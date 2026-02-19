@@ -160,7 +160,8 @@ SPEED_MAPPING = {
 
 def prompt_input(prompt_text):
     """Print prompt and get input - ensures prompt is visible in web UI."""
-    print(prompt_text, end="", flush=True)
+    sys.stdout.write(prompt_text)
+    sys.stdout.flush()
     return input()
 
 
@@ -1475,8 +1476,9 @@ def main():
     print(" AUTHENTICATION")
     print("-" * 70)
     username = prompt_input("\nUsername: ").strip()
-    print("Password: ", end="", flush=True)
-    # Check if running in web UI mode (PTY) - getpass doesn't work with PTY
+    sys.stdout.write("Password: ")
+    sys.stdout.flush()
+    # Check if running in web UI mode - getpass doesn't work with pipes
     if os.environ.get('ACI_WEB_UI') == '1':
         password = input().strip()
     else:
