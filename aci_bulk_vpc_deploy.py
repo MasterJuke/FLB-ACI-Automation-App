@@ -26,6 +26,7 @@ Author: Network Automation Script
 """
 
 import csv
+import os
 import re
 import sys
 import getpass
@@ -1250,7 +1251,11 @@ def main():
     print("\nUsername: ", end="", flush=True)
     username = input().strip()
     print("Password: ", end="", flush=True)
-    password = getpass.getpass("")
+    # Check if running in web UI mode (PTY) - getpass doesn't work with PTY
+    if os.environ.get('ACI_WEB_UI') == '1':
+        password = input().strip()
+    else:
+        password = getpass.getpass("")
     if not username or not password:
         print("[ERROR] Credentials required")
         sys.exit(1)
