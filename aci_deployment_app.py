@@ -95,7 +95,7 @@ def run_script_thread(script_path, csv_path):
         env['PYTHONUNBUFFERED'] = '1'
         env['ACI_WEB_UI'] = '1'  # Signal to scripts that they're running in web UI
         
-        # Use simple pipes instead of PTY - more reliable
+        # Use simple pipes
         running_process = subprocess.Popen(
             [sys.executable, '-u', script_path],
             stdin=subprocess.PIPE,
@@ -107,72 +107,101 @@ def run_script_thread(script_path, csv_path):
         )
         
         import re as _re
+        import threading
+        
         # Regex to strip ANSI escape sequences
         ansi_escape = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         
-        buffer = b""
+        buffer = []
+        buffer_lock = threading.Lock()
+        last_char_time = [time.time()]
+        read_complete = [False]
         
-        while True:
-            # Read available data
-            byte = running_process.stdout.read(1)
-            if not byte:
-                break
-            
-            buffer += byte
-            
-            # Check if we have a complete line
-            if byte == b'\n':
+        def reader_thread():
+            """Read from stdout byte by byte."""
+            while True:
                 try:
-                    line = buffer.decode('utf-8', errors='replace')
-                    line = ansi_escape.sub('', line)
-                    line = line.strip()
+                    byte = running_process.stdout.read(1)
+                    if not byte:
+                        read_complete[0] = True
+                        break
+                    with buffer_lock:
+                        buffer.append(byte)
+                        last_char_time[0] = time.time()
+                except:
+                    read_complete[0] = True
+                    break
+        
+        # Start reader thread
+        reader = threading.Thread(target=reader_thread, daemon=True)
+        reader.start()
+        
+        # Main loop - process buffer and detect prompts
+        while not read_complete[0] or buffer:
+            time.sleep(0.05)  # Small delay to accumulate data
+            
+            with buffer_lock:
+                if not buffer:
+                    continue
+                
+                # Convert buffer to string
+                try:
+                    data = b''.join(buffer)
+                    text = data.decode('utf-8', errors='replace')
+                except:
+                    continue
+                
+                # Process complete lines first
+                while '\n' in text:
+                    line, text = text.split('\n', 1)
+                    line = ansi_escape.sub('', line).strip()
                     if line:
                         output_queue.put(('output', line))
-                except:
-                    pass
-                buffer = b""
-            
-            # Check for prompts (data ending with : or ? without newline)
-            elif len(buffer) > 2:
-                try:
-                    text = buffer.decode('utf-8', errors='replace')
-                    text_clean = text.rstrip()
+                
+                # Update buffer with remaining text
+                buffer.clear()
+                if text:
+                    buffer.extend([bytes([b]) for b in text.encode('utf-8')])
+                
+                # Check if remaining text is a prompt (no newline, ends with : or ?)
+                if text.strip():
+                    time_since_last = time.time() - last_char_time[0]
+                    text_clean = text.strip()
                     text_lower = text_clean.lower()
                     
                     # Detect prompt patterns
                     is_prompt = (
                         text_clean.endswith(':') or
                         text_clean.endswith('?') or
-                        text_clean.endswith(')') and ('(1/2)' in text_lower or '(yes/no)' in text_lower or '(y/n)' in text_lower)
+                        ('(1/2)' in text_lower) or
+                        ('(yes/no)' in text_lower) or
+                        ('(y/n)' in text_lower)
                     )
                     
-                    if is_prompt:
-                        # Wait a tiny bit to see if more data is coming
-                        import select
-                        try:
-                            readable, _, _ = select.select([running_process.stdout], [], [], 0.1)
-                            if not readable:
-                                # No more data, this is a prompt
-                                text = ansi_escape.sub('', text)
-                                text = text.strip()
-                                if text:
-                                    output_queue.put(('output', text))
-                                buffer = b""
-                        except:
-                            pass
+                    # If it looks like a prompt and no new data for 100ms, flush it
+                    if is_prompt and time_since_last > 0.1:
+                        text_out = ansi_escape.sub('', text).strip()
+                        if text_out:
+                            output_queue.put(('output', text_out))
+                        buffer.clear()
+        
+        # Wait for reader thread to finish
+        reader.join(timeout=1.0)
+        
+        # Flush any remaining buffer
+        with buffer_lock:
+            if buffer:
+                try:
+                    data = b''.join(buffer)
+                    text = data.decode('utf-8', errors='replace')
+                    text = ansi_escape.sub('', text).strip()
+                    if text:
+                        output_queue.put(('output', text))
                 except:
                     pass
         
-        # Flush remaining buffer
-        if buffer:
-            try:
-                text = buffer.decode('utf-8', errors='replace')
-                text = ansi_escape.sub('', text)
-                text = text.strip()
-                if text:
-                    output_queue.put(('output', text))
-            except:
-                pass
+        running_process.wait()
+        output_queue.put(('exit', running_process.returncode))
         
         running_process.wait()
         output_queue.put(('exit', running_process.returncode))
