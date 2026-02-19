@@ -93,6 +93,7 @@ def run_script_thread(script_path, csv_path):
     try:
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
+        env['ACI_WEB_UI'] = '1'  # Signal to scripts that they're running in web UI
         
         # Use pseudo-terminal on Unix for proper prompt handling
         import platform
@@ -120,32 +121,54 @@ def run_script_thread(script_path, csv_path):
                 
                 # Read from master
                 current_line = ""
+                buffer_timeout = 0.1  # Wait 100ms for more data before flushing
+                
+                import select as _select
+                
                 while True:
                     try:
-                        data = _os.read(master_fd, 1024)
-                        if not data:
-                            break
-                        text = data.decode('utf-8', errors='replace')
+                        # Wait for data with timeout
+                        readable, _, _ = _select.select([master_fd], [], [], 0.1)
                         
-                        for char in text:
-                            if char == '\n':
-                                output_queue.put(('output', current_line))
-                                current_line = ""
-                            elif char == '\r':
-                                pass
-                            else:
-                                current_line += char
-                        
-                        # Flush any partial line that looks like a prompt
-                        if current_line and (
-                            current_line.rstrip().endswith((':', '?', ')', ']', ' ')) or
-                            any(kw in current_line.lower() for kw in 
-                                ['select', 'enter', 'username', 'password', 'confirm', 
-                                 'choice', 'yes/no', '1/2', 'press'])
-                        ):
-                            output_queue.put(('output', current_line))
-                            current_line = ""
+                        if readable:
+                            data = _os.read(master_fd, 4096)
+                            if not data:
+                                break
+                            text = data.decode('utf-8', errors='replace')
                             
+                            for char in text:
+                                if char == '\n':
+                                    if current_line:
+                                        output_queue.put(('output', current_line))
+                                    current_line = ""
+                                elif char == '\r':
+                                    pass  # Ignore carriage returns
+                                else:
+                                    current_line += char
+                        else:
+                            # Timeout - no data received, check if we have a pending prompt
+                            if current_line:
+                                # Check if it looks like a prompt waiting for input
+                                line_lower = current_line.lower().strip()
+                                is_prompt = (
+                                    current_line.rstrip().endswith(':') or
+                                    current_line.rstrip().endswith('?') or
+                                    '(yes/no)' in line_lower or
+                                    '(y/n)' in line_lower or
+                                    line_lower.endswith('(1/2):') or
+                                    line_lower.endswith('[default=1]:') or
+                                    'username:' in line_lower or
+                                    'password:' in line_lower or
+                                    'enter filename:' in line_lower or
+                                    'select mode' in line_lower or
+                                    'select (' in line_lower or
+                                    'confirm' in line_lower and ':' in current_line
+                                )
+                                
+                                if is_prompt:
+                                    output_queue.put(('output', current_line))
+                                    current_line = ""
+                                    
                     except OSError:
                         break
                 
