@@ -37,15 +37,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # =============================================================================
 
 APIC_URLS = {
-    "D1": "",  # <-- UPDATE THIS (BLU Tenant - ACC switches)
-    "D2": "",  # <-- UPDATE THIS (BLU Tenant - SDC switches)
-    "D3": ""   # <-- UPDATE THIS (NSM_BLU Tenant - NSM switches)
+    "D1": "",  # <-- UPDATE THIS (ACC switches)
+    "D2": "",  # <-- UPDATE THIS (SDC switches)
+    "D3": ""   # <-- UPDATE THIS (NSM switches)
 }
 
+# Multiple tenants per datacenter
 TENANTS = {
-    "D1": "BLU",
-    "D2": "BLU",
-    "D3": "NSM_BLU"
+    "D1": ["BLU", "GWC", "GWS"],
+    "D2": ["BLU", "GWC", "GWS"],
+    "D3": ["NSM_BLU", "NSM_BRN", "NSM_GLD", "NSM_GRN"]
 }
 
 POD_ID = "1"
@@ -64,15 +65,15 @@ def prompt_input(prompt_text):
 
 
 def detect_environment(switch_name):
-    """Detect data center from switch name."""
+    """Detect data center from switch name. D3=NSM, D2=SDC, D1=everything else."""
     switch_upper = switch_name.upper()
     if "NSM" in switch_upper:
         return "D3"
     elif "SDC" in switch_upper:
         return "D2"
-    elif "ACC" in switch_upper:
+    else:
+        # Default to D1 for all other switches (including ACC and any without prefix)
         return "D1"
-    return None
 
 
 def extract_node_id(switch_name):
@@ -125,7 +126,7 @@ def login_to_apic(session, apic_url, username, password):
 
 
 def get_epg_app_profiles(session, apic_url, tenant, vlan_id):
-    """Find all Application Profiles containing the EPG for a given VLAN."""
+    """Find all Application Profiles containing the EPG for a given VLAN in a single tenant."""
     try:
         vlan_pattern = f"V{vlan_id:04d}"
         response = session.get(
@@ -145,11 +146,21 @@ def get_epg_app_profiles(session, apic_url, tenant, vlan_id):
                 results.append({
                     "app_profile": ap_match.group(1),
                     "epg_name": epg_name,
+                    "tenant": tenant,
                     "dn": dn
                 })
         return results
     except:
         return []
+
+
+def get_epg_app_profiles_all_tenants(session, apic_url, tenants, vlan_id):
+    """Find all Application Profiles containing the EPG for a given VLAN across all tenants."""
+    all_results = []
+    for tenant in tenants:
+        results = get_epg_app_profiles(session, apic_url, tenant, vlan_id)
+        all_results.extend(results)
+    return all_results
 
 
 def find_epg_binding(session, apic_url, tenant, app_profile, epg_name, path_dn):
@@ -301,7 +312,7 @@ def main():
     
     bindings_to_delete = []
     not_found = []
-    app_profile_selections = {}
+    ap_tenant_selections = {}  # {env:vlan -> (app_profile, tenant) or "ALL"}
     
     for idx, dep in enumerate(deployments, 1):
         print(f"\n[{idx}/{len(deployments)}] {dep['switch']} port {dep['port']}")
@@ -313,7 +324,7 @@ def main():
         
         session = sessions[env]
         apic_url = APIC_URLS[env]
-        tenant = TENANTS[env]
+        tenants_list = TENANTS[env]
         node_id = extract_node_id(dep['switch'])
         
         if not node_id:
@@ -326,11 +337,11 @@ def main():
         
         # Process each VLAN
         vlans = parse_vlans(dep['vlans'])
-        print(f"  Searching for {len(vlans)} VLAN binding(s)...")
+        print(f"  Searching for {len(vlans)} VLAN binding(s) (across {len(tenants_list)} tenants)...")
         
         for vlan in vlans:
-            # Find EPG(s) for this VLAN
-            epg_results = get_epg_app_profiles(session, apic_url, tenant, vlan)
+            # Find EPG(s) for this VLAN across ALL tenants
+            epg_results = get_epg_app_profiles_all_tenants(session, apic_url, tenants_list, vlan)
             
             if not epg_results:
                 print(f"    VLAN {vlan}: [WARNING] No EPG found")
@@ -342,39 +353,42 @@ def main():
                 })
                 continue
             
-            # Handle multiple Application Profiles
+            # Handle multiple Application Profiles/Tenants
             if len(epg_results) > 1:
                 cache_key = f"{env}:{vlan}"
-                if cache_key not in app_profile_selections:
-                    print(f"\n    [ALERT] VLAN {vlan} exists in multiple Application Profiles:")
-                    print("    " + "-" * 40)
+                if cache_key not in ap_tenant_selections:
+                    print(f"\n    [ALERT] VLAN {vlan} exists in multiple locations:")
+                    print("    " + "-" * 50)
                     for i, opt in enumerate(epg_results, 1):
-                        print(f"    [{i}] {opt['app_profile']} -> {opt['epg_name']}")
-                    print("    [A] Check ALL Application Profiles")
-                    print("    " + "-" * 40)
+                        print(f"    [{i}] {opt.get('tenant', 'N/A')} / {opt['app_profile']} -> {opt['epg_name']}")
+                    print("    [A] Check ALL locations")
+                    print("    " + "-" * 50)
                     
                     while True:
                         sys.stdout.write(f"\n    Select for VLAN {vlan}: "); sys.stdout.flush()
                         choice = input().strip().upper()
                         if choice == 'A':
-                            app_profile_selections[cache_key] = "ALL"
+                            ap_tenant_selections[cache_key] = "ALL"
                             break
                         try:
                             idx = int(choice) - 1
                             if 0 <= idx < len(epg_results):
-                                app_profile_selections[cache_key] = epg_results[idx]['app_profile']
+                                selected = epg_results[idx]
+                                ap_tenant_selections[cache_key] = (selected['app_profile'], selected.get('tenant', tenants_list[0]))
                                 break
                         except:
                             pass
                         print("    [ERROR] Invalid selection")
                 
-                selection = app_profile_selections[cache_key]
+                selection = ap_tenant_selections[cache_key]
                 if selection != "ALL":
-                    epg_results = [e for e in epg_results if e['app_profile'] == selection]
+                    ap, tn = selection
+                    epg_results = [e for e in epg_results if e['app_profile'] == ap and e.get('tenant') == tn]
             
             # Find actual bindings
             for epg in epg_results:
-                binding = find_epg_binding(session, apic_url, tenant, epg['app_profile'], epg['epg_name'], path_dn)
+                epg_tenant = epg.get('tenant', tenants_list[0])
+                binding = find_epg_binding(session, apic_url, epg_tenant, epg['app_profile'], epg['epg_name'], path_dn)
                 
                 if binding:
                     bindings_to_delete.append({
@@ -383,7 +397,7 @@ def main():
                         "node_id": node_id,
                         "vlan": vlan,
                         "env": env,
-                        "tenant": tenant,
+                        "tenant": epg_tenant,
                         "app_profile": epg['app_profile'],
                         "epg_name": epg['epg_name'],
                         "binding_dn": binding['dn'],
