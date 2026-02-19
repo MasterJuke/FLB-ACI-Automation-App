@@ -94,35 +94,147 @@ def run_script_thread(script_path, csv_path):
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
         
-        running_process = subprocess.Popen(
-            [sys.executable, script_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
-            cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
-        )
+        # Use pseudo-terminal on Unix for proper prompt handling
+        import platform
+        use_pty = platform.system() != 'Windows'
         
-        for line in iter(running_process.stdout.readline, ''):
-            if line:
-                output_queue.put(('output', line.rstrip('\n\r')))
+        if use_pty:
+            try:
+                import pty
+                import os as _os
+                global pty_master_fd
+                
+                master_fd, slave_fd = pty.openpty()
+                pty_master_fd = master_fd  # Store globally for send_input
+                
+                running_process = subprocess.Popen(
+                    [sys.executable, '-u', script_path],
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    env=env,
+                    cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
+                )
+                
+                _os.close(slave_fd)
+                
+                # Read from master
+                current_line = ""
+                while True:
+                    try:
+                        data = _os.read(master_fd, 1024)
+                        if not data:
+                            break
+                        text = data.decode('utf-8', errors='replace')
+                        
+                        for char in text:
+                            if char == '\n':
+                                output_queue.put(('output', current_line))
+                                current_line = ""
+                            elif char == '\r':
+                                pass
+                            else:
+                                current_line += char
+                        
+                        # Flush any partial line that looks like a prompt
+                        if current_line and (
+                            current_line.rstrip().endswith((':', '?', ')', ']', ' ')) or
+                            any(kw in current_line.lower() for kw in 
+                                ['select', 'enter', 'username', 'password', 'confirm', 
+                                 'choice', 'yes/no', '1/2', 'press'])
+                        ):
+                            output_queue.put(('output', current_line))
+                            current_line = ""
+                            
+                    except OSError:
+                        break
+                
+                if current_line:
+                    output_queue.put(('output', current_line))
+                
+                pty_master_fd = None  # Clear global ref
+                _os.close(master_fd)
+                running_process.wait()
+                output_queue.put(('exit', running_process.returncode))
+                
+            except ImportError:
+                use_pty = False
         
-        running_process.wait()
-        output_queue.put(('exit', running_process.returncode))
+        if not use_pty:
+            # Windows fallback - use threads to read output
+            running_process = subprocess.Popen(
+                [sys.executable, '-u', script_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+                env=env,
+                cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
+            )
+            
+            current_line = ""
+            last_output_time = time.time()
+            
+            while True:
+                byte = running_process.stdout.read(1)
+                if not byte:
+                    if current_line:
+                        output_queue.put(('output', current_line))
+                    break
+                
+                char = byte.decode('utf-8', errors='replace')
+                
+                if char == '\n':
+                    output_queue.put(('output', current_line))
+                    current_line = ""
+                    last_output_time = time.time()
+                elif char == '\r':
+                    pass
+                else:
+                    current_line += char
+                    # Check if this looks like a prompt waiting for input
+                    if current_line and (
+                        current_line.rstrip().endswith((':', '?', ')', ']')) or
+                        any(kw in current_line.lower() for kw in 
+                            ['select', 'enter', 'username', 'password', 'confirm', 
+                             'choice', 'yes/no', '1/2', 'press'])
+                    ):
+                        # Wait a tiny bit to see if more data comes
+                        time.sleep(0.05)
+                        # Flush the prompt
+                        output_queue.put(('output', current_line))
+                        current_line = ""
+            
+            running_process.wait()
+            output_queue.put(('exit', running_process.returncode))
         
     except Exception as e:
         output_queue.put(('error', str(e)))
     finally:
         running_process = None
 
+
+# Global variable to store master_fd for pty
+pty_master_fd = None
+
 def send_input_to_process(text):
     """Send input to the running process."""
-    global running_process
+    global running_process, pty_master_fd
+    
+    # Try pty first
+    if pty_master_fd is not None:
+        try:
+            import os as _os
+            _os.write(pty_master_fd, (text + '\n').encode('utf-8'))
+            return True
+        except:
+            pass
+    
+    # Fall back to stdin
     if running_process and running_process.stdin:
         try:
-            running_process.stdin.write(text + '\n')
+            data = (text + '\n').encode('utf-8')
+            running_process.stdin.write(data)
             running_process.stdin.flush()
             return True
         except:
@@ -996,7 +1108,7 @@ HTML_TEMPLATE = '''
             </div>
 
             <nav class="nav-section">
-                <div class="nav-label">Deployment Types</div>
+                <div class="nav-label">Bulk Deployments</div>
                 
                 <div class="nav-item vpc" onclick="selectView('vpc')">
                     <div class="nav-icon">⚡</div>
@@ -1098,10 +1210,49 @@ HTML_TEMPLATE = '''
                 </div>
 
                 <div class="config-panel">
-                    <div class="config-row">
+                    <div class="csv-toggle-group">
+                        <button class="csv-toggle active" onclick="toggleCsvMode('vpc', 'file')">📁 Use CSV File</button>
+                        <button class="csv-toggle" onclick="toggleCsvMode('vpc', 'inline')">✏️ Edit Inline</button>
+                    </div>
+                    <div id="vpcFileMode" class="config-row">
                         <div class="config-group">
                             <label class="config-label">CSV File Path</label>
                             <input type="text" class="config-input" id="vpcCsvPath" value="{{ config.default_vpc_csv }}">
+                        </div>
+                    </div>
+                    <div id="vpcInlineMode" style="display: none;">
+                        <div class="csv-editor-section" style="padding: 0;">
+                            <div class="csv-editor-header">
+                                <span class="csv-editor-title">Inline CSV Editor</span>
+                                <div class="csv-editor-actions">
+                                    <button class="csv-editor-btn add" onclick="addCsvRow('vpc')">+ Add Row</button>
+                                    <button class="csv-editor-btn" onclick="exportCsv('vpc')">Export CSV</button>
+                                </div>
+                            </div>
+                            <table class="csv-editor-table" id="vpcCsvTable">
+                                <thead>
+                                    <tr>
+                                        <th>Hostname</th>
+                                        <th>Switch1</th>
+                                        <th>Switch2</th>
+                                        <th>Speed</th>
+                                        <th>VLANS</th>
+                                        <th>WorkOrder</th>
+                                        <th class="row-actions"></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td><input type="text" placeholder="MEDHVIOP173_SEA_PROD"></td>
+                                        <td><input type="text" placeholder="EDCLEAFACC1501"></td>
+                                        <td><input type="text" placeholder="EDCLEAFACC1502"></td>
+                                        <td><input type="text" placeholder="25G"></td>
+                                        <td><input type="text" placeholder="32,64-67"></td>
+                                        <td><input type="text" placeholder="WO123456"></td>
+                                        <td class="row-actions"><button class="delete-row" onclick="deleteCsvRow(this)">✕</button></td>
+                                    </tr>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 </div>
@@ -1154,10 +1305,49 @@ HTML_TEMPLATE = '''
                 </div>
 
                 <div class="config-panel">
-                    <div class="config-row">
+                    <div class="csv-toggle-group">
+                        <button class="csv-toggle active" onclick="toggleCsvMode('individual', 'file')">📁 Use CSV File</button>
+                        <button class="csv-toggle" onclick="toggleCsvMode('individual', 'inline')">✏️ Edit Inline</button>
+                    </div>
+                    <div id="individualFileMode" class="config-row">
                         <div class="config-group">
                             <label class="config-label">CSV File Path</label>
                             <input type="text" class="config-input" id="individualCsvPath" value="{{ config.default_individual_csv }}">
+                        </div>
+                    </div>
+                    <div id="individualInlineMode" style="display: none;">
+                        <div class="csv-editor-section" style="padding: 0;">
+                            <div class="csv-editor-header">
+                                <span class="csv-editor-title">Inline CSV Editor</span>
+                                <div class="csv-editor-actions">
+                                    <button class="csv-editor-btn add" onclick="addCsvRow('individual')">+ Add Row</button>
+                                    <button class="csv-editor-btn" onclick="exportCsv('individual')">Export CSV</button>
+                                </div>
+                            </div>
+                            <table class="csv-editor-table" id="individualCsvTable">
+                                <thead>
+                                    <tr>
+                                        <th>Hostname</th>
+                                        <th>Switch</th>
+                                        <th>Type</th>
+                                        <th>Speed</th>
+                                        <th>VLANS</th>
+                                        <th>WorkOrder</th>
+                                        <th class="row-actions"></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td><input type="text" placeholder="MEDHVIOP173_MGMT"></td>
+                                        <td><input type="text" placeholder="EDCLEAFNSM2163"></td>
+                                        <td><input type="text" placeholder="ACCESS"></td>
+                                        <td><input type="text" placeholder="1G"></td>
+                                        <td><input type="text" placeholder="2958"></td>
+                                        <td><input type="text" placeholder="WO123456"></td>
+                                        <td class="row-actions"><button class="delete-row" onclick="deleteCsvRow(this)">✕</button></td>
+                                    </tr>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 </div>
@@ -1222,17 +1412,15 @@ HTML_TEMPLATE = '''
                             <input type="text" class="settings-input" id="settingsIndividualScript" value="{{ config.individual_script }}">
                             <div class="settings-hint">Path to the individual port bulk deployment Python script</div>
                         </div>
-                    </div>
-
-                    <div class="settings-section">
-                        <div class="settings-section-title">📄 Default CSV Files</div>
                         <div class="settings-row">
-                            <label class="settings-label">Default VPC CSV</label>
-                            <input type="text" class="settings-input" id="settingsVpcCsv" value="{{ config.default_vpc_csv }}">
+                            <label class="settings-label">EPG Add Script</label>
+                            <input type="text" class="settings-input" id="settingsEpgaddScript" value="{{ config.epgadd_script }}">
+                            <div class="settings-hint">Path to the EPG add Python script</div>
                         </div>
                         <div class="settings-row">
-                            <label class="settings-label">Default Individual Port CSV</label>
-                            <input type="text" class="settings-input" id="settingsIndividualCsv" value="{{ config.default_individual_csv }}">
+                            <label class="settings-label">EPG Delete Script</label>
+                            <input type="text" class="settings-input" id="settingsEpgdeleteScript" value="{{ config.epgdelete_script }}">
+                            <div class="settings-hint">Path to the EPG delete Python script</div>
                         </div>
                     </div>
 
@@ -1272,6 +1460,26 @@ HTML_TEMPLATE = '''
                                 </table>
                             </div>
                         </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 16px;">
+                            <div>
+                                <div style="font-weight: 600; color: #38ef7d; margin-bottom: 8px;">EPG Add CSV:</div>
+                                <table class="csv-table" style="font-size: 11px;">
+                                    <tr><th>Column</th><th>Description</th></tr>
+                                    <tr><td>Switch</td><td>Target switch</td></tr>
+                                    <tr><td>Port</td><td>Port number (e.g., 1/68)</td></tr>
+                                    <tr><td>VLANS</td><td>VLAN IDs to add</td></tr>
+                                </table>
+                            </div>
+                            <div>
+                                <div style="font-weight: 600; color: #f45c43; margin-bottom: 8px;">EPG Delete CSV:</div>
+                                <table class="csv-table" style="font-size: 11px;">
+                                    <tr><th>Column</th><th>Description</th></tr>
+                                    <tr><td>Switch</td><td>Target switch</td></tr>
+                                    <tr><td>Port</td><td>Port number (e.g., 1/68)</td></tr>
+                                    <tr><td>VLANS</td><td>VLAN IDs to remove</td></tr>
+                                </table>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1288,9 +1496,11 @@ HTML_TEMPLATE = '''
                 <div class="readme-panel">
                     <div class="readme-tabs">
                         <div class="readme-tab active" onclick="switchReadmeTab('ui')">🖥️ Using the UI</div>
-                        <div class="readme-tab" onclick="switchReadmeTab('vpc')">⚡ VPC Deployment</div>
-                        <div class="readme-tab" onclick="switchReadmeTab('individual')">🔌 Individual Port</div>
-                        <div class="readme-tab" onclick="switchReadmeTab('troubleshoot')">🔧 Troubleshooting</div>
+                        <div class="readme-tab" onclick="switchReadmeTab('vpc')">⚡ VPC</div>
+                        <div class="readme-tab" onclick="switchReadmeTab('individual')">🔌 Port</div>
+                        <div class="readme-tab" onclick="switchReadmeTab('epgadd')">➕ EPG Add</div>
+                        <div class="readme-tab" onclick="switchReadmeTab('epgdelete')">➖ EPG Delete</div>
+                        <div class="readme-tab" onclick="switchReadmeTab('troubleshoot')">🔧 Troubleshoot</div>
                     </div>
 
                     <!-- UI Tab -->
@@ -1431,6 +1641,112 @@ MEDHVIOP173_Clients,EDCLEAFNSM2163,TRUNK,25G,"2704-2719",WO123456
                                     <li><strong>Port Selector</strong> - Under the Interface Profile</li>
                                     <li><strong>Static EPG Bindings</strong> - Access=untagged, Trunk=tagged</li>
                                 </ul>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- EPG Add Tab -->
+                    <div id="readmeTabEpgadd" class="readme-tab-content">
+                        <div class="readme-section">
+                            <div class="readme-section-title"><span>➕</span> EPG Add - Add EPGs to Existing Ports</div>
+                            <div class="readme-content">
+                                <p>Add EPG static bindings to ports that already have policy groups configured.</p>
+                                
+                                <h3>CSV Format</h3>
+                                <table class="csv-table">
+                                    <tr><th>Column</th><th>Description</th><th>Example</th></tr>
+                                    <tr><td>Switch</td><td>Target switch name</td><td><code>EDCLEAFACC1501</code></td></tr>
+                                    <tr><td>Port</td><td>Port number</td><td><code>1/68</code></td></tr>
+                                    <tr><td>VLANS</td><td>VLAN IDs to add</td><td><code>32,64-67</code></td></tr>
+                                </table>
+
+                                <h3>Example CSV</h3>
+                                <div class="csv-example">
+Switch,Port,VLANS
+EDCLEAFACC1501,1/68,"32,64-67"
+EDCLEAFNSM2163,1/5,2958
+                                </div>
+
+                                <h3>Features</h3>
+                                <ul>
+                                    <li><strong>Dry-Run Mode</strong> - Validate without deploying</li>
+                                    <li><strong>Multi-AP Detection</strong> - Alerts when VLAN exists in multiple Application Profiles</li>
+                                    <li><strong>Batch Preview</strong> - Shows ALL bindings before deployment</li>
+                                    <li><strong>Skip Existing</strong> - Automatically skips already-bound EPGs</li>
+                                    <li><strong>Binding Mode</strong> - Choose Trunk (tagged) or Access (untagged)</li>
+                                </ul>
+
+                                <h3>Multi-Application Profile Handling</h3>
+                                <p>If a VLAN exists in multiple Application Profiles, you'll be prompted:</p>
+                                <div class="csv-example">
+[ALERT] VLAN 32 exists in multiple Application Profiles:
+--------------------------------------------------
+  [1] APP_PROFILE_1 -> V0032_EPG
+  [2] APP_PROFILE_2 -> V0032_BACKUP
+--------------------------------------------------
+Select Application Profile for VLAN 32: _
+                                </div>
+
+                                <h3>What Gets Created</h3>
+                                <ul>
+                                    <li><strong>Static Path Binding</strong> on the EPG</li>
+                                    <li><strong>VLAN Encapsulation</strong> - vlan-{ID}</li>
+                                    <li><strong>Deployment Immediacy</strong> - Immediate</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- EPG Delete Tab -->
+                    <div id="readmeTabEpgdelete" class="readme-tab-content">
+                        <div class="readme-section">
+                            <div class="readme-section-title"><span>➖</span> EPG Delete - Remove EPGs from Ports</div>
+                            <div class="readme-content">
+                                <p>Remove EPG static bindings from existing ports.</p>
+                                
+                                <h3>CSV Format</h3>
+                                <table class="csv-table">
+                                    <tr><th>Column</th><th>Description</th><th>Example</th></tr>
+                                    <tr><td>Switch</td><td>Target switch name</td><td><code>EDCLEAFACC1501</code></td></tr>
+                                    <tr><td>Port</td><td>Port number</td><td><code>1/68</code></td></tr>
+                                    <tr><td>VLANS</td><td>VLAN IDs to remove</td><td><code>32,64-67</code></td></tr>
+                                </table>
+
+                                <h3>Example CSV</h3>
+                                <div class="csv-example">
+Switch,Port,VLANS
+EDCLEAFACC1501,1/68,"32,64-67"
+EDCLEAFNSM2163,1/5,2958
+                                </div>
+
+                                <h3>Features</h3>
+                                <ul>
+                                    <li><strong>Dry-Run Mode</strong> - Validate without deleting</li>
+                                    <li><strong>Multi-AP Handling</strong> - Check specific AP or ALL profiles</li>
+                                    <li><strong>Batch Preview</strong> - Shows ALL bindings to delete</li>
+                                    <li><strong>Safety Confirmation</strong> - Must type 'YES' to confirm deletion</li>
+                                </ul>
+
+                                <h3>Multi-Application Profile Handling</h3>
+                                <p>When a VLAN exists in multiple Application Profiles:</p>
+                                <div class="csv-example">
+[ALERT] VLAN 32 exists in multiple Application Profiles:
+----------------------------------------
+  [1] APP_PROFILE_1 -> V0032_EPG
+  [2] APP_PROFILE_2 -> V0032_BACKUP
+  [A] Check ALL Application Profiles
+----------------------------------------
+Select for VLAN 32: _
+                                </div>
+
+                                <h3>Confirmation Required</h3>
+                                <p>Deletion requires explicit confirmation:</p>
+                                <div class="csv-example">
+[WARNING] About to delete 5 EPG binding(s)
+         This action cannot be undone!
+
+Confirm deletion (type 'YES' to confirm): _
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1787,6 +2103,8 @@ MEDHVIOP173_Clients,EDCLEAFNSM2163,TRUNK,25G,"2704-2719",WO123456
                 'ui': 'readmeTabUi',
                 'vpc': 'readmeTabVpc',
                 'individual': 'readmeTabIndividual',
+                'epgadd': 'readmeTabEpgadd',
+                'epgdelete': 'readmeTabEpgdelete',
                 'troubleshoot': 'readmeTabTroubleshoot'
             };
             document.getElementById(tabMap[tab]).classList.add('active');
@@ -1917,8 +2235,8 @@ MEDHVIOP173_Clients,EDCLEAFNSM2163,TRUNK,25G,"2704-2719",WO123456
             const settings = {
                 vpc_script: document.getElementById('settingsVpcScript').value,
                 individual_script: document.getElementById('settingsIndividualScript').value,
-                default_vpc_csv: document.getElementById('settingsVpcCsv').value,
-                default_individual_csv: document.getElementById('settingsIndividualCsv').value,
+                epgadd_script: document.getElementById('settingsEpgaddScript').value,
+                epgdelete_script: document.getElementById('settingsEpgdeleteScript').value,
                 version: document.getElementById('settingsVersion').value
             };
             fetch('/api/settings', {
@@ -1931,8 +2249,6 @@ MEDHVIOP173_Clients,EDCLEAFNSM2163,TRUNK,25G,"2704-2719",WO123456
                 if (data.status === 'saved') {
                     alert('Settings saved!');
                     document.getElementById('versionBadge').textContent = 'v' + settings.version;
-                    document.getElementById('vpcCsvPath').value = settings.default_vpc_csv;
-                    document.getElementById('individualCsvPath').value = settings.default_individual_csv;
                 }
             });
         }
