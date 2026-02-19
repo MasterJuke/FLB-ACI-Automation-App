@@ -615,6 +615,7 @@ HTML_TEMPLATE = '''
             overflow: hidden;
             border: 1px solid var(--border-color);
             background: var(--bg-terminal);
+            min-height: 0;  /* Critical for nested flex scrolling */
         }
 
         .terminal-header {
@@ -660,13 +661,28 @@ HTML_TEMPLATE = '''
             flex: 1;
             padding: 16px;
             overflow-y: auto;
+            overflow-x: hidden;
             font-family: 'JetBrains Mono', monospace;
             font-size: 13px;
             line-height: 1.6;
+            min-height: 0;  /* Important for flex children to scroll */
+            max-height: 100%;
         }
-        .terminal-output::-webkit-scrollbar { width: 8px; }
-        .terminal-output::-webkit-scrollbar-track { background: transparent; }
-        .terminal-output::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+        .terminal-output::-webkit-scrollbar { width: 10px; }
+        .terminal-output::-webkit-scrollbar-track { background: var(--bg-darkest); border-radius: 5px; }
+        .terminal-output::-webkit-scrollbar-thumb { 
+            background: var(--border-color); 
+            border-radius: 5px;
+            border: 2px solid var(--bg-darkest);
+        }
+        .terminal-output::-webkit-scrollbar-thumb:hover { 
+            background: var(--text-muted); 
+        }
+        /* Firefox scrollbar */
+        .terminal-output {
+            scrollbar-width: thin;
+            scrollbar-color: var(--border-color) var(--bg-darkest);
+        }
 
         .terminal-line { white-space: pre-wrap; word-break: break-all; margin-bottom: 1px; }
         .terminal-line.header { color: var(--accent-cyan); font-weight: 600; }
@@ -1196,7 +1212,7 @@ HTML_TEMPLATE = '''
             </div>
 
             <!-- VPC Screen -->
-            <div id="vpcScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column;">
+            <div id="vpcScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;">
                 <div class="header-bar">
                     <div class="header-title">
                         <h2>VPC Bulk Deployment</h2>
@@ -1291,7 +1307,7 @@ HTML_TEMPLATE = '''
             </div>
 
             <!-- Individual Screen -->
-            <div id="individualScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column;">
+            <div id="individualScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;">
                 <div class="header-bar">
                     <div class="header-title">
                         <h2>Individual Port Deployment</h2>
@@ -1388,7 +1404,7 @@ HTML_TEMPLATE = '''
             </div>
 
             <!-- Settings Screen -->
-            <div id="settingsScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column;">
+            <div id="settingsScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;">
                 <div class="header-bar">
                     <div class="header-title">
                         <h2>Settings</h2>
@@ -1485,7 +1501,7 @@ HTML_TEMPLATE = '''
             </div>
 
             <!-- README Screen -->
-            <div id="readmeScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column;">
+            <div id="readmeScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;">
                 <div class="header-bar">
                     <div class="header-title">
                         <h2>Documentation</h2>
@@ -1799,7 +1815,7 @@ Confirm deletion (type 'YES' to confirm): _
             </div>
 
             <!-- EPG Add Screen -->
-            <div id="epgaddScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column;">
+            <div id="epgaddScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;">
                 <div class="header-bar">
                     <div class="header-title">
                         <h2>EPG Add - Add EPGs to Existing Ports</h2>
@@ -1888,7 +1904,7 @@ Confirm deletion (type 'YES' to confirm): _
             </div>
 
             <!-- EPG Delete Screen -->
-            <div id="epgdeleteScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column;">
+            <div id="epgdeleteScreen" class="hidden" style="flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden;">
                 <div class="header-bar">
                     <div class="header-title">
                         <h2>EPG Delete - Remove EPGs from Ports</h2>
