@@ -120,60 +120,73 @@ def run_script_thread(script_path, csv_path):
                 _os.close(slave_fd)
                 
                 # Read from master
-                current_line = ""
-                buffer_timeout = 0.1  # Wait 100ms for more data before flushing
-                
                 import select as _select
+                import re as _re
+                
+                # Regex to strip ANSI escape sequences
+                ansi_escape = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+                
+                buffer = ""
+                last_flush_time = time.time()
                 
                 while True:
                     try:
                         # Wait for data with timeout
-                        readable, _, _ = _select.select([master_fd], [], [], 0.1)
+                        readable, _, _ = _select.select([master_fd], [], [], 0.05)
                         
                         if readable:
                             data = _os.read(master_fd, 4096)
                             if not data:
                                 break
-                            text = data.decode('utf-8', errors='replace')
                             
-                            for char in text:
-                                if char == '\n':
-                                    if current_line:
-                                        output_queue.put(('output', current_line))
-                                    current_line = ""
-                                elif char == '\r':
-                                    pass  # Ignore carriage returns
-                                else:
-                                    current_line += char
+                            text = data.decode('utf-8', errors='replace')
+                            # Strip ANSI escape sequences
+                            text = ansi_escape.sub('', text)
+                            buffer += text
+                            last_flush_time = time.time()
+                            
+                            # Process complete lines
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                line = line.rstrip('\r')
+                                if line:  # Don't send empty lines
+                                    output_queue.put(('output', line))
+                        
                         else:
-                            # Timeout - no data received, check if we have a pending prompt
-                            if current_line:
+                            # Timeout - check if we should flush the buffer
+                            if buffer and (time.time() - last_flush_time) > 0.15:
+                                # Clean up the buffer
+                                buffer = buffer.rstrip('\r')
+                                
                                 # Check if it looks like a prompt waiting for input
-                                line_lower = current_line.lower().strip()
+                                buffer_lower = buffer.lower().strip()
                                 is_prompt = (
-                                    current_line.rstrip().endswith(':') or
-                                    current_line.rstrip().endswith('?') or
-                                    '(yes/no)' in line_lower or
-                                    '(y/n)' in line_lower or
-                                    line_lower.endswith('(1/2):') or
-                                    line_lower.endswith('[default=1]:') or
-                                    'username:' in line_lower or
-                                    'password:' in line_lower or
-                                    'enter filename:' in line_lower or
-                                    'select mode' in line_lower or
-                                    'select (' in line_lower or
-                                    'confirm' in line_lower and ':' in current_line
+                                    buffer.rstrip().endswith(':') or
+                                    buffer.rstrip().endswith('?') or
+                                    '(yes/no)' in buffer_lower or
+                                    '(y/n)' in buffer_lower or
+                                    '(1/2)' in buffer_lower or
+                                    '[default=' in buffer_lower or
+                                    'username:' in buffer_lower or
+                                    'password:' in buffer_lower or
+                                    'filename:' in buffer_lower or
+                                    'choice:' in buffer_lower or
+                                    buffer_lower.startswith('select')
                                 )
                                 
-                                if is_prompt:
-                                    output_queue.put(('output', current_line))
-                                    current_line = ""
+                                if is_prompt and buffer:
+                                    output_queue.put(('output', buffer))
+                                    buffer = ""
                                     
                     except OSError:
                         break
                 
-                if current_line:
-                    output_queue.put(('output', current_line))
+                # Flush remaining buffer
+                if buffer:
+                    for line in buffer.split('\n'):
+                        line = line.rstrip('\r')
+                        if line:
+                            output_queue.put(('output', line))
                 
                 pty_master_fd = None  # Clear global ref
                 _os.close(master_fd)
@@ -185,6 +198,9 @@ def run_script_thread(script_path, csv_path):
         
         if not use_pty:
             # Windows fallback - use threads to read output
+            import re as _re
+            ansi_escape = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            
             running_process = subprocess.Popen(
                 [sys.executable, '-u', script_path],
                 stdin=subprocess.PIPE,
@@ -195,38 +211,54 @@ def run_script_thread(script_path, csv_path):
                 cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
             )
             
-            current_line = ""
-            last_output_time = time.time()
+            buffer = ""
+            last_data_time = time.time()
             
             while True:
                 byte = running_process.stdout.read(1)
                 if not byte:
-                    if current_line:
-                        output_queue.put(('output', current_line))
+                    # Process remaining buffer
+                    if buffer:
+                        for line in buffer.split('\n'):
+                            line = line.rstrip('\r')
+                            if line:
+                                output_queue.put(('output', line))
                     break
                 
                 char = byte.decode('utf-8', errors='replace')
+                buffer += char
+                last_data_time = time.time()
                 
-                if char == '\n':
-                    output_queue.put(('output', current_line))
-                    current_line = ""
-                    last_output_time = time.time()
-                elif char == '\r':
-                    pass
-                else:
-                    current_line += char
-                    # Check if this looks like a prompt waiting for input
-                    if current_line and (
-                        current_line.rstrip().endswith((':', '?', ')', ']')) or
-                        any(kw in current_line.lower() for kw in 
-                            ['select', 'enter', 'username', 'password', 'confirm', 
-                             'choice', 'yes/no', '1/2', 'press'])
-                    ):
-                        # Wait a tiny bit to see if more data comes
-                        time.sleep(0.05)
-                        # Flush the prompt
-                        output_queue.put(('output', current_line))
-                        current_line = ""
+                # Strip ANSI codes from buffer periodically
+                buffer = ansi_escape.sub('', buffer)
+                
+                # Process complete lines
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.rstrip('\r')
+                    if line:
+                        output_queue.put(('output', line))
+                
+                # Check for prompts if buffer has content and ends with prompt chars
+                if buffer:
+                    buffer_clean = buffer.rstrip()
+                    buffer_lower = buffer_clean.lower()
+                    is_prompt = (
+                        buffer_clean.endswith(':') or
+                        buffer_clean.endswith('?') or
+                        '(yes/no)' in buffer_lower or
+                        '(1/2)' in buffer_lower or
+                        '[default=' in buffer_lower or
+                        'username:' in buffer_lower or
+                        'password:' in buffer_lower
+                    )
+                    
+                    if is_prompt:
+                        time.sleep(0.05)  # Small delay to catch any trailing chars
+                        buffer = buffer.rstrip('\r')
+                        if buffer:
+                            output_queue.put(('output', buffer))
+                            buffer = ""
             
             running_process.wait()
             output_queue.put(('exit', running_process.returncode))
