@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-ACI Bulk EPG Delete Script
-===========================
-Remove EPG static bindings from existing ports.
+ACI Bulk EPG Add Script
+========================
+Add EPG static bindings to existing ports.
 
 Features:
-- Delete EPGs from ports
-- Preview all deletions before executing
+- Add EPGs to ports that already have policy groups configured
+- Handles EPGs that exist in multiple Application Profiles
+- Batch preview before deployment
 - Dry-run mode
-- Batch deletion
+- Interactive Application Profile selection
 
 Input CSV Format:
 Switch,Port,VLANS
@@ -49,7 +50,7 @@ TENANTS = {
 }
 
 POD_ID = "1"
-DEPLOYMENT_FILE = "epg_delete.csv"
+DEPLOYMENT_FILE = "epg_add.csv"
 
 
 # =============================================================================
@@ -151,8 +152,29 @@ def get_epg_app_profiles(session, apic_url, tenant, vlan_id):
         return []
 
 
-def find_epg_binding(session, apic_url, tenant, app_profile, epg_name, path_dn):
-    """Find if an EPG binding exists and return its details."""
+def check_port_exists(session, apic_url, node_id, port):
+    """Check if port has a policy group assigned (is configured)."""
+    eth_port = f"eth{port}" if not port.startswith("eth") else port
+    
+    # Check if port selector exists for this port
+    port_num = port.split('/')[-1]
+    url = f"{apic_url}/api/class/infraPortBlk.json?query-target-filter=and(eq(infraPortBlk.fromPort,\"{port_num}\"),eq(infraPortBlk.toPort,\"{port_num}\"))"
+    
+    try:
+        response = session.get(url, verify=False, timeout=15)
+        if response.status_code == 200:
+            data = response.json().get("imdata", [])
+            for item in data:
+                dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
+                if node_id in dn:
+                    return True
+    except:
+        pass
+    return False
+
+
+def check_epg_binding_exists(session, apic_url, tenant, app_profile, epg_name, path_dn):
+    """Check if an EPG binding already exists on a path."""
     try:
         url = f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{app_profile}/epg-{epg_name}.json?query-target=children&target-subtree-class=fvRsPathAtt"
         response = session.get(url, verify=False, timeout=15)
@@ -160,23 +182,29 @@ def find_epg_binding(session, apic_url, tenant, app_profile, epg_name, path_dn):
             for item in response.json().get("imdata", []):
                 attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
                 if path_dn in attrs.get("tDn", ""):
-                    return {
-                        "dn": attrs.get("dn", ""),
-                        "tDn": attrs.get("tDn", ""),
-                        "encap": attrs.get("encap", ""),
-                        "mode": attrs.get("mode", "")
-                    }
+                    return True
     except:
         pass
-    return None
+    return False
 
 
-def delete_static_binding(session, apic_url, binding_dn):
-    """Delete a static binding from an EPG."""
+def deploy_static_binding(session, apic_url, tenant, app_profile, epg_name, vlan_id, mode, path_dn):
+    """Deploy a static binding to an EPG."""
+    payload = {
+        "fvRsPathAtt": {
+            "attributes": {
+                "tDn": path_dn,
+                "encap": f"vlan-{vlan_id}",
+                "instrImedcy": "immediate",
+                "mode": mode
+            }
+        }
+    }
+    
     try:
-        response = session.delete(
-            f"{apic_url}/api/mo/{binding_dn}.json",
-            verify=False, timeout=30
+        response = session.post(
+            f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{app_profile}/epg-{epg_name}.json",
+            json=payload, verify=False, timeout=30
         )
         return response.status_code == 200, response.text
     except Exception as e:
@@ -187,8 +215,8 @@ def delete_static_binding(session, apic_url, binding_dn):
 # CSV FUNCTIONS
 # =============================================================================
 
-def load_epg_delete_csv(filename):
-    """Load EPG delete deployment CSV file."""
+def load_epg_add_csv(filename):
+    """Load EPG add deployment CSV file."""
     try:
         with open(filename, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
@@ -215,7 +243,7 @@ def load_epg_delete_csv(filename):
 
 def main():
     print("\n" + "=" * 70)
-    print(" ACI BULK EPG DELETE SCRIPT")
+    print(" ACI BULK EPG ADD SCRIPT")
     print("=" * 70)
     
     # Check configuration
@@ -232,7 +260,7 @@ def main():
     
     # Load deployments
     print(f"\n[INFO] Loading from: {deployment_file}")
-    deployments = load_epg_delete_csv(deployment_file)
+    deployments = load_epg_add_csv(deployment_file)
     if not deployments:
         sys.exit(1)
     
@@ -242,8 +270,8 @@ def main():
     print("\n" + "-" * 70)
     print(" RUN MODE")
     print("-" * 70)
-    print("\n  [1] Normal - Delete EPG bindings")
-    print("  [2] Dry-Run - Validate only, don't delete")
+    print("\n  [1] Normal - Deploy EPG bindings")
+    print("  [2] Dry-Run - Validate only, don't deploy")
     
     while True:
         print("\nSelect mode (1/2): ", end="", flush=True)
@@ -251,6 +279,23 @@ def main():
         if mode_choice in ['1', '2']:
             break
     dry_run = (mode_choice == '2')
+    
+    # Select binding mode
+    print("\n" + "-" * 70)
+    print(" BINDING MODE")
+    print("-" * 70)
+    print("\n  [1] Trunk (Tagged) - Multiple VLANs, tagged traffic")
+    print("  [2] Access (Untagged) - Single VLAN, untagged traffic")
+    
+    while True:
+        print("\nSelect mode (1/2) [default=1]: ", end="", flush=True)
+        binding_choice = input().strip()
+        if binding_choice in ["", "1"]:
+            binding_mode = "regular"  # trunk
+            break
+        elif binding_choice == "2":
+            binding_mode = "untagged"  # access
+            break
     
     # Get credentials
     print("\n" + "-" * 70)
@@ -287,16 +332,16 @@ def main():
         sys.exit(1)
     
     # ==========================================================================
-    # PHASE 1: FIND ALL BINDINGS TO DELETE
+    # PHASE 1: ANALYZE ALL DEPLOYMENTS
     # ==========================================================================
     
     print("\n" + "=" * 70)
-    print(" PHASE 1: FINDING EPG BINDINGS")
+    print(" PHASE 1: ANALYZING DEPLOYMENTS")
     print("=" * 70)
     
-    bindings_to_delete = []
-    not_found = []
-    app_profile_selections = {}
+    all_bindings = []
+    alerts = []
+    app_profile_selections = {}  # Cache user selections for multi-AP VLANs
     
     for idx, dep in enumerate(deployments, 1):
         print(f"\n[{idx}/{len(deployments)}] {dep['switch']} port {dep['port']}")
@@ -315,13 +360,17 @@ def main():
             print(f"  [SKIP] Cannot extract node ID from switch name")
             continue
         
+        # Check port exists
+        if not check_port_exists(session, apic_url, node_id, dep['port']):
+            print(f"  [WARNING] Port may not have policy group configured")
+        
         # Build path DN
         eth_port = f"eth{dep['port']}" if not dep['port'].startswith("eth") else dep['port']
         path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_port}]"
         
         # Process each VLAN
         vlans = parse_vlans(dep['vlans'])
-        print(f"  Searching for {len(vlans)} VLAN binding(s)...")
+        print(f"  Processing {len(vlans)} VLAN(s)...")
         
         for vlan in vlans:
             # Find EPG(s) for this VLAN
@@ -329,147 +378,231 @@ def main():
             
             if not epg_results:
                 print(f"    VLAN {vlan}: [WARNING] No EPG found")
-                not_found.append({
+                alerts.append({
+                    "type": "NO_EPG",
                     "switch": dep['switch'],
                     "port": dep['port'],
                     "vlan": vlan,
-                    "reason": "No EPG found"
+                    "message": f"No EPG found for VLAN {vlan}"
                 })
                 continue
             
-            # Handle multiple Application Profiles
+            # Check if VLAN exists in multiple Application Profiles
             if len(epg_results) > 1:
+                # Check if we already have a selection for this VLAN
                 cache_key = f"{env}:{vlan}"
-                if cache_key not in app_profile_selections:
-                    print(f"\n    [ALERT] VLAN {vlan} exists in multiple Application Profiles:")
-                    print("    " + "-" * 40)
-                    for i, opt in enumerate(epg_results, 1):
-                        print(f"    [{i}] {opt['app_profile']} -> {opt['epg_name']}")
-                    print("    [A] Check ALL Application Profiles")
-                    print("    " + "-" * 40)
-                    
-                    while True:
-                        print(f"\n    Select for VLAN {vlan}: ", end="", flush=True)
-                        choice = input().strip().upper()
-                        if choice == 'A':
-                            app_profile_selections[cache_key] = "ALL"
-                            break
-                        try:
-                            idx = int(choice) - 1
-                            if 0 <= idx < len(epg_results):
-                                app_profile_selections[cache_key] = epg_results[idx]['app_profile']
-                                break
-                        except:
-                            pass
-                        print("    [ERROR] Invalid selection")
-                
-                selection = app_profile_selections[cache_key]
-                if selection != "ALL":
-                    epg_results = [e for e in epg_results if e['app_profile'] == selection]
-            
-            # Find actual bindings
-            for epg in epg_results:
-                binding = find_epg_binding(session, apic_url, tenant, epg['app_profile'], epg['epg_name'], path_dn)
-                
-                if binding:
-                    bindings_to_delete.append({
+                if cache_key in app_profile_selections:
+                    selected_ap = app_profile_selections[cache_key]
+                    epg_results = [e for e in epg_results if e['app_profile'] == selected_ap]
+                else:
+                    # Alert - will prompt user later
+                    alerts.append({
+                        "type": "MULTI_AP",
                         "switch": dep['switch'],
                         "port": dep['port'],
-                        "node_id": node_id,
                         "vlan": vlan,
                         "env": env,
-                        "tenant": tenant,
-                        "app_profile": epg['app_profile'],
-                        "epg_name": epg['epg_name'],
-                        "binding_dn": binding['dn'],
-                        "mode": binding['mode']
+                        "options": epg_results,
+                        "message": f"VLAN {vlan} exists in {len(epg_results)} Application Profiles"
                     })
-                    print(f"    VLAN {vlan}: [FOUND] {epg['epg_name']} ({epg['app_profile']})")
-                else:
-                    not_found.append({
-                        "switch": dep['switch'],
-                        "port": dep['port'],
-                        "vlan": vlan,
-                        "reason": f"No binding on {epg['app_profile']}"
-                    })
+                    continue
+            
+            if epg_results:
+                epg = epg_results[0]
+                
+                # Check if binding already exists
+                already_bound = check_epg_binding_exists(
+                    session, apic_url, tenant, epg['app_profile'], epg['epg_name'], path_dn
+                )
+                
+                all_bindings.append({
+                    "switch": dep['switch'],
+                    "port": dep['port'],
+                    "node_id": node_id,
+                    "vlan": vlan,
+                    "env": env,
+                    "tenant": tenant,
+                    "app_profile": epg['app_profile'],
+                    "epg_name": epg['epg_name'],
+                    "path_dn": path_dn,
+                    "already_bound": already_bound,
+                    "mode": binding_mode
+                })
     
     # ==========================================================================
-    # PHASE 2: PREVIEW DELETIONS
+    # PHASE 2: RESOLVE MULTI-AP ALERTS
+    # ==========================================================================
+    
+    multi_ap_alerts = [a for a in alerts if a['type'] == 'MULTI_AP']
+    
+    if multi_ap_alerts:
+        print("\n" + "=" * 70)
+        print(" PHASE 2: RESOLVE APPLICATION PROFILE CONFLICTS")
+        print("=" * 70)
+        
+        # Group by VLAN to avoid asking multiple times
+        vlan_alerts = {}
+        for alert in multi_ap_alerts:
+            key = f"{alert['env']}:{alert['vlan']}"
+            if key not in vlan_alerts:
+                vlan_alerts[key] = alert
+        
+        for key, alert in vlan_alerts.items():
+            print(f"\n[ALERT] VLAN {alert['vlan']} exists in multiple Application Profiles:")
+            print("-" * 50)
+            for i, opt in enumerate(alert['options'], 1):
+                print(f"  [{i}] {opt['app_profile']} -> {opt['epg_name']}")
+            print("-" * 50)
+            
+            while True:
+                print(f"\nSelect Application Profile for VLAN {alert['vlan']}: ", end="", flush=True)
+                choice = input().strip()
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(alert['options']):
+                        selected = alert['options'][idx]
+                        app_profile_selections[key] = selected['app_profile']
+                        print(f"  [SELECTED] {selected['app_profile']}")
+                        
+                        # Now add the bindings for all ports with this VLAN
+                        for dep in deployments:
+                            env = detect_environment(dep['switch'])
+                            if f"{env}:{alert['vlan']}" != key:
+                                continue
+                            
+                            if env not in sessions:
+                                continue
+                            
+                            session = sessions[env]
+                            apic_url = APIC_URLS[env]
+                            tenant = TENANTS[env]
+                            node_id = extract_node_id(dep['switch'])
+                            
+                            vlans = parse_vlans(dep['vlans'])
+                            if alert['vlan'] not in vlans:
+                                continue
+                            
+                            eth_port = f"eth{dep['port']}" if not dep['port'].startswith("eth") else dep['port']
+                            path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_port}]"
+                            
+                            already_bound = check_epg_binding_exists(
+                                session, apic_url, tenant, selected['app_profile'], selected['epg_name'], path_dn
+                            )
+                            
+                            all_bindings.append({
+                                "switch": dep['switch'],
+                                "port": dep['port'],
+                                "node_id": node_id,
+                                "vlan": alert['vlan'],
+                                "env": env,
+                                "tenant": tenant,
+                                "app_profile": selected['app_profile'],
+                                "epg_name": selected['epg_name'],
+                                "path_dn": path_dn,
+                                "already_bound": already_bound,
+                                "mode": binding_mode
+                            })
+                        break
+                except:
+                    pass
+                print("  [ERROR] Invalid selection")
+    
+    # ==========================================================================
+    # PHASE 3: PREVIEW ALL BINDINGS
     # ==========================================================================
     
     print("\n" + "=" * 70)
-    print(" PHASE 2: DELETION PREVIEW")
+    print(" PHASE 3: DEPLOYMENT PREVIEW")
     print("=" * 70)
     
-    if not bindings_to_delete:
-        print("\n[INFO] No bindings found to delete")
-        if not_found:
-            print(f"\n  {len(not_found)} binding(s) not found:")
-            for item in not_found[:10]:
-                print(f"    - {item['switch']} port {item['port']}: VLAN {item['vlan']} - {item['reason']}")
-            if len(not_found) > 10:
-                print(f"    ... and {len(not_found) - 10} more")
+    if not all_bindings:
+        print("\n[INFO] No valid bindings to deploy")
         sys.exit(0)
     
-    print(f"\n  Bindings to delete: {len(bindings_to_delete)}")
-    print(f"  Not found:          {len(not_found)}")
+    # Show summary
+    new_bindings = [b for b in all_bindings if not b['already_bound']]
+    existing_bindings = [b for b in all_bindings if b['already_bound']]
     
-    print("\n  === BINDINGS TO DELETE ===")
-    print("  " + "-" * 76)
-    print(f"  {'Switch':<20} {'Port':<8} {'VLAN':<6} {'EPG':<25} {'App Profile':<15}")
-    print("  " + "-" * 76)
+    print(f"\n  Total bindings: {len(all_bindings)}")
+    print(f"  New bindings:   {len(new_bindings)}")
+    print(f"  Already exist:  {len(existing_bindings)} (will be skipped)")
     
-    for b in bindings_to_delete[:25]:
-        mode = "trunk" if b['mode'] == "regular" else "access"
-        print(f"  {b['switch']:<20} {b['port']:<8} {b['vlan']:<6} {b['epg_name']:<25} {b['app_profile']:<15}")
+    # Show alerts
+    no_epg_alerts = [a for a in alerts if a['type'] == 'NO_EPG']
+    if no_epg_alerts:
+        print(f"\n  [WARNINGS] {len(no_epg_alerts)} VLAN(s) with no EPG found:")
+        for alert in no_epg_alerts[:5]:
+            print(f"    - {alert['switch']} port {alert['port']}: VLAN {alert['vlan']}")
+        if len(no_epg_alerts) > 5:
+            print(f"    ... and {len(no_epg_alerts) - 5} more")
     
-    if len(bindings_to_delete) > 25:
-        print(f"  ... and {len(bindings_to_delete) - 25} more bindings")
+    # Show binding details
+    mode_display = "Trunk (Tagged)" if binding_mode == "regular" else "Access (Untagged)"
     
-    print("  " + "-" * 76)
+    print(f"\n  Binding Mode: {mode_display}")
+    print("\n  === NEW BINDINGS TO DEPLOY ===")
+    print("  " + "-" * 66)
+    print(f"  {'Switch':<20} {'Port':<8} {'VLAN':<6} {'EPG':<30}")
+    print("  " + "-" * 66)
+    
+    for b in new_bindings[:20]:
+        print(f"  {b['switch']:<20} {b['port']:<8} {b['vlan']:<6} {b['epg_name']:<30}")
+    
+    if len(new_bindings) > 20:
+        print(f"  ... and {len(new_bindings) - 20} more bindings")
+    
+    print("  " + "-" * 66)
+    
+    if existing_bindings:
+        print(f"\n  === EXISTING BINDINGS (will skip) ===")
+        for b in existing_bindings[:5]:
+            print(f"  {b['switch']} port {b['port']}: VLAN {b['vlan']} already bound")
+        if len(existing_bindings) > 5:
+            print(f"  ... and {len(existing_bindings) - 5} more")
     
     # ==========================================================================
-    # PHASE 3: CONFIRM AND DELETE
+    # PHASE 4: CONFIRM AND DEPLOY
     # ==========================================================================
     
     print("\n" + "=" * 70)
-    print(" PHASE 3: DELETION")
+    print(" PHASE 4: DEPLOYMENT")
     print("=" * 70)
     
     if dry_run:
-        print("\n[DRY-RUN] Would delete the following bindings:")
-        for b in bindings_to_delete:
-            print(f"  - {b['switch']} port {b['port']}: VLAN {b['vlan']} from {b['epg_name']}")
-        print(f"\n[DRY-RUN] {len(bindings_to_delete)} binding(s) would be deleted")
+        print("\n[DRY-RUN] Would deploy the following bindings:")
+        for b in new_bindings:
+            print(f"  - {b['switch']} port {b['port']}: VLAN {b['vlan']} -> {b['epg_name']}")
+        print(f"\n[DRY-RUN] {len(new_bindings)} binding(s) would be created")
         sys.exit(0)
     
-    print(f"\n[WARNING] About to delete {len(bindings_to_delete)} EPG binding(s)")
-    print("         This action cannot be undone!")
-    
-    print("\n  [Y] Yes - Delete all bindings")
+    print(f"\nReady to deploy {len(new_bindings)} binding(s)")
+    print("\n  [Y] Yes - Deploy all bindings")
     print("  [N] No - Cancel")
     
-    print("\nConfirm deletion (type 'YES' to confirm): ", end="", flush=True)
+    print("\nConfirm deployment: ", end="", flush=True)
     confirm = input().strip().upper()
     
-    if confirm != 'YES':
+    if confirm not in ['Y', 'YES']:
         print("\n[CANCELLED]")
         sys.exit(0)
     
-    # Delete
-    print("\n[INFO] Deleting bindings...")
+    # Deploy
+    print("\n[INFO] Deploying bindings...")
     
     success_count = 0
     fail_count = 0
     
-    for b in bindings_to_delete:
+    for b in new_bindings:
         session = sessions[b['env']]
         apic_url = APIC_URLS[b['env']]
         
-        success, response = delete_static_binding(session, apic_url, b['binding_dn'])
+        success, response = deploy_static_binding(
+            session, apic_url, b['tenant'], b['app_profile'],
+            b['epg_name'], b['vlan'], b['mode'], b['path_dn']
+        )
         
         if success:
-            print(f"  [DELETED] {b['switch']} port {b['port']}: VLAN {b['vlan']}")
+            print(f"  [OK] {b['switch']} port {b['port']}: VLAN {b['vlan']}")
             success_count += 1
         else:
             print(f"  [FAIL] {b['switch']} port {b['port']}: VLAN {b['vlan']} - {response[:50]}")
@@ -479,9 +612,9 @@ def main():
     print("\n" + "=" * 70)
     print(" COMPLETE")
     print("=" * 70)
-    print(f"\n  Deleted:   {success_count}")
-    print(f"  Failed:    {fail_count}")
-    print(f"  Not found: {len(not_found)}")
+    print(f"\n  Success: {success_count}")
+    print(f"  Failed:  {fail_count}")
+    print(f"  Skipped: {len(existing_bindings)} (already existed)")
     print("\n" + "=" * 70 + "\n")
 
 
