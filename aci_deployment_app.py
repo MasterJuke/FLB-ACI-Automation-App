@@ -95,207 +95,87 @@ def run_script_thread(script_path, csv_path):
         env['PYTHONUNBUFFERED'] = '1'
         env['ACI_WEB_UI'] = '1'  # Signal to scripts that they're running in web UI
         
-        # Use pseudo-terminal on Unix for proper prompt handling
-        import platform
-        use_pty = platform.system() != 'Windows'
+        # Use simple pipes instead of PTY - more reliable
+        running_process = subprocess.Popen(
+            [sys.executable, '-u', script_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            env=env,
+            cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
+        )
         
-        if use_pty:
-            try:
-                import pty
-                import os as _os
-                import termios
-                import struct
-                import fcntl
-                global pty_master_fd
-                
-                master_fd, slave_fd = pty.openpty()
-                pty_master_fd = master_fd  # Store globally for send_input
-                
-                # Set terminal size to very wide to prevent line wrapping
-                try:
-                    winsize = struct.pack('HHHH', 24, 500, 0, 0)  # 24 rows, 500 cols
-                    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
-                except:
-                    pass
-                
-                # Disable echo on the PTY
-                try:
-                    attrs = termios.tcgetattr(slave_fd)
-                    attrs[3] = attrs[3] & ~termios.ECHO  # Disable echo
-                    termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
-                except:
-                    pass
-                
-                running_process = subprocess.Popen(
-                    [sys.executable, '-u', script_path],
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    env=env,
-                    cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
-                )
-                
-                _os.close(slave_fd)
-                
-                # Read from master
-                import select as _select
-                import re as _re
-                global last_sent_input
-                
-                # Regex to strip ANSI escape sequences
-                ansi_escape = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-                
-                buffer = ""
-                last_data_time = time.time()
-                
-                while True:
-                    try:
-                        # Wait for data with timeout
-                        readable, _, _ = _select.select([master_fd], [], [], 0.03)
-                        
-                        if readable:
-                            data = _os.read(master_fd, 8192)
-                            if not data:
-                                break
-                            
-                            text = data.decode('utf-8', errors='replace')
-                            # Strip ANSI escape sequences
-                            text = ansi_escape.sub('', text)
-                            # Remove carriage returns
-                            text = text.replace('\r', '')
-                            
-                            buffer += text
-                            last_data_time = time.time()
-                            
-                            # Process complete lines (lines ending with newline)
-                            while '\n' in buffer:
-                                line, buffer = buffer.split('\n', 1)
-                                line = line.strip()
-                                
-                                # Skip empty lines and echoed input
-                                if not line:
-                                    continue
-                                if last_sent_input and line == last_sent_input:
-                                    last_sent_input = ""  # Clear after filtering once
-                                    continue
-                                    
-                                output_queue.put(('output', line))
-                        
-                        else:
-                            # Timeout - check if we should flush the buffer as a prompt
-                            time_since_data = time.time() - last_data_time
-                            
-                            if buffer.strip() and time_since_data > 0.2:
-                                buffer_clean = buffer.strip()
-                                buffer_lower = buffer_clean.lower()
-                                
-                                # Check if it looks like a prompt waiting for input
-                                is_prompt = (
-                                    buffer_clean.endswith(':') or
-                                    buffer_clean.endswith('?') or
-                                    '(yes/no)' in buffer_lower or
-                                    '(y/n)' in buffer_lower or
-                                    '(1/2)' in buffer_lower or
-                                    '[default=' in buffer_lower or
-                                    'username:' in buffer_lower or
-                                    'password:' in buffer_lower or
-                                    'filename:' in buffer_lower or
-                                    'select ' in buffer_lower or
-                                    'choice:' in buffer_lower or
-                                    'confirm' in buffer_lower
-                                )
-                                
-                                if is_prompt:
-                                    # Skip if it's just echoed input
-                                    if not (last_sent_input and buffer_clean == last_sent_input):
-                                        output_queue.put(('output', buffer_clean))
-                                    buffer = ""
-                                    last_sent_input = ""
-                                    
-                    except OSError:
-                        break
-                
-                # Flush remaining buffer
-                if buffer.strip():
-                    for line in buffer.split('\n'):
-                        line = line.strip()
-                        if line:
-                            output_queue.put(('output', line))
-                
-                pty_master_fd = None  # Clear global ref
-                _os.close(master_fd)
-                running_process.wait()
-                output_queue.put(('exit', running_process.returncode))
-                
-            except ImportError:
-                use_pty = False
+        import re as _re
+        # Regex to strip ANSI escape sequences
+        ansi_escape = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         
-        if not use_pty:
-            # Windows fallback - use threads to read output
-            import re as _re
-            ansi_escape = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        buffer = b""
+        
+        while True:
+            # Read available data
+            byte = running_process.stdout.read(1)
+            if not byte:
+                break
             
-            running_process = subprocess.Popen(
-                [sys.executable, '-u', script_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
-                env=env,
-                cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
-            )
+            buffer += byte
             
-            buffer = ""
-            last_data_time = time.time()
-            
-            while True:
-                byte = running_process.stdout.read(1)
-                if not byte:
-                    # Process remaining buffer
-                    if buffer:
-                        for line in buffer.split('\n'):
-                            line = line.rstrip('\r')
-                            if line:
-                                output_queue.put(('output', line))
-                    break
-                
-                char = byte.decode('utf-8', errors='replace')
-                buffer += char
-                last_data_time = time.time()
-                
-                # Strip ANSI codes from buffer periodically
-                buffer = ansi_escape.sub('', buffer)
-                
-                # Process complete lines
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.rstrip('\r')
+            # Check if we have a complete line
+            if byte == b'\n':
+                try:
+                    line = buffer.decode('utf-8', errors='replace')
+                    line = ansi_escape.sub('', line)
+                    line = line.strip()
                     if line:
                         output_queue.put(('output', line))
-                
-                # Check for prompts if buffer has content and ends with prompt chars
-                if buffer:
-                    buffer_clean = buffer.rstrip()
-                    buffer_lower = buffer_clean.lower()
+                except:
+                    pass
+                buffer = b""
+            
+            # Check for prompts (data ending with : or ? without newline)
+            elif len(buffer) > 2:
+                try:
+                    text = buffer.decode('utf-8', errors='replace')
+                    text_clean = text.rstrip()
+                    text_lower = text_clean.lower()
+                    
+                    # Detect prompt patterns
                     is_prompt = (
-                        buffer_clean.endswith(':') or
-                        buffer_clean.endswith('?') or
-                        '(yes/no)' in buffer_lower or
-                        '(1/2)' in buffer_lower or
-                        '[default=' in buffer_lower or
-                        'username:' in buffer_lower or
-                        'password:' in buffer_lower
+                        text_clean.endswith(':') or
+                        text_clean.endswith('?') or
+                        text_clean.endswith(')') and ('(1/2)' in text_lower or '(yes/no)' in text_lower or '(y/n)' in text_lower)
                     )
                     
                     if is_prompt:
-                        time.sleep(0.05)  # Small delay to catch any trailing chars
-                        buffer = buffer.rstrip('\r')
-                        if buffer:
-                            output_queue.put(('output', buffer))
-                            buffer = ""
-            
-            running_process.wait()
-            output_queue.put(('exit', running_process.returncode))
+                        # Wait a tiny bit to see if more data is coming
+                        import select
+                        try:
+                            readable, _, _ = select.select([running_process.stdout], [], [], 0.1)
+                            if not readable:
+                                # No more data, this is a prompt
+                                text = ansi_escape.sub('', text)
+                                text = text.strip()
+                                if text:
+                                    output_queue.put(('output', text))
+                                buffer = b""
+                        except:
+                            pass
+                except:
+                    pass
+        
+        # Flush remaining buffer
+        if buffer:
+            try:
+                text = buffer.decode('utf-8', errors='replace')
+                text = ansi_escape.sub('', text)
+                text = text.strip()
+                if text:
+                    output_queue.put(('output', text))
+            except:
+                pass
+        
+        running_process.wait()
+        output_queue.put(('exit', running_process.returncode))
         
     except Exception as e:
         output_queue.put(('error', str(e)))
@@ -303,26 +183,16 @@ def run_script_thread(script_path, csv_path):
         running_process = None
 
 
-# Global variable to store master_fd for pty
+# Global variable to store master_fd for pty (not used in new approach but kept for compatibility)
 pty_master_fd = None
-last_sent_input = ""  # Track sent input to filter echo
+last_sent_input = ""
 
 def send_input_to_process(text):
     """Send input to the running process."""
-    global running_process, pty_master_fd, last_sent_input
+    global running_process, last_sent_input
     
-    last_sent_input = text.strip()  # Store to filter echo
+    last_sent_input = text.strip()
     
-    # Try pty first
-    if pty_master_fd is not None:
-        try:
-            import os as _os
-            _os.write(pty_master_fd, (text + '\n').encode('utf-8'))
-            return True
-        except:
-            pass
-    
-    # Fall back to stdin
     if running_process and running_process.stdin:
         try:
             data = (text + '\n').encode('utf-8')
