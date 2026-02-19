@@ -100,7 +100,8 @@ SPEED_MAPPING = {
 
 def prompt_input(prompt_text):
     """Print prompt and get input - ensures prompt is visible in web UI."""
-    print(prompt_text, end="", flush=True)
+    sys.stdout.write(prompt_text)
+    sys.stdout.flush()
     return input()
 
 
@@ -1201,7 +1202,8 @@ def main():
     
     # Get deployment file
     print(f"\n[INFO] Default deployment file: {DEPLOYMENT_FILE}")
-    print("Press Enter to use default, or enter filename: ", end="", flush=True)
+    sys.stdout.write("Press Enter to use default, or enter filename: ")
+    sys.stdout.flush()
     custom_file = input().strip()
     deployment_file = custom_file if custom_file else DEPLOYMENT_FILE
     
@@ -1221,7 +1223,8 @@ def main():
     print("  [2] Dry-Run - Validate only, don't deploy")
     
     while True:
-        print("\nSelect mode (1/2): ", end="", flush=True)
+        sys.stdout.write("\nSelect mode (1/2): ")
+        sys.stdout.flush()
         mode_choice = input().strip()
         if mode_choice in ['1', '2']:
             break
@@ -1235,7 +1238,8 @@ def main():
     print("  [2] FLOW-CONTROL-ON")
     
     while True:
-        print("\nSelect (1/2) [default=1]: ", end="", flush=True)
+        sys.stdout.write("\nSelect (1/2) [default=1]: ")
+        sys.stdout.flush()
         flow_choice = input().strip()
         if flow_choice in ["", "1"]:
             flow_control = "default"
@@ -1248,10 +1252,12 @@ def main():
     print("\n" + "-" * 70)
     print(" AUTHENTICATION")
     print("-" * 70)
-    print("\nUsername: ", end="", flush=True)
+    sys.stdout.write("\nUsername: ")
+    sys.stdout.flush()
     username = input().strip()
-    print("Password: ", end="", flush=True)
-    # Check if running in web UI mode (PTY) - getpass doesn't work with PTY
+    sys.stdout.write("Password: ")
+    sys.stdout.flush()
+    # Check if running in web UI mode - getpass doesn't work with pipes
     if os.environ.get('ACI_WEB_UI') == '1':
         password = input().strip()
     else:
