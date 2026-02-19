@@ -249,7 +249,7 @@ def stop_process():
 # HTML TEMPLATE
 # =============================================================================
 
-HTML_TEMPLATE = '''
+HTML_TEMPLATE = r'''
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2136,8 +2136,39 @@ Confirm deletion (type 'YES' to confirm): _
         function addLine(type, text, lineType = 'normal') {
             const output = document.getElementById(type + 'Output');
             const line = document.createElement('div');
+            
+            // Auto-detect line type based on content
+            if (lineType === 'normal') {
+                const textUpper = text.toUpperCase();
+                if (textUpper.includes('[FOUND]') || textUpper.includes('[SUCCESS]') || textUpper.includes('[OK]') || textUpper.includes('[CREATED]') || textUpper.includes('[DEPLOYED]')) {
+                    lineType = 'success';
+                } else if (textUpper.includes('[ERROR]') || textUpper.includes('[FAILED]') || textUpper.includes('[FAILURE]')) {
+                    lineType = 'error';
+                } else if (textUpper.includes('[WARNING]') || textUpper.includes('[WARN]') || textUpper.includes('[SKIP]') || textUpper.includes('[SKIPPED]')) {
+                    lineType = 'warning';
+                } else if (textUpper.includes('[INFO]')) {
+                    lineType = 'info';
+                } else if (text.startsWith('===') || text.startsWith('---') || text.startsWith('***')) {
+                    lineType = 'header';
+                }
+            }
+            
             line.className = 'terminal-line ' + lineType;
-            line.textContent = text;
+            
+            // For success/error/warning lines, also highlight the tag itself
+            if (lineType === 'success' || lineType === 'error' || lineType === 'warning' || lineType === 'info') {
+                // Use innerHTML to highlight tags, but escape the rest
+                const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const highlighted = escaped
+                    .replace(/\[(FOUND|SUCCESS|OK|CREATED|DEPLOYED)\]/gi, '<span style="color: var(--accent-green); font-weight: 600;">[$1]</span>')
+                    .replace(/\[(ERROR|FAILED|FAILURE)\]/gi, '<span style="color: var(--accent-red); font-weight: 600;">[$1]</span>')
+                    .replace(/\[(WARNING|WARN|SKIP|SKIPPED)\]/gi, '<span style="color: var(--accent-orange); font-weight: 600;">[$1]</span>')
+                    .replace(/\[(INFO)\]/gi, '<span style="color: var(--accent-blue); font-weight: 600;">[$1]</span>');
+                line.innerHTML = highlighted;
+            } else {
+                line.textContent = text;
+            }
+            
             output.appendChild(line);
             output.scrollTop = output.scrollHeight;
         }
