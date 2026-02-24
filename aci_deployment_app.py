@@ -4,16 +4,16 @@ ACI Bulk Deployment Web Application
 ====================================
 Flask-based web UI for running ACI deployment scripts.
 
-Features:
+Features (v1.3.0):
 - Sleek Docker/VS Code inspired interface
-- Real-time terminal output
-- Interactive input handling
-- Settings management for script paths
-- CSV format reference tables
-- Deployment log with history tracking
-- Estimated time-saved calculator
+- Real-time terminal output with interactive input
+- APIC Credential Manager (in-memory, auto-injects into scripts)
+- CSV Validation before deployment
+- Auto-save deployment logs (sanitized, no credentials)
+- Rollback script generation per deployment
+- Deployment log with time-saved calculator
 - File picker for CSV selection
-- Enhanced bracket-number coloring in terminal
+- Bracket-number coloring in terminal
 
 Requirements:
 - Python 3.6+
@@ -21,23 +21,24 @@ Requirements:
 
 Usage:
     python aci_deployment_app.py
-
-Then open http://localhost:5000 in your browser.
+    Open http://localhost:5000 in your browser.
 
 Author: Network Automation
-Version: 1.2.0
+Version: 1.3.0
 """
 
 import os
 import sys
+import csv
 import json
+import re
 import subprocess
 import threading
 import queue
 import time
 from datetime import datetime
 from pathlib import Path
-from flask import Flask, render_template_string, request, jsonify, Response
+from flask import Flask, render_template_string, request, jsonify, send_file
 
 app = Flask(__name__)
 
@@ -47,7 +48,10 @@ app = Flask(__name__)
 
 CONFIG_FILE = "aci_deploy_config.json"
 LOG_FILE = "aci_deploy_log.json"
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'csv_uploads')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'csv_uploads')
+SAVED_LOGS_FOLDER = os.path.join(BASE_DIR, 'saved_logs')
+ROLLBACK_FOLDER = os.path.join(BASE_DIR, 'rollback_scripts')
 
 DEFAULT_CONFIG = {
     "vpc_script": "aci_bulk_vpc_deploy.py",
@@ -58,44 +62,38 @@ DEFAULT_CONFIG = {
     "default_individual_csv": "individual_port_deployments.csv",
     "default_epgadd_csv": "epg_add.csv",
     "default_epgdelete_csv": "epg_delete.csv",
-    "version": "1.2.0"
+    "version": "1.3.0"
 }
 
-# Time estimates (minutes) for manual APIC GUI operations per deployment item.
-# Based on: navigate fabric tree, locate switch/interface profile, create policy
-# groups, create port selectors, navigate to each EPG tenant/AP, add static
-# path bindings, select encap, verify deployment status in APIC.
 TIME_ESTIMATES = {
-    "vpc": {
-        "per_deployment": 18,
-        "label": "VPC Port Channel + EPG Bindings"
-    },
-    "individual": {
-        "per_deployment": 12,
-        "label": "Individual Port Policy + EPG Bindings"
-    },
-    "epgadd": {
-        "per_deployment": 6,
-        "label": "EPG Static Path Binding Addition"
-    },
-    "epgdelete": {
-        "per_deployment": 5,
-        "label": "EPG Static Path Binding Removal"
-    }
+    "vpc": {"per_deployment": 18, "label": "VPC Port Channel + EPG Bindings"},
+    "individual": {"per_deployment": 12, "label": "Individual Port Policy + EPG Bindings"},
+    "epgadd": {"per_deployment": 6, "label": "EPG Static Path Binding Addition"},
+    "epgdelete": {"per_deployment": 5, "label": "EPG Static Path Binding Removal"}
 }
 
-# Global state for running processes
+# CSV column requirements per script type
+CSV_REQUIREMENTS = {
+    "vpc": {"required": ["HOSTNAME", "SWITCH1", "SWITCH2", "SPEED", "VLANS", "WORKORDER"],
+            "validators": {"SPEED": r"^(1G|10G|25G|40G|100G)$", "VLANS": r"^[\d,\-\s\"]+$"}},
+    "individual": {"required": ["HOSTNAME", "SWITCH", "TYPE", "SPEED", "VLANS", "WORKORDER"],
+                   "validators": {"TYPE": r"^(ACCESS|TRUNK)$", "SPEED": r"^(1G|10G|25G|40G|100G)$", "VLANS": r"^[\d,\-\s\"]+$"}},
+    "epgadd": {"required": ["SWITCH", "PORT", "VLANS"],
+               "validators": {"PORT": r"^(eth)?[\d]+/[\d]+$", "VLANS": r"^[\d,\-\s\"]+$"}},
+    "epgdelete": {"required": ["SWITCH", "PORT", "VLANS"],
+                  "validators": {"PORT": r"^(eth)?[\d]+/[\d]+$", "VLANS": r"^[\d,\-\s\"]+$"}}
+}
+
+# Global state
 running_process = None
 output_queue = queue.Queue()
 input_queue = queue.Queue()
 
+# In-memory credential storage (NEVER written to disk)
+stored_credentials = {"username": None, "password": None, "set": False}
+
 # Track current run for logging
-current_run = {
-    "type": None,
-    "start_time": None,
-    "csv_path": None,
-    "output_lines": []
-}
+current_run = {"type": None, "start_time": None, "csv_path": None, "output_lines": [], "status": None}
 
 # =============================================================================
 # CONFIG MANAGEMENT
@@ -135,16 +133,18 @@ def save_log(log_data):
     with open(LOG_FILE, 'w') as f:
         json.dump(log_data, f, indent=2)
 
-def add_log_entry(deploy_type, csv_path, status, deployment_count, duration_seconds, output_summary):
+def add_log_entry(deploy_type, csv_path, status, deployment_count, duration_seconds, output_lines):
     log = load_log()
     est = TIME_ESTIMATES.get(deploy_type, {})
     manual_minutes = est.get("per_deployment", 10) * deployment_count
     auto_minutes = round(duration_seconds / 60, 2)
     saved_minutes = max(0, round(manual_minutes - auto_minutes, 1))
+    entry_id = len(log["entries"]) + 1
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     entry = {
-        "id": len(log["entries"]) + 1,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "id": entry_id,
+        "timestamp": timestamp,
         "type": deploy_type,
         "csv_file": os.path.basename(csv_path) if csv_path else "inline",
         "status": status,
@@ -153,14 +153,607 @@ def add_log_entry(deploy_type, csv_path, status, deployment_count, duration_seco
         "manual_estimate_minutes": manual_minutes,
         "automated_minutes": auto_minutes,
         "time_saved_minutes": saved_minutes,
-        "output_summary": output_summary[-8:] if output_summary else []
+        "output_summary": output_lines[-8:] if output_lines else [],
+        "saved_log_file": None,
+        "rollback_file": None
     }
+
+    # Auto-save sanitized log
+    saved_log = auto_save_log(deploy_type, entry_id, timestamp, output_lines)
+    if saved_log:
+        entry["saved_log_file"] = saved_log
+
+    # Generate rollback script
+    rollback = generate_rollback_script(deploy_type, entry_id, timestamp, output_lines)
+    if rollback:
+        entry["rollback_file"] = rollback
 
     log["entries"].append(entry)
     log["total_time_saved_minutes"] = round(sum(e.get("time_saved_minutes", 0) for e in log["entries"]), 1)
     log["total_deployments"] = sum(e.get("deployment_count", 0) for e in log["entries"])
     save_log(log)
     return entry
+
+# =============================================================================
+# AUTO-SAVE LOGS (sanitized - no credentials)
+# =============================================================================
+
+SENSITIVE_PATTERNS = [
+    re.compile(r'(?i)(password|pwd|passwd|secret|token)\s*[:=]\s*\S+'),
+    re.compile(r'(?i)^Password:\s*.*$'),
+    re.compile(r'"pwd"\s*:\s*"[^"]*"'),
+    re.compile(r'Auto-filled password'),
+]
+
+def sanitize_line(line):
+    """Remove sensitive data from a log line."""
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern.search(line):
+            # For credential auto-fill lines, keep the info but redact
+            if 'Auto-filled password' in line:
+                return '[CREDENTIALS] Auto-filled password: ••••••••'
+            return None  # Skip this line entirely
+    # Also catch lines that are just the raw password input echo
+    if stored_credentials.get('password') and stored_credentials['password']:
+        pwd = stored_credentials['password']
+        # Check if line IS the password (echoed from stdin) or contains it
+        stripped = line.strip()
+        if stripped == pwd or (line.startswith('> ') and pwd in line):
+            return '> [PASSWORD REDACTED]'
+    return line
+
+def auto_save_log(deploy_type, entry_id, timestamp, output_lines):
+    """Save sanitized deployment log to saved_logs/ folder."""
+    try:
+        os.makedirs(SAVED_LOGS_FOLDER, exist_ok=True)
+        ts = timestamp.replace(":", "").replace("-", "").replace(" ", "_")
+        filename = f"{ts}_{deploy_type}_run{entry_id}.txt"
+        filepath = os.path.join(SAVED_LOGS_FOLDER, filename)
+
+        with open(filepath, 'w') as f:
+            f.write(f"ACI Deployment Log\n")
+            f.write(f"{'=' * 60}\n")
+            f.write(f"Type:      {deploy_type.upper()}\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Run ID:    {entry_id}\n")
+            f.write(f"{'=' * 60}\n\n")
+
+            for line in output_lines:
+                sanitized = sanitize_line(line)
+                if sanitized is not None:
+                    f.write(sanitized + '\n')
+
+            f.write(f"\n{'=' * 60}\n")
+            f.write(f"End of log\n")
+
+        return filename
+    except Exception as e:
+        print(f"[WARNING] Failed to save log: {e}")
+        return None
+
+# =============================================================================
+# ROLLBACK SCRIPT GENERATION
+# =============================================================================
+
+def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):
+    """Parse deployment output and generate a rollback Python script."""
+    try:
+        os.makedirs(ROLLBACK_FOLDER, exist_ok=True)
+        ts = timestamp.replace(":", "").replace("-", "").replace(" ", "_")
+        filename = f"rollback_{ts}_{deploy_type}_run{entry_id}.py"
+        filepath = os.path.join(ROLLBACK_FOLDER, filename)
+
+        # Parse output to find created objects
+        rollback_actions = parse_deployment_output(deploy_type, output_lines)
+
+        if not rollback_actions:
+            return None
+
+        # Generate the rollback script
+        script = build_rollback_script(deploy_type, entry_id, timestamp, rollback_actions)
+
+        with open(filepath, 'w') as f:
+            f.write(script)
+
+        return filename
+    except Exception as e:
+        print(f"[WARNING] Failed to generate rollback: {e}")
+        return None
+
+
+def parse_deployment_output(deploy_type, lines):
+    """
+    Parse terminal output to extract created ACI objects for rollback.
+    Matches exact print statements from deployment scripts:
+      VPC:        deploy_vpc() in aci_bulk_vpc_deploy.py
+      Individual: deploy_individual_port() in aci_bulk_individual_deploy.py
+      EPG Add:    main() in aci_bulk_epg_add.py
+      EPG Delete: main() in aci_bulk_epg_delete.py
+    """
+    actions = []
+    full_text = '\n'.join(lines)
+
+    if deploy_type == 'vpc':
+        # VPC policy group: "[2/4] Creating VPC Interface Policy Group: {name}"
+        for m in re.finditer(r'Creating VPC Interface Policy Group:\s*(\S+)', full_text):
+            actions.append({"action": "delete_vpc_ipg", "name": m.group(1)})
+
+        # Port selector (VPC uses policy_group as selector name):
+        # "[3/4] Creating Access Port Selector: {name}"
+        for m in re.finditer(r'Creating Access Port Selector:\s*(\S+)', full_text):
+            actions.append({"action": "delete_port_selector_vpc", "name": m.group(1)})
+
+        # Interface profile: "Interface Profile: {name}" (printed right after selector)
+        int_profile_matches = re.findall(r'Interface Profile:\s*(\S+)', full_text)
+        if int_profile_matches:
+            for a in actions:
+                if a["action"] == "delete_port_selector_vpc" and "int_profile" not in a:
+                    a["int_profile"] = int_profile_matches[0]
+
+        # Node pair from preview: "vPC Leaf Switch Pair:   {node1}-{node2}"
+        node_pair = re.search(r'vPC Leaf Switch Pair:\s+(\d+)-(\d+)', full_text)
+
+        # VPC policy group name (used in path construction)
+        vpc_pg_name = None
+        for a in actions:
+            if a["action"] == "delete_vpc_ipg":
+                vpc_pg_name = a["name"]
+                break
+
+        # Successful bindings: "VLAN {vlan}: OK"
+        for m in re.finditer(r'VLAN\s+(\d+):\s*OK', full_text):
+            vlan = m.group(1)
+            binding = {"action": "delete_binding", "vlan": vlan}
+            if node_pair:
+                binding["node1"] = node_pair.group(1)
+                binding["node2"] = node_pair.group(2)
+            if vpc_pg_name:
+                binding["vpc_pg"] = vpc_pg_name
+            actions.append(binding)
+
+        # EPG info from preview lines: "VLAN   32 -> AppProf / EPG_Name [TenantName]"
+        epg_map = {}
+        for m in re.finditer(r'VLAN\s+(\d+)\s*->\s*(\S+)\s*/\s*(\S+?)(?:\s+\[(\S+?)\])?\s*$', full_text, re.MULTILINE):
+            epg_map[m.group(1)] = {"app_profile": m.group(2), "epg": m.group(3), "tenant": m.group(4) or ""}
+
+        for a in actions:
+            if a["action"] == "delete_binding" and a.get("vlan") in epg_map:
+                a.update(epg_map[a["vlan"]])
+
+        # Port descriptions: "Node {node_id} eth{interface}: [SUCCESS]"
+        for m in re.finditer(r'Node\s+(\d+)\s+eth([\d/]+):\s*\[SUCCESS\]', full_text):
+            actions.append({"action": "clear_description", "node_id": m.group(1), "interface": m.group(2)})
+
+    elif deploy_type == 'individual':
+        # Policy group: "[2/4] Creating Leaf Access Port Policy Group: {name}"
+        for m in re.finditer(r'Creating Leaf Access Port Policy Group:\s*(\S+)', full_text):
+            actions.append({"action": "delete_access_ipg", "name": m.group(1)})
+
+        # Port selector: "[3/4] Creating Port Selector: {name}"
+        for m in re.finditer(r'Creating Port Selector:\s*(\S+)', full_text):
+            actions.append({"action": "delete_port_selector_individual", "name": m.group(1)})
+
+        # Interface profile: "Interface Profile: {name}"
+        int_profile_matches = re.findall(r'Interface Profile:\s*(\S+)', full_text)
+        if int_profile_matches:
+            for a in actions:
+                if a["action"] == "delete_port_selector_individual" and "int_profile" not in a:
+                    a["int_profile"] = int_profile_matches[0]
+
+        # Node ID from preview: "Node ID:               {node_id}"
+        node_match = re.search(r'Node ID:\s+(\d+)', full_text)
+        # Interface from preview: "Interface:             eth{interface}"
+        int_match = re.search(r'Interface:\s+eth([\d/]+)', full_text)
+
+        # Successful bindings: "VLAN {vlan}: OK"
+        for m in re.finditer(r'VLAN\s+(\d+):\s*OK', full_text):
+            binding = {"action": "delete_binding", "vlan": m.group(1)}
+            if node_match:
+                binding["node_id"] = node_match.group(1)
+            if int_match:
+                binding["interface"] = int_match.group(1)
+            actions.append(binding)
+
+        # EPG info from preview: "VLAN   32 -> AppProf / EPG_Name [TenantName]"
+        epg_map = {}
+        for m in re.finditer(r'VLAN\s+(\d+)\s*->\s*(\S+)\s*/\s*(\S+?)(?:\s+\[(\S+?)\])?\s*$', full_text, re.MULTILINE):
+            epg_map[m.group(1)] = {"app_profile": m.group(2), "epg": m.group(3), "tenant": m.group(4) or ""}
+        for a in actions:
+            if a["action"] == "delete_binding" and a.get("vlan") in epg_map:
+                a.update(epg_map[a["vlan"]])
+
+        # Port description: "[1/4] Setting port description: ..." then "[SUCCESS]"
+        if node_match and int_match:
+            desc_success = re.search(r'\[1/4\].*description.*\n.*\[SUCCESS\]', full_text)
+            if desc_success:
+                actions.append({"action": "clear_description", "node_id": node_match.group(1), "interface": int_match.group(1)})
+
+    elif deploy_type == 'epgadd':
+        # EPG Add output: "[OK] {switch} port {port}: VLAN {vlan}"
+        for m in re.finditer(r'\[OK\]\s+(\S+)\s+port\s+([\d/]+):\s*VLAN\s+(\d+)', full_text):
+            actions.append({"action": "delete_binding", "switch": m.group(1), "port": m.group(2), "vlan": m.group(3)})
+
+    elif deploy_type == 'epgdelete':
+        # EPG Delete output: "[DELETED] {switch} port {port}: VLAN {vlan}"
+        for m in re.finditer(r'\[DELETED\]\s+(\S+)\s+port\s+([\d/]+):\s*VLAN\s+(\d+)', full_text):
+            actions.append({"action": "recreate_binding", "switch": m.group(1), "port": m.group(2), "vlan": m.group(3)})
+
+    return actions
+
+
+def build_rollback_script(deploy_type, entry_id, timestamp, actions):
+    """Build a Python rollback script from parsed actions."""
+    # Count meaningful actions
+    meaningful = [a for a in actions if a["action"] not in ["clear_description"]]
+    if not meaningful:
+        meaningful = actions
+
+    script = f'''#!/usr/bin/env python3
+"""
+ACI ROLLBACK SCRIPT
+====================
+Auto-generated rollback for: {deploy_type.upper()} deployment
+Original Run ID: {entry_id}
+Original Timestamp: {timestamp}
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+WARNING: This script will REVERSE the changes made by the original deployment.
+         Review carefully before executing!
+
+Actions to perform:
+'''
+    for i, a in enumerate(meaningful, 1):
+        if a["action"] == "delete_vpc_ipg":
+            script += f'  {i}. Delete VPC Policy Group: {a.get("name", "?")}\n'
+        elif a["action"] == "delete_access_ipg":
+            script += f'  {i}. Delete Leaf Access Port Policy Group: {a.get("name", "?")}\n'
+        elif a["action"].startswith("delete_port_selector"):
+            script += f'  {i}. Delete Port Selector: {a.get("name", "?")} from {a.get("int_profile", "?")}\n'
+        elif a["action"] == "delete_binding":
+            script += f'  {i}. Delete static binding VLAN {a.get("vlan", "?")} from EPG {a.get("epg", "?")}\n'
+        elif a["action"] == "recreate_binding":
+            script += f'  {i}. Re-create static binding VLAN {a.get("vlan", "?")} on {a.get("switch", "?")} port {a.get("port", "?")}\n'
+        elif a["action"] == "clear_description":
+            script += f'  {i}. Clear port description on node {a.get("node_id", "?")} eth{a.get("interface", "?")}\n'
+
+    script += f'''
+"""
+
+import os
+import sys
+import getpass
+import requests
+import urllib3
+import re
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# =============================================================================
+# APIC CONFIGURATION - Update these if different from deployment scripts
+# =============================================================================
+
+APIC_URLS = {{
+    "D1": "",  # <-- UPDATE or copy from your deployment script
+    "D2": "",  # <-- UPDATE or copy from your deployment script
+    "D3": ""   # <-- UPDATE or copy from your deployment script
+}}
+
+POD_ID = "1"
+
+def detect_environment(switch_name):
+    s = switch_name.upper()
+    if "NSM" in s: return "D3"
+    elif "SDC" in s: return "D2"
+    return "D1"
+
+def extract_node_id(switch_name):
+    m = re.search(r"(\\d+)$", switch_name)
+    return m.group(1) if m else None
+
+def login_to_apic(session, apic_url, username, password):
+    try:
+        r = session.post(f"{{apic_url}}/api/aaaLogin.json",
+            json={{"aaaUser": {{"attributes": {{"name": username, "pwd": password}}}}}},
+            verify=False, timeout=30)
+        return r.status_code == 200
+    except:
+        return False
+
+
+def main():
+    print("\\n" + "=" * 60)
+    print(" ACI ROLLBACK SCRIPT")
+    print(f" Original: {deploy_type.upper()} Run #{entry_id} ({timestamp})")
+    print("=" * 60)
+
+    # Authenticate
+    username = input("\\nUsername: ").strip()
+    password = getpass.getpass("Password: ")
+
+    sessions = {{}}
+    needed_envs = set()
+'''
+
+    # Add environment detection based on actions
+    env_refs = set()
+    for a in actions:
+        if a.get("node1"):
+            env_refs.add("node_pair")
+        if a.get("node_id"):
+            env_refs.add("single_node")
+        if a.get("switch"):
+            env_refs.add("switch")
+
+    # Determine which environments to authenticate to
+    script += '''
+    # Determine needed environments
+'''
+
+    if deploy_type in ['vpc', 'individual']:
+        script += f'''    # Based on original deployment
+    needed_envs = set()
+'''
+        for a in actions:
+            if a.get("node_id"):
+                script += f'    needed_envs.add("D1")  # Adjust based on your node IDs\n'
+                break
+            if a.get("node1"):
+                script += f'    needed_envs.add("D1")  # Adjust based on your node IDs\n'
+                break
+
+    script += '''
+    if not needed_envs:
+        needed_envs = {"D1"}  # Default - update as needed
+
+    for env in needed_envs:
+        if not APIC_URLS.get(env):
+            print(f"  [SKIP] No APIC URL for {env}")
+            continue
+        print(f"\\n[INFO] Authenticating to {env}...")
+        session = requests.Session()
+        if login_to_apic(session, APIC_URLS[env], username, password):
+            sessions[env] = session
+            print(f"       [SUCCESS]")
+        else:
+            print(f"       [FAILED]")
+
+    if not sessions:
+        print("\\n[ERROR] No successful authentications.")
+        sys.exit(1)
+
+    # Use first available session
+    env = list(sessions.keys())[0]
+    session = sessions[env]
+    apic_url = APIC_URLS[env]
+
+    print("\\n" + "=" * 60)
+    print(" ROLLBACK ACTIONS")
+    print("=" * 60)
+    print()
+'''
+
+    # Generate specific rollback code for each action
+    action_num = 0
+
+    # Delete bindings first (reverse order of creation)
+    binding_actions = [a for a in actions if a["action"] in ["delete_binding"]]
+    for a in binding_actions:
+        action_num += 1
+        tenant = a.get("tenant", "TENANT")
+        ap = a.get("app_profile", "APP_PROFILE")
+        epg = a.get("epg", "EPG")
+        vlan = a.get("vlan", "0")
+
+        if deploy_type == 'vpc':
+            node1 = a.get("node1", "NODE1")
+            node2 = a.get("node2", "NODE2")
+            pg = a.get("vpc_pg", "")
+            if not pg:
+                for x in actions:
+                    if x["action"] == "delete_vpc_ipg":
+                        pg = x.get("name", "POLICY_GROUP")
+                        break
+            script += f'''
+    # Action {action_num}: Delete static binding VLAN {vlan}
+    print(f"  [{action_num}] Deleting static binding VLAN {vlan} from {epg}...")
+    try:
+        path = "topology/pod-{POD_ID}/protpaths-{node1}-{node2}/pathep-[{pg}]"
+        dn = f"uni/tn-{tenant}/ap-{ap}/epg-{epg}/rspathAtt-[{{path}}]"
+        r = session.delete(f"{{apic_url}}/api/mo/{{dn}}.json", verify=False, timeout=30)
+        print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
+    except Exception as e:
+        print(f"      [ERROR] {{e}}")
+'''
+        elif deploy_type == 'individual':
+            node_id = a.get("node_id", "NODE")
+            interface = a.get("interface", "1/1")
+            script += f'''
+    # Action {action_num}: Delete static binding VLAN {vlan}
+    print(f"  [{action_num}] Deleting static binding VLAN {vlan} from {epg}...")
+    try:
+        path = "topology/pod-{POD_ID}/paths-{node_id}/pathep-[eth{interface}]"
+        dn = f"uni/tn-{tenant}/ap-{ap}/epg-{epg}/rspathAtt-[{{path}}]"
+        r = session.delete(f"{{apic_url}}/api/mo/{{dn}}.json", verify=False, timeout=30)
+        print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
+    except Exception as e:
+        print(f"      [ERROR] {{e}}")
+'''
+
+    # Delete port selectors
+    selector_actions = [a for a in actions if "port_selector" in a["action"]]
+    for a in selector_actions:
+        action_num += 1
+        name = a.get("name", "SELECTOR")
+        int_profile = a.get("int_profile", "INT_PROFILE")
+        script += f'''
+    # Action {action_num}: Delete Port Selector
+    print(f"  [{action_num}] Deleting port selector: {name}...")
+    try:
+        r = session.delete(
+            f"{{apic_url}}/api/mo/uni/infra/accportprof-{int_profile}/hports-{name}-typ-range.json",
+            verify=False, timeout=30)
+        print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
+    except Exception as e:
+        print(f"      [ERROR] {{e}}")
+'''
+
+    # Delete policy groups
+    ipg_actions = [a for a in actions if a["action"] in ["delete_vpc_ipg", "delete_access_ipg"]]
+    for a in ipg_actions:
+        action_num += 1
+        name = a.get("name", "POLICY_GROUP")
+        if a["action"] == "delete_vpc_ipg":
+            path = f"uni/infra/funcprof/accbundle-{name}"
+            label = "VPC Policy Group"
+        else:
+            path = f"uni/infra/funcprof/accportgrp-{name}"
+            label = "Leaf Access Port Policy Group"
+        script += f'''
+    # Action {action_num}: Delete {label}
+    print(f"  [{action_num}] Deleting {label}: {name}...")
+    try:
+        r = session.delete(f"{{apic_url}}/api/mo/{path}.json", verify=False, timeout=30)
+        print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
+    except Exception as e:
+        print(f"      [ERROR] {{e}}")
+'''
+
+    # Clear port descriptions
+    desc_actions = [a for a in actions if a["action"] == "clear_description"]
+    for a in desc_actions:
+        action_num += 1
+        node_id = a.get("node_id", "NODE")
+        interface = a.get("interface", "1/1")
+        script += f'''
+    # Action {action_num}: Clear port description
+    print(f"  [{action_num}] Clearing description on node {node_id} eth{interface}...")
+    try:
+        dn = f"topology/pod-{POD_ID}/node-{node_id}/sys/phys-[eth{interface}]"
+        r = session.post(f"{{apic_url}}/api/node/mo/{{dn}}.json",
+            json={{"l1PhysIf": {{"attributes": {{"descr": ""}}}}}}, verify=False, timeout=30)
+        print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
+    except Exception as e:
+        print(f"      [ERROR] {{e}}")
+'''
+
+    # EPG Add rollback = delete bindings
+    epgadd_actions = [a for a in actions if a["action"] == "delete_binding" and deploy_type == "epgadd"]
+    for a in epgadd_actions:
+        action_num += 1
+        switch = a.get("switch", "SWITCH")
+        port = a.get("port", "1/1")
+        vlan = a.get("vlan", "0")
+        script += f'''
+    # Action {action_num}: Delete EPG binding VLAN {vlan} from {switch} port {port}
+    print(f"  [{action_num}] Deleting VLAN {vlan} from {switch} port {port}...")
+    # NOTE: You need to fill in tenant/ap/epg for this VLAN
+    # This requires querying the APIC for the EPG containing VLAN {vlan}
+    print(f"      [MANUAL] Locate and delete fvRsPathAtt for VLAN {vlan} on node/pathep")
+'''
+
+    # EPG Delete rollback = recreate bindings
+    recreate_actions = [a for a in actions if a["action"] == "recreate_binding"]
+    for a in recreate_actions:
+        action_num += 1
+        switch = a.get("switch", "SWITCH")
+        port = a.get("port", "1/1")
+        vlan = a.get("vlan", "0")
+        script += f'''
+    # Action {action_num}: Re-create binding VLAN {vlan} on {switch} port {port}
+    print(f"  [{action_num}] Re-creating VLAN {vlan} on {switch} port {port}...")
+    # NOTE: Requires tenant/ap/epg info and original mode (trunk/access)
+    # Query APIC for EPG containing VLAN {vlan}, then re-create fvRsPathAtt
+    print(f"      [MANUAL] Use EPG Add script to re-bind VLAN {vlan} to {switch} port {port}")
+'''
+
+    script += f'''
+    print()
+    print("=" * 60)
+    print(" ROLLBACK COMPLETE")
+    print("=" * 60)
+    print(f"\\n  {action_num} action(s) processed")
+    print()
+
+
+if __name__ == "__main__":
+    print("\\n[WARNING] This will REVERSE changes from {deploy_type.upper()} Run #{entry_id}")
+    confirm = input("Type 'YES' to confirm rollback: ").strip()
+    if confirm != "YES":
+        print("\\n[CANCELLED]")
+        sys.exit(0)
+    main()
+'''
+    return script
+
+
+# =============================================================================
+# CSV VALIDATION
+# =============================================================================
+
+def validate_csv_file(filepath, script_type):
+    """Validate a CSV file against requirements for the given script type."""
+    results = {"valid": True, "errors": [], "warnings": [], "row_count": 0, "columns_found": []}
+    reqs = CSV_REQUIREMENTS.get(script_type)
+    if not reqs:
+        results["warnings"].append(f"No validation rules for type: {script_type}")
+        return results
+
+    try:
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                results["valid"] = False
+                results["errors"].append("CSV file is empty or has no headers")
+                return results
+
+            # Normalize headers
+            headers = [h.strip().upper() for h in reader.fieldnames if h]
+            results["columns_found"] = headers
+
+            # Check required columns
+            missing = [col for col in reqs["required"] if col not in headers]
+            if missing:
+                results["valid"] = False
+                results["errors"].append(f"Missing columns: {', '.join(missing)}")
+                return results
+
+            # Validate rows
+            rows = list(reader)
+            results["row_count"] = len(rows)
+            if not rows:
+                results["valid"] = False
+                results["errors"].append("CSV has headers but no data rows")
+                return results
+
+            # Validate each row
+            validators = reqs.get("validators", {})
+            for i, row in enumerate(rows, 1):
+                normalized = {k.strip().upper(): (v.strip() if v else "") for k, v in row.items() if k}
+                for col, pattern in validators.items():
+                    val = normalized.get(col, "").strip().strip('"').strip("'")
+                    if val and not re.match(pattern, val, re.IGNORECASE):
+                        results["warnings"].append(f"Row {i}: {col} value '{val}' may be invalid")
+
+                # Check for empty required fields
+                for col in reqs["required"]:
+                    if not normalized.get(col, "").strip():
+                        results["warnings"].append(f"Row {i}: {col} is empty")
+
+    except FileNotFoundError:
+        results["valid"] = False
+        results["errors"].append(f"File not found: {filepath}")
+    except Exception as e:
+        results["valid"] = False
+        results["errors"].append(f"Parse error: {str(e)}")
+
+    # Cap warnings
+    if len(results["warnings"]) > 10:
+        total = len(results["warnings"])
+        results["warnings"] = results["warnings"][:10]
+        results["warnings"].append(f"... and {total - 10} more warnings")
+
+    return results
+
 
 # =============================================================================
 # PROCESS MANAGEMENT
@@ -183,14 +776,15 @@ def run_script_thread(script_path, csv_path):
             cwd=os.path.dirname(os.path.abspath(script_path)) or '.'
         )
 
-        import re as _re
-        import threading
-        ansi_escape = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
         buffer = []
         buffer_lock = threading.Lock()
         last_char_time = [time.time()]
         read_complete = [False]
+
+        # Auto-credential tracking
+        cred_state = {"awaiting": None}  # None, "username", "password"
 
         def reader_thread():
             while True:
@@ -235,6 +829,30 @@ def run_script_thread(script_path, csv_path):
                             current_run["output_lines"].append(text_out)
                         buffer.clear()
 
+                        # AUTO-CREDENTIAL INJECTION
+                        if stored_credentials.get("set"):
+                            if 'username' in tl and tl.endswith(':'):
+                                cred_state["awaiting"] = "username"
+                                time.sleep(0.1)
+                                try:
+                                    uname = stored_credentials["username"]
+                                    running_process.stdin.write((uname + '\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    output_queue.put(('output', f'[CREDENTIALS] Auto-filled username: {uname}'))
+                                    current_run["output_lines"].append(f'[CREDENTIALS] Auto-filled username: {uname}')
+                                except:
+                                    pass
+                            elif 'password' in tl and tl.endswith(':'):
+                                cred_state["awaiting"] = "password"
+                                time.sleep(0.1)
+                                try:
+                                    running_process.stdin.write((stored_credentials["password"] + '\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    output_queue.put(('output', '[CREDENTIALS] Auto-filled password: ••••••••'))
+                                    current_run["output_lines"].append('[CREDENTIALS] Auto-filled password')
+                                except:
+                                    pass
+
         reader.join(timeout=1.0)
         with buffer_lock:
             if buffer:
@@ -255,7 +873,8 @@ def run_script_thread(script_path, csv_path):
         status = "success" if exit_code == 0 else "failed"
         lines = current_run["output_lines"]
         deploy_count = sum(1 for l in lines if any(m in l.upper() for m in
-                          ['[DEPLOYED]', '[CREATED]', '[SUCCESS]', 'BINDING CREATED', 'COMPLETE']))
+                          ['[DEPLOYED]', '[CREATED]', '[SUCCESS]', 'BINDING CREATED', ': OK',
+                           '[OK]', '[DELETED]']))
         deploy_count = max(1, deploy_count)
         if current_run["type"]:
             add_log_entry(current_run["type"], current_run["csv_path"], status, deploy_count, duration, lines)
@@ -268,12 +887,9 @@ def run_script_thread(script_path, csv_path):
     finally:
         running_process = None
 
-pty_master_fd = None
-last_sent_input = ""
 
 def send_input_to_process(text):
-    global running_process, last_sent_input
-    last_sent_input = text.strip()
+    global running_process
     if running_process and running_process.stdin:
         try:
             running_process.stdin.write((text + '\n').encode('utf-8'))
@@ -295,8 +911,9 @@ def stop_process():
             add_log_entry(current_run["type"], current_run["csv_path"], "stopped", 0, duration, current_run["output_lines"])
         running_process = None
 
+
 # =============================================================================
-# HTML TEMPLATE  (embedded as raw string - uses Jinja2 via render_template_string)
+# HTML TEMPLATE
 # =============================================================================
 
 HTML_TEMPLATE = r'''
@@ -331,8 +948,12 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .nav-item.epgadd .nav-icon{background:linear-gradient(135deg,#11998e,#38ef7d)}
 .nav-item.epgdelete .nav-icon{background:linear-gradient(135deg,#eb3349,#f45c43)}
 .nav-item.logs .nav-icon{background:linear-gradient(135deg,#667eea,#764ba2)}
+.nav-item.credentials .nav-icon{background:linear-gradient(135deg,#f7971e,#ffd200)}
 .nav-item-title{font-weight:600;font-size:14px;margin-bottom:2px}
 .nav-item-desc{font-size:11px;color:var(--text-muted)}
+.cred-badge{margin-left:auto;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600}
+.cred-badge.set{background:rgba(63,185,80,.2);color:var(--accent-green)}
+.cred-badge.unset{background:rgba(248,81,73,.15);color:var(--accent-red)}
 .status-indicator{width:8px;height:8px;border-radius:50%;background:var(--accent-green);box-shadow:0 0 8px var(--accent-green);animation:pulse 2s infinite}
 .status-indicator.running{background:var(--accent-orange);box-shadow:0 0 8px var(--accent-orange);animation:pulse .5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
@@ -351,6 +972,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .header-badge.epgadd{background:rgba(56,239,125,.2);color:#38ef7d}
 .header-badge.epgdelete{background:rgba(244,92,67,.2);color:#f45c43}
 .header-badge.logs{background:rgba(118,75,162,.2);color:#a78bfa}
+.header-badge.credentials{background:rgba(247,151,30,.2);color:#ffd200}
 .header-actions{display:flex;gap:8px}
 .header-btn{padding:8px 16px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;transition:all .2s ease;border:1px solid var(--border-color);background:transparent;color:var(--text-secondary);font-family:inherit}
 .header-btn:hover{border-color:var(--accent-cyan);color:var(--accent-cyan)}
@@ -373,6 +995,10 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .file-picker-btn{padding:12px 20px;border:1px solid var(--accent-cyan);border-radius:8px;background:linear-gradient(135deg,rgba(57,212,212,.1),rgba(88,166,255,.1));color:var(--accent-cyan);font-family:'IBM Plex Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;white-space:nowrap}
 .file-picker-btn:hover{background:linear-gradient(135deg,rgba(57,212,212,.2),rgba(88,166,255,.2));box-shadow:0 0 16px var(--glow-cyan)}
 .file-input-hidden{display:none}
+.csv-validation{margin-top:8px;padding:10px 14px;border-radius:6px;font-size:12px;font-family:'JetBrains Mono',monospace}
+.csv-validation.valid{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3);color:var(--accent-green)}
+.csv-validation.invalid{background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.3);color:var(--accent-red)}
+.csv-validation.warnings{background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.3);color:var(--accent-yellow)}
 .csv-reference{padding:16px 20px;background:rgba(57,212,212,.05);border-bottom:1px solid var(--border-color)}
 .csv-reference-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .csv-reference-title{font-size:12px;font-weight:600;color:var(--accent-cyan);text-transform:uppercase;letter-spacing:1px}
@@ -406,6 +1032,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .terminal-line.info{color:var(--accent-blue)}
 .terminal-line.muted{color:var(--text-muted)}
 .terminal-line.prompt{color:var(--accent-purple)}
+.terminal-line.credential{color:var(--accent-yellow)}
 .bracket-num{color:var(--accent-blue)!important;font-weight:700}
 .terminal-input-area{display:flex;align-items:center;padding:12px 16px;background:rgba(0,0,0,.3);border-top:1px solid var(--border-color);gap:12px}
 .terminal-prompt{color:var(--accent-cyan);font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600}
@@ -432,6 +1059,25 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .ts-value.purple{-webkit-text-fill-color:var(--accent-purple)}
 .ts-label{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
 .ts-divider{width:1px;height:40px;background:var(--border-color)}
+/* Credential Panel */
+.cred-panel{padding:32px;overflow-y:auto;flex:1}
+.cred-section{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:12px;padding:24px;margin-bottom:20px;max-width:600px}
+.cred-section-title{font-size:14px;font-weight:600;color:#ffd200;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.cred-status{padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:13px;display:flex;align-items:center;gap:10px}
+.cred-status.set{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3);color:var(--accent-green)}
+.cred-status.unset{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.2);color:var(--accent-red)}
+.cred-row{margin-bottom:16px}
+.cred-label{display:block;font-size:12px;font-weight:500;color:var(--text-secondary);margin-bottom:8px}
+.cred-input{width:100%;padding:12px 16px;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px}
+.cred-input:focus{outline:none;border-color:#ffd200;box-shadow:0 0 0 3px rgba(247,151,30,.15)}
+.cred-hint{font-size:11px;color:var(--text-muted);margin-top:12px;padding:10px;background:var(--bg-input);border-radius:6px;line-height:1.6}
+.cred-actions{display:flex;gap:12px;margin-top:20px}
+.cred-btn{padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;font-family:inherit}
+.cred-btn.save{background:linear-gradient(135deg,#f7971e,#ffd200);color:#0d1117}
+.cred-btn.save:hover{box-shadow:0 4px 16px rgba(247,151,30,.3)}
+.cred-btn.clear{background:transparent;border:1px solid var(--accent-red);color:var(--accent-red)}
+.cred-btn.clear:hover{background:rgba(248,81,73,.1)}
+/* Settings, Readme, Logs panels - same as v1.2.0 */
 .settings-panel{padding:24px;overflow-y:auto;flex:1}
 .settings-section{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:12px;padding:20px;margin-bottom:20px}
 .settings-section-title{font-size:14px;font-weight:600;color:var(--accent-cyan);margin-bottom:16px}
@@ -448,85 +1094,77 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .readme-content h3{color:var(--accent-cyan);font-size:15px;margin:20px 0 12px;font-weight:600}
 .readme-content h3:first-child{margin-top:0}
 .readme-content p{margin-bottom:12px}
-.readme-content ul{margin:12px 0;padding-left:24px}
-.readme-content li{margin-bottom:8px}
-.readme-content code{background:var(--bg-input);padding:2px 8px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--accent-cyan)}
-.readme-content .step{display:flex;gap:16px;margin-bottom:16px;padding:16px;background:var(--bg-terminal);border-radius:8px;border-left:3px solid var(--accent-cyan)}
-.readme-content .step-number{width:32px;height:32px;background:linear-gradient(135deg,var(--accent-cyan),var(--accent-blue));border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--bg-darkest);flex-shrink:0}
-.readme-content .step-content{flex:1}
-.readme-content .step-title{font-weight:600;color:var(--text-primary);margin-bottom:4px}
-.readme-tabs{display:flex;gap:8px;margin-bottom:20px;border-bottom:1px solid var(--border-color);padding-bottom:12px;flex-wrap:wrap}
-.readme-tab{padding:10px 20px;border-radius:8px;cursor:pointer;font-weight:500;font-size:14px;transition:all .2s;background:transparent;color:var(--text-muted);border:1px solid transparent}
-.readme-tab:hover{color:var(--text-primary);background:var(--bg-input)}
-.readme-tab.active{background:linear-gradient(135deg,rgba(57,212,212,.15),rgba(88,166,255,.15));color:var(--accent-cyan);border-color:var(--accent-cyan)}
+.readme-tabs{display:flex;gap:8px;padding:0 24px;margin-bottom:0}
+.readme-tab{padding:10px 16px;border-radius:8px 8px 0 0;background:var(--bg-darkest);border:1px solid var(--border-color);border-bottom:none;color:var(--text-muted);cursor:pointer;font-size:13px;font-weight:500}
+.readme-tab.active{background:var(--bg-dark);color:var(--text-primary);border-bottom:2px solid var(--accent-cyan)}
 .readme-tab-content{display:none}.readme-tab-content.active{display:block}
-.csv-editor-section{padding:16px 20px;background:var(--bg-darkest);border-bottom:1px solid var(--border-color)}
-.csv-editor-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.csv-editor-title{font-size:12px;font-weight:600;color:var(--accent-cyan);text-transform:uppercase;letter-spacing:1px}
-.csv-editor-actions{display:flex;gap:8px}
-.csv-editor-btn{padding:6px 12px;border-radius:4px;font-size:11px;font-weight:500;cursor:pointer;border:1px solid var(--border-color);background:transparent;color:var(--text-secondary);font-family:inherit;transition:all .2s}
-.csv-editor-btn:hover{border-color:var(--accent-cyan);color:var(--accent-cyan)}
-.csv-editor-btn.add{border-color:var(--accent-green);color:var(--accent-green)}
-.csv-editor-btn.add:hover{background:rgba(63,185,80,.1)}
-.csv-editor-table{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:12px}
-.csv-editor-table th{background:var(--bg-input);padding:10px 8px;text-align:left;font-weight:600;color:var(--accent-cyan);border:1px solid var(--border-color)}
-.csv-editor-table td{padding:4px;border:1px solid var(--border-color)}
-.csv-editor-table input{width:100%;padding:8px;background:var(--bg-terminal);border:1px solid transparent;border-radius:4px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px}
-.csv-editor-table input:focus{outline:none;border-color:var(--accent-cyan)}
-.csv-editor-table .row-actions{width:40px;text-align:center}
-.csv-editor-table .delete-row{background:transparent;border:none;color:var(--accent-red);cursor:pointer;font-size:14px;padding:4px 8px;border-radius:4px}
-.csv-editor-table .delete-row:hover{background:rgba(248,81,73,.1)}
-.csv-toggle-group{display:flex;gap:8px;margin-bottom:12px}
-.csv-toggle{padding:8px 16px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--border-color);background:transparent;color:var(--text-muted);transition:all .2s}
-.csv-toggle.active{border-color:var(--accent-cyan);color:var(--accent-cyan);background:rgba(57,212,212,.1)}
+.step{display:flex;gap:16px;margin-bottom:20px}.step-number{width:32px;height:32px;border-radius:50%;background:var(--accent-cyan);color:var(--bg-darkest);display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0}.step-title{font-weight:600;margin-bottom:4px}
+/* Logs */
 .logs-panel{padding:24px;overflow-y:auto;flex:1}
 .log-stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
-.log-stat-card{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:12px;padding:20px;text-align:center}
-.log-stat-card .sv{font-size:30px;font-weight:700;font-family:'JetBrains Mono',monospace}
-.log-stat-card .sv.green{background:linear-gradient(135deg,var(--accent-cyan),var(--accent-green));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.log-stat-card .sv.blue{color:var(--accent-blue)}.log-stat-card .sv.purple{color:var(--accent-purple)}.log-stat-card .sv.orange{color:var(--accent-orange)}
-.log-stat-card .sl{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-top:8px}
-.log-stat-card .ss{font-size:11px;color:var(--text-muted);margin-top:4px;font-family:'JetBrains Mono',monospace}
-.log-entries-section{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:12px;overflow:hidden}
-.log-entries-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border-color)}
-.log-entries-title{font-size:14px;font-weight:600;color:var(--accent-cyan)}
-.log-clear-btn{padding:6px 12px;border-radius:4px;font-size:11px;font-weight:500;cursor:pointer;border:1px solid var(--accent-red);background:transparent;color:var(--accent-red);font-family:inherit;transition:all .2s}
-.log-clear-btn:hover{background:rgba(248,81,73,.1)}
-.log-entry{display:flex;align-items:center;gap:16px;padding:14px 20px;border-bottom:1px solid var(--border-color);transition:background .15s}
-.log-entry:last-child{border-bottom:none}
-.log-entry:hover{background:rgba(88,166,255,.04)}
-.log-entry-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
-.log-entry-dot.success{background:var(--accent-green);box-shadow:0 0 8px rgba(63,185,80,.4)}
-.log-entry-dot.failed{background:var(--accent-red);box-shadow:0 0 8px rgba(248,81,73,.4)}
-.log-entry-dot.stopped{background:var(--accent-orange);box-shadow:0 0 8px rgba(240,136,62,.4)}
-.log-entry-info{flex:1}
-.log-entry-title{font-weight:600;font-size:13px;margin-bottom:2px}
-.log-entry-meta{font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace}
-.log-entry-type{padding:4px 10px;border-radius:6px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.log-stat-card{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:10px;padding:16px;text-align:center}
+.sv{font-size:24px;font-weight:700;font-family:'JetBrains Mono',monospace}
+.sv.green{color:var(--accent-green)}.sv.blue{color:var(--accent-blue)}.sv.purple{color:var(--accent-purple)}.sv.orange{color:var(--accent-orange)}
+.sl{font-size:12px;color:var(--text-secondary);margin-top:4px}.ss{font-size:10px;color:var(--text-muted)}
+.log-entries-section{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:10px;padding:16px}
+.log-entries-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.log-entries-title{font-size:14px;font-weight:600}
+.log-clear-btn{padding:6px 12px;border-radius:6px;background:transparent;border:1px solid var(--accent-red);color:var(--accent-red);cursor:pointer;font-size:11px;font-family:inherit}
+.log-entry{display:flex;align-items:center;gap:12px;padding:12px;border-radius:8px;margin-bottom:8px;background:var(--bg-dark);border:1px solid var(--border-color);transition:border-color .2s}
+.log-entry:hover{border-color:var(--accent-cyan)}
+.log-entry-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.log-entry-dot.success{background:var(--accent-green)}.log-entry-dot.failed{background:var(--accent-red)}.log-entry-dot.stopped{background:var(--accent-orange)}
+.log-entry-info{flex:1;min-width:0}
+.log-entry-title{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.log-entry-meta{font-size:11px;color:var(--text-muted)}
+.log-entry-type{padding:3px 8px;border-radius:6px;font-size:10px;font-weight:600;white-space:nowrap}
 .log-entry-type.vpc{background:rgba(163,113,247,.2);color:var(--accent-purple)}
 .log-entry-type.individual{background:rgba(240,136,62,.2);color:var(--accent-orange)}
 .log-entry-type.epgadd{background:rgba(56,239,125,.2);color:#38ef7d}
 .log-entry-type.epgdelete{background:rgba(244,92,67,.2);color:#f45c43}
-.log-entry-saved{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--accent-green);min-width:80px;text-align:right}
-.log-empty{padding:40px;text-align:center;color:var(--text-muted)}
-.log-empty-icon{font-size:36px;margin-bottom:12px}
+.log-entry-saved{font-size:12px;font-weight:600;color:var(--accent-green);white-space:nowrap}
+.log-entry-actions{display:flex;gap:6px;flex-shrink:0}
+.log-action-btn{padding:4px 10px;border-radius:5px;font-size:10px;font-weight:600;cursor:pointer;border:none;font-family:inherit;transition:all .2s}
+.log-action-btn.download{background:rgba(88,166,255,.15);color:var(--accent-blue)}
+.log-action-btn.download:hover{background:rgba(88,166,255,.3)}
+.log-action-btn.rollback{background:rgba(248,81,73,.12);color:var(--accent-red)}
+.log-action-btn.rollback:hover{background:rgba(248,81,73,.25)}
+.log-empty{text-align:center;padding:40px;color:var(--text-muted)}
+.log-empty-icon{font-size:40px;margin-bottom:12px}
+/* CSV toggles & editor */
+.csv-toggle-group{display:flex;gap:8px;margin-bottom:12px}
+.csv-toggle{padding:8px 16px;border-radius:6px;background:var(--bg-input);border:1px solid var(--border-color);color:var(--text-muted);cursor:pointer;font-size:12px;font-weight:500;font-family:inherit}
+.csv-toggle.active{border-color:var(--accent-cyan);color:var(--accent-cyan);background:rgba(57,212,212,.08)}
+.csv-editor-section{margin-top:12px}
+.csv-editor-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.csv-editor-title{font-size:12px;font-weight:600;color:var(--text-secondary)}
+.csv-editor-actions{display:flex;gap:8px}
+.csv-editor-btn{padding:6px 12px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border-color);color:var(--text-secondary);cursor:pointer;font-size:11px;font-family:inherit}
+.csv-editor-btn.add{border-color:var(--accent-green);color:var(--accent-green)}
+.csv-editor-table{width:100%;border-collapse:collapse;font-size:12px}
+.csv-editor-table th{background:var(--bg-input);padding:8px 10px;text-align:left;color:var(--accent-cyan);border:1px solid var(--border-color);font-weight:600}
+.csv-editor-table td{padding:4px;border:1px solid var(--border-color)}
+.csv-editor-table input{width:100%;padding:6px 8px;background:var(--bg-terminal);border:1px solid transparent;border-radius:4px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:11px}
+.csv-editor-table input:focus{border-color:var(--accent-cyan);outline:none}
+.row-actions{width:36px;text-align:center}
+.delete-row{background:none;border:none;color:var(--accent-red);cursor:pointer;font-size:14px;opacity:.5}
+.delete-row:hover{opacity:1}
 .hidden{display:none!important}
 </style>
 </head>
 <body>
 <div class="app-container">
 <aside class="sidebar">
-<div class="sidebar-header"><div class="logo"><div class="logo-icon">ACI</div><div><div class="logo-text">ACI Deploy</div><div class="logo-subtitle">Bulk Deployment Console</div></div></div></div>
+<div class="sidebar-header"><div class="logo"><div class="logo-icon">ACI</div><div><div class="logo-text">Bulk Deploy</div><div class="logo-subtitle">Automation Console</div></div></div></div>
 <nav class="nav-section">
-<div class="nav-label">Bulk Deployments</div>
-<div class="nav-item vpc" onclick="selectView('vpc')"><div class="nav-icon">⚡</div><div><div class="nav-item-title">VPC Bulk</div><div class="nav-item-desc">Virtual Port Channel deployments</div></div></div>
-<div class="nav-item individual" onclick="selectView('individual')"><div class="nav-icon">🔌</div><div><div class="nav-item-title">Port Bulk</div><div class="nav-item-desc">Individual port deployments</div></div></div>
-<div class="nav-label">EPG Management</div>
-<div class="nav-item epgadd" onclick="selectView('epgadd')"><div class="nav-icon">➕</div><div><div class="nav-item-title">EPG Add</div><div class="nav-item-desc">Add EPGs to existing ports</div></div></div>
+<div class="nav-label">Deployments</div>
+<div class="nav-item vpc" onclick="selectView('vpc')"><div class="nav-icon">⚡</div><div><div class="nav-item-title">VPC Bulk</div><div class="nav-item-desc">Virtual Port Channels</div></div></div>
+<div class="nav-item individual" onclick="selectView('individual')"><div class="nav-icon">🔌</div><div><div class="nav-item-title">Port Bulk</div><div class="nav-item-desc">Individual Ports</div></div></div>
+<div class="nav-item epgadd" onclick="selectView('epgadd')"><div class="nav-icon">➕</div><div><div class="nav-item-title">EPG Add</div><div class="nav-item-desc">Add EPGs to ports</div></div></div>
 <div class="nav-item epgdelete" onclick="selectView('epgdelete')"><div class="nav-icon">➖</div><div><div class="nav-item-title">EPG Delete</div><div class="nav-item-desc">Remove EPGs from ports</div></div></div>
-<div class="nav-label">Insights</div>
-<div class="nav-item logs" onclick="selectView('logs')"><div class="nav-icon">📊</div><div><div class="nav-item-title">Deploy Log</div><div class="nav-item-desc">History &amp; time saved</div></div></div>
-<div class="nav-label">Configuration</div>
+<div class="nav-label">Management</div>
+<div class="nav-item credentials" onclick="selectView('credentials')"><div class="nav-icon">🔑</div><div><div class="nav-item-title">Credentials</div><div class="nav-item-desc">APIC authentication</div></div><span class="cred-badge unset" id="credNavBadge">NOT SET</span></div>
+<div class="nav-item logs" onclick="selectView('logs')"><div class="nav-icon">📊</div><div><div class="nav-item-title">Deploy Log</div><div class="nav-item-desc">History &amp; rollback</div></div></div>
 <div class="nav-item settings" onclick="selectView('settings')"><div class="nav-icon">⚙️</div><div><div class="nav-item-title">Settings</div><div class="nav-item-desc">Script paths &amp; configuration</div></div></div>
 <div class="nav-label">Documentation</div>
 <div class="nav-item readme" onclick="selectView('readme')"><div class="nav-icon">📖</div><div><div class="nav-item-title">README</div><div class="nav-item-desc">Instructions &amp; help guide</div></div></div>
@@ -546,11 +1184,25 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="time-saved-banner"><div class="ts-stat"><div class="ts-value" id="wTimeSaved">0m</div><div class="ts-label">Total Time Saved</div></div><div class="ts-divider"></div><div class="ts-stat"><div class="ts-value blue" id="wDeploys">0</div><div class="ts-label">Total Deployments</div></div><div class="ts-divider"></div><div class="ts-stat"><div class="ts-value purple" id="wRuns">0</div><div class="ts-label">Script Runs</div></div></div>
 </div>
 
-<!-- DEPLOYMENT SCREENS - generated via JS helper to reduce duplication -->
+<!-- DEPLOYMENT SCREENS -->
 <div id="vpcScreen" class="hidden" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden"></div>
 <div id="individualScreen" class="hidden" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden"></div>
 <div id="epgaddScreen" class="hidden" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden"></div>
 <div id="epgdeleteScreen" class="hidden" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden"></div>
+
+<!-- CREDENTIALS -->
+<div id="credentialsScreen" class="hidden" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
+<div class="header-bar"><div class="header-title"><h2>APIC Credentials</h2><span class="header-badge credentials">AUTH</span></div></div>
+<div class="cred-panel">
+<div class="cred-section">
+<div class="cred-section-title">🔑 APIC Credential Manager</div>
+<div class="cred-status unset" id="credStatusBox"><span id="credStatusIcon">⚠️</span> <span id="credStatusText">No credentials stored</span></div>
+<div class="cred-row"><label class="cred-label">APIC Username</label><input type="text" class="cred-input" id="credUsername" placeholder="admin" autocomplete="off"></div>
+<div class="cred-row"><label class="cred-label">APIC Password</label><input type="password" class="cred-input" id="credPassword" placeholder="••••••••" autocomplete="off"></div>
+<div class="cred-actions"><button class="cred-btn save" onclick="saveCredentials()">Save Credentials</button><button class="cred-btn clear" onclick="clearCredentials()">Clear</button></div>
+<div class="cred-hint">🛡️ Credentials are stored <strong>in memory only</strong> and are never written to disk. They clear automatically when the app restarts.<br><br>When set, credentials are auto-injected into scripts when they prompt for Username/Password — no manual typing needed.</div>
+</div>
+</div></div>
 
 <!-- LOGS -->
 <div id="logsScreen" class="hidden" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
@@ -572,8 +1224,8 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="settings-section"><div class="settings-section-title">📁 Script Paths</div>
 <div class="settings-row"><label class="settings-label">VPC Deployment Script</label><input type="text" class="settings-input" id="settingsVpcScript" value="{{ config.vpc_script }}"><div class="settings-hint">Path to the VPC bulk deployment Python script</div></div>
 <div class="settings-row"><label class="settings-label">Individual Port Deployment Script</label><input type="text" class="settings-input" id="settingsIndividualScript" value="{{ config.individual_script }}"><div class="settings-hint">Path to the individual port bulk deployment Python script</div></div>
-<div class="settings-row"><label class="settings-label">EPG Add Script</label><input type="text" class="settings-input" id="settingsEpgaddScript" value="{{ config.epgadd_script }}"><div class="settings-hint">Path to the EPG add Python script</div></div>
-<div class="settings-row"><label class="settings-label">EPG Delete Script</label><input type="text" class="settings-input" id="settingsEpgdeleteScript" value="{{ config.epgdelete_script }}"><div class="settings-hint">Path to the EPG delete Python script</div></div>
+<div class="settings-row"><label class="settings-label">EPG Add Script</label><input type="text" class="settings-input" id="settingsEpgaddScript" value="{{ config.epgadd_script }}"></div>
+<div class="settings-row"><label class="settings-label">EPG Delete Script</label><input type="text" class="settings-input" id="settingsEpgdeleteScript" value="{{ config.epgdelete_script }}"></div>
 </div>
 <div class="settings-section"><div class="settings-section-title">ℹ️ Application Info</div><div class="settings-row"><label class="settings-label">Version</label><input type="text" class="settings-input" id="settingsVersion" value="{{ config.version }}"></div></div>
 </div></div>
@@ -589,22 +1241,24 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="readme-tab" onclick="switchReadmeTab('troubleshoot')">🔧 Troubleshoot</div>
 </div>
 <div id="readmeTabUi" class="readme-tab-content active"><div class="readme-section"><div class="readme-section-title"><span>🚀</span> Getting Started</div><div class="readme-content">
-<div class="step"><div class="step-number">1</div><div class="step-content"><div class="step-title">Select Deployment Type</div><div>Click <strong>VPC Bulk</strong> or <strong>Port Bulk</strong> in the sidebar.</div></div></div>
-<div class="step"><div class="step-number">2</div><div class="step-content"><div class="step-title">Select CSV File</div><div>Click <strong>Browse Files</strong> to open your file explorer and select your CSV.</div></div></div>
-<div class="step"><div class="step-number">3</div><div class="step-content"><div class="step-title">Run the Script</div><div>Click <strong>Run Script</strong>. The terminal shows real-time output.</div></div></div>
-<div class="step"><div class="step-number">4</div><div class="step-content"><div class="step-title">Respond to Prompts</div><div>Type in the input bar and press <strong>Enter</strong>. Option numbers like <code>[1]</code> <code>[2]</code> appear in <span style="color:var(--accent-blue)">blue</span> for easy reading.</div></div></div>
+<div class="step"><div class="step-number">1</div><div class="step-content"><div class="step-title">Set Credentials</div><div>Click <strong>Credentials</strong> in the sidebar and enter your APIC username/password. These auto-fill during deployments.</div></div></div>
+<div class="step"><div class="step-number">2</div><div class="step-content"><div class="step-title">Select Deployment Type</div><div>Click a deployment type in the sidebar.</div></div></div>
+<div class="step"><div class="step-number">3</div><div class="step-content"><div class="step-title">Select CSV File</div><div>Click <strong>Browse Files</strong> to open your file explorer. CSV is validated automatically.</div></div></div>
+<div class="step"><div class="step-number">4</div><div class="step-content"><div class="step-title">Run &amp; Respond</div><div>Click <strong>Run Script</strong>. Credentials auto-inject. Type responses for prompts in the input bar.</div></div></div>
+<div class="step"><div class="step-number">5</div><div class="step-content"><div class="step-title">Review Logs &amp; Rollback</div><div>Check <strong>Deploy Log</strong> for history. Download sanitized logs for work orders. Use <strong>Rollback</strong> to generate reversal scripts.</div></div></div>
 </div></div></div>
 <div id="readmeTabVpc" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>⚡</span> VPC Bulk Deployment</div><div class="readme-content"><p>Deploy VPCs across switch pairs. CSV columns: Hostname, Switch1, Switch2, Speed, VLANS, WorkOrder.</p></div></div></div>
 <div id="readmeTabIndividual" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔌</span> Individual Port Deployment</div><div class="readme-content"><p>Deploy individual ports. ACCESS = single VLAN untagged, TRUNK = multiple VLANs tagged.</p></div></div></div>
-<div id="readmeTabTroubleshoot" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔧</span> Troubleshooting</div><div class="readme-content"><h3>Script Not Found</h3><p>Go to Settings and verify script paths.</p><h3>CSV Errors</h3><p>Check headers match exactly. Wrap VLAN ranges in quotes. Save as UTF-8.</p></div></div></div>
+<div id="readmeTabTroubleshoot" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔧</span> Troubleshooting</div><div class="readme-content"><h3>Script Not Found</h3><p>Go to Settings and verify script paths.</p><h3>CSV Errors</h3><p>Check headers match exactly. Wrap VLAN ranges in quotes. Save as UTF-8.</p><h3>Credentials Not Auto-Filling</h3><p>Ensure credentials are set in the Credentials panel before running scripts.</p></div></div></div>
 </div></div>
 
 </main></div>
 
 <script>
 let currentView='welcome',isRunning=false,pollInterval=null,csvModes={vpc:'file',individual:'file',epgadd:'file',epgdelete:'file'};
+let credSet=false;
 
-// Build deployment screens dynamically to avoid HTML duplication
+// Build deployment screens dynamically
 const screenDefs = [
   {id:'vpc',title:'VPC Bulk Deployment',badge:'VPC',badgeCls:'vpc',console:'vpc-deployment-console',
    csvCols:['Hostname','Switch1','Switch2','Speed','VLANS','WorkOrder'],
@@ -636,7 +1290,7 @@ screenDefs.forEach(s => {
 <div class="header-bar"><div class="header-title"><h2>${s.title}</h2><span class="header-badge ${s.badgeCls}">${s.badge}</span></div><div class="header-actions"><button class="header-btn" onclick="clearTerminal('${s.id}')">Clear</button><button class="header-btn danger" onclick="stopScript()" id="${s.id}StopBtn" disabled>Stop</button><button class="header-btn primary" onclick="runScript('${s.id}')" id="${s.id}RunBtn">Run Script</button></div></div>
 <div class="config-panel">
 <div class="csv-toggle-group"><button class="csv-toggle active" onclick="toggleCsvMode('${s.id}','file')">📁 Use CSV File</button><button class="csv-toggle" onclick="toggleCsvMode('${s.id}','inline')">✏️ Edit Inline</button></div>
-<div id="${s.id}FileMode"><label class="config-label">CSV File</label><div class="file-picker-row"><div class="file-picker-display" id="${s.id}FpDisplay"><span class="fp-icon">📄</span><span class="fp-placeholder">No file selected — click Browse</span></div><button class="file-picker-btn" onclick="document.getElementById('${s.id}FileInput').click()">Browse Files</button><input type="file" class="file-input-hidden" id="${s.id}FileInput" accept=".csv,.txt" onchange="handleFileSelect('${s.id}',this)"><input type="hidden" id="${s.id}CsvPath" value="${s.defCsv}"></div></div>
+<div id="${s.id}FileMode"><label class="config-label">CSV File</label><div class="file-picker-row"><div class="file-picker-display" id="${s.id}FpDisplay"><span class="fp-icon">📄</span><span class="fp-placeholder">No file selected — click Browse</span></div><button class="file-picker-btn" onclick="document.getElementById('${s.id}FileInput').click()">Browse Files</button><input type="file" class="file-input-hidden" id="${s.id}FileInput" accept=".csv,.txt" onchange="handleFileSelect('${s.id}',this)"><input type="hidden" id="${s.id}CsvPath" value="${s.defCsv}"></div><div id="${s.id}Validation"></div></div>
 <div id="${s.id}InlineMode" style="display:none"><div class="csv-editor-section" style="padding:0"><div class="csv-editor-header"><span class="csv-editor-title">Inline CSV Editor</span><div class="csv-editor-actions"><button class="csv-editor-btn add" onclick="addCsvRow('${s.id}')">+ Add Row</button><button class="csv-editor-btn" onclick="exportCsv('${s.id}')">Export CSV</button></div></div><table class="csv-editor-table" id="${s.id}CsvTable"><thead><tr>${thRow}</tr></thead><tbody><tr>${tdRow}</tr></tbody></table></div></div>
 </div>
 <div class="csv-reference" id="${s.id}CsvRef"><div class="csv-reference-header"><span class="csv-reference-title">📋 CSV Format Reference</span><span class="csv-reference-toggle" onclick="toggleCsvRef('${s.id}')">Hide</span></div><table class="csv-table">${s.csvRef}</table><div class="csv-example"><div class="csv-example-label"># Example:</div>${s.csvEx}</div></div>
@@ -647,13 +1301,34 @@ function selectView(view){
   currentView=view;
   document.querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'));
   const nav=document.querySelector('.nav-item.'+view); if(nav) nav.classList.add('active');
-  ['welcomeScreen','vpcScreen','individualScreen','settingsScreen','readmeScreen','epgaddScreen','epgdeleteScreen','logsScreen'].forEach(id=>{document.getElementById(id).classList.add('hidden')});
+  ['welcomeScreen','vpcScreen','individualScreen','settingsScreen','readmeScreen','epgaddScreen','epgdeleteScreen','logsScreen','credentialsScreen'].forEach(id=>{document.getElementById(id).classList.add('hidden')});
   const sc=document.getElementById(view+'Screen');
   if(sc){sc.classList.remove('hidden');sc.style.display='flex'}else if(view==='welcome'){document.getElementById('welcomeScreen').classList.remove('hidden')}
   if(view==='welcome'||view==='logs') refreshLog();
 }
 
-// FILE PICKER
+// CREDENTIALS
+function saveCredentials(){
+  const u=document.getElementById('credUsername').value.trim();
+  const p=document.getElementById('credPassword').value;
+  if(!u||!p){alert('Both username and password are required');return}
+  fetch('/api/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})})
+  .then(r=>r.json()).then(d=>{if(d.status==='saved'){updateCredStatus(true);alert('Credentials saved (in memory only)')}});
+}
+function clearCredentials(){
+  fetch('/api/credentials',{method:'DELETE'}).then(r=>r.json()).then(()=>{
+    updateCredStatus(false);document.getElementById('credUsername').value='';document.getElementById('credPassword').value='';
+  });
+}
+function updateCredStatus(isSet){
+  credSet=isSet;
+  const box=document.getElementById('credStatusBox'),icon=document.getElementById('credStatusIcon'),txt=document.getElementById('credStatusText'),badge=document.getElementById('credNavBadge');
+  if(isSet){box.className='cred-status set';icon.textContent='✅';txt.textContent='Credentials stored (auto-fill active)';badge.className='cred-badge set';badge.textContent='SET'}
+  else{box.className='cred-status unset';icon.textContent='⚠️';txt.textContent='No credentials stored';badge.className='cred-badge unset';badge.textContent='NOT SET'}
+}
+function checkCredentials(){fetch('/api/credentials').then(r=>r.json()).then(d=>updateCredStatus(d.set))}
+
+// FILE PICKER with CSV VALIDATION
 function handleFileSelect(type,input){
   if(!input.files||!input.files.length) return;
   const fd=new FormData(); fd.append('file',input.files[0]);
@@ -663,6 +1338,14 @@ function handleFileSelect(type,input){
       const dp=document.getElementById(type+'FpDisplay');
       dp.innerHTML='<span class="fp-icon">✅</span><span class="fp-name">'+d.filename+'</span>';
       dp.classList.add('has-file');
+      // Validate CSV
+      fetch('/api/validate-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:d.path,type:type})})
+      .then(r=>r.json()).then(v=>{
+        const vd=document.getElementById(type+'Validation');
+        if(v.valid && !v.warnings.length){vd.innerHTML='<div class="csv-validation valid">✅ Valid: '+v.row_count+' row(s), columns: '+v.columns_found.join(', ')+'</div>'}
+        else if(v.valid && v.warnings.length){vd.innerHTML='<div class="csv-validation warnings">⚠️ Valid with warnings ('+v.row_count+' rows): '+v.warnings.slice(0,3).join('; ')+'</div>'}
+        else{vd.innerHTML='<div class="csv-validation invalid">❌ Invalid: '+v.errors.join('; ')+'</div>'}
+      });
     } else alert('Upload failed: '+(d.message||'Unknown'));
   }).catch(e=>alert('Upload error: '+e));
 }
@@ -677,7 +1360,7 @@ function exportCsv(type){const table=document.getElementById(type+'CsvTable'),ro
 function switchReadmeTab(tab){document.querySelectorAll('.readme-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.readme-tab-content').forEach(c=>c.classList.remove('active'));event.target.classList.add('active');const map={ui:'readmeTabUi',vpc:'readmeTabVpc',individual:'readmeTabIndividual',troubleshoot:'readmeTabTroubleshoot'};const el=document.getElementById(map[tab]);if(el)el.classList.add('active')}
 function toggleCsvRef(type){const ref=document.getElementById(type+'CsvRef'),t=ref.querySelector('.csv-table'),e=ref.querySelector('.csv-example'),tog=ref.querySelector('.csv-reference-toggle');if(t.style.display==='none'){t.style.display='';e.style.display='';tog.textContent='Hide'}else{t.style.display='none';e.style.display='none';tog.textContent='Show'}}
 
-// TERMINAL - Feature #4: bracket-number highlighting
+// TERMINAL
 function highlightBracketNums(html){return html.replace(/\[(\d+|[A-Za-z])\]/g,'<span class="bracket-num">[$1]</span>')}
 
 function addLine(type,text,lineType='normal'){
@@ -687,15 +1370,17 @@ function addLine(type,text,lineType='normal'){
     else if(tu.includes('[ERROR]')||tu.includes('[FAILED]')||tu.includes('[FAILURE]'))lineType='error';
     else if(tu.includes('[WARNING]')||tu.includes('[WARN]')||tu.includes('[SKIP]')||tu.includes('[SKIPPED]'))lineType='warning';
     else if(tu.includes('[INFO]'))lineType='info';
+    else if(tu.includes('[CREDENTIALS]'))lineType='credential';
     else if(text.startsWith('===')||text.startsWith('---')||text.startsWith('***'))lineType='header';
   }
   line.className='terminal-line '+lineType;
   const esc=text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  if(['success','error','warning','info'].includes(lineType)){
+  if(['success','error','warning','info','credential'].includes(lineType)){
     let h=esc.replace(/\[(FOUND|SUCCESS|OK|CREATED|DEPLOYED)\]/gi,'<span style="color:var(--accent-green);font-weight:600">[$1]</span>')
       .replace(/\[(ERROR|FAILED|FAILURE)\]/gi,'<span style="color:var(--accent-red);font-weight:600">[$1]</span>')
       .replace(/\[(WARNING|WARN|SKIP|SKIPPED)\]/gi,'<span style="color:var(--accent-orange);font-weight:600">[$1]</span>')
-      .replace(/\[(INFO)\]/gi,'<span style="color:var(--accent-blue);font-weight:600">[$1]</span>');
+      .replace(/\[(INFO)\]/gi,'<span style="color:var(--accent-blue);font-weight:600">[$1]</span>')
+      .replace(/\[(CREDENTIALS)\]/gi,'<span style="color:#ffd200;font-weight:600">[$1]</span>');
     line.innerHTML=highlightBracketNums(h);
   } else { line.innerHTML=highlightBracketNums(esc); }
   output.appendChild(line); output.scrollTop=output.scrollHeight;
@@ -711,12 +1396,13 @@ function runScript(type){
   document.getElementById(type+'RunBtn').disabled=true;document.getElementById(type+'StopBtn').disabled=false;
   document.getElementById(type+'Input').disabled=false;document.getElementById(type+'SubmitBtn').disabled=false;
   clearTerminal(type);addLine(type,'[INFO] Starting script...','info');addLine(type,'[INFO] CSV: '+csvPath,'info');
+  if(credSet) addLine(type,'[CREDENTIALS] Auto-fill active — credentials will be injected','credential');
   fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:type,csv_path:csvPath})})
   .then(r=>r.json()).then(d=>{if(d.status==='started')startPolling(type);else{addLine(type,'[ERROR] '+d.message,'error');scriptEnded(type)}})
   .catch(e=>{addLine(type,'[ERROR] '+e,'error');scriptEnded(type)});
 }
 
-function startPolling(type){pollInterval=setInterval(()=>{fetch('/api/output').then(r=>r.json()).then(d=>{d.lines.forEach(item=>{if(item.type==='output'){let lt='normal';if(item.text.includes('===')||item.text.includes('---'))lt='header';else if(item.text.includes('[SUCCESS]')||item.text.includes(' OK'))lt='success';else if(item.text.includes('[ERROR]')||item.text.includes('[FAILED]'))lt='error';else if(item.text.includes('[WARNING]'))lt='warning';else if(item.text.includes('[INFO]'))lt='info';else if(item.text.includes('Select')||item.text.endsWith(':')||item.text.endsWith('?'))lt='prompt';addLine(type,item.text,lt)}else if(item.type==='exit'){addLine(type,'[EXIT] Code: '+item.code,item.code===0?'success':'error');scriptEnded(type)}else if(item.type==='error'){addLine(type,'[ERROR] '+item.text,'error');scriptEnded(type)}})})},100)}
+function startPolling(type){pollInterval=setInterval(()=>{fetch('/api/output').then(r=>r.json()).then(d=>{d.lines.forEach(item=>{if(item.type==='output'){let lt='normal';if(item.text.includes('===')||item.text.includes('---'))lt='header';else if(item.text.includes('[SUCCESS]')||item.text.includes(' OK'))lt='success';else if(item.text.includes('[ERROR]')||item.text.includes('[FAILED]'))lt='error';else if(item.text.includes('[WARNING]'))lt='warning';else if(item.text.includes('[INFO]'))lt='info';else if(item.text.includes('[CREDENTIALS]'))lt='credential';else if(item.text.includes('Select')||item.text.endsWith(':')||item.text.endsWith('?'))lt='prompt';addLine(type,item.text,lt)}else if(item.type==='exit'){addLine(type,'[EXIT] Code: '+item.code,item.code===0?'success':'error');scriptEnded(type)}else if(item.type==='error'){addLine(type,'[ERROR] '+item.text,'error');scriptEnded(type)}})})},100)}
 
 function scriptEnded(type){isRunning=false;if(pollInterval){clearInterval(pollInterval);pollInterval=null}setStatus(type,'Ready',false);document.getElementById(type+'RunBtn').disabled=false;document.getElementById(type+'StopBtn').disabled=true;document.getElementById(type+'Input').disabled=true;document.getElementById(type+'SubmitBtn').disabled=true}
 function stopScript(){fetch('/api/stop',{method:'POST'}).then(()=>{addLine(currentView,'[STOPPED] Terminated by user','warning');scriptEnded(currentView)})}
@@ -725,7 +1411,7 @@ function handleInputKeypress(e,type){if(e.key==='Enter')submitInput(type)}
 
 function saveSettings(){const s={vpc_script:document.getElementById('settingsVpcScript').value,individual_script:document.getElementById('settingsIndividualScript').value,epgadd_script:document.getElementById('settingsEpgaddScript').value,epgdelete_script:document.getElementById('settingsEpgdeleteScript').value,version:document.getElementById('settingsVersion').value};fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)}).then(r=>r.json()).then(d=>{if(d.status==='saved'){alert('Settings saved!');document.getElementById('versionBadge').textContent='v'+s.version}})}
 
-// LOG
+// LOG with download + rollback buttons
 function fmtMin(m){if(m<60)return Math.round(m)+'m';return Math.floor(m/60)+'h '+Math.round(m%60)+'m'}
 function refreshLog(){fetch('/api/logs').then(r=>r.json()).then(log=>{
   const e=log.entries||[],ts=log.total_time_saved_minutes||0,td=log.total_deployments||0,runs=e.length,ok=e.filter(x=>x.status==='success').length,rate=runs>0?Math.round(ok/runs*100)+'%':'—';
@@ -734,10 +1420,19 @@ function refreshLog(){fetch('/api/logs').then(r=>r.json()).then(log=>{
   if(u('logTimeSaved')){u('logTimeSaved').textContent=fmtMin(ts);u('logDeploys').textContent=td;u('logRuns').textContent=runs;u('logSuccessRate').textContent=rate}
   const c=u('logEntriesContainer');if(!e.length){c.innerHTML='<div class="log-empty"><div class="log-empty-icon">📭</div>No deployments yet.</div>';return}
   const labels={vpc:'VPC',individual:'PORT',epgadd:'EPG ADD',epgdelete:'EPG DEL'};let h='';
-  for(let i=e.length-1;i>=0;i--){const x=e[i];h+='<div class="log-entry"><div class="log-entry-dot '+x.status+'"></div><div class="log-entry-info"><div class="log-entry-title">'+(x.csv_file||'inline')+'</div><div class="log-entry-meta">'+x.timestamp+' · '+x.deployment_count+' items · '+x.duration_seconds+'s</div></div><span class="log-entry-type '+x.type+'">'+(labels[x.type]||x.type)+'</span><div class="log-entry-saved">-'+fmtMin(x.time_saved_minutes)+'</div></div>'}
+  for(let i=e.length-1;i>=0;i--){const x=e[i];
+    let actionBtns='<div class="log-entry-actions">';
+    if(x.saved_log_file) actionBtns+='<button class="log-action-btn download" onclick="downloadLog(\''+x.saved_log_file+'\')">📥 Log</button>';
+    if(x.rollback_file) actionBtns+='<button class="log-action-btn rollback" onclick="downloadRollback(\''+x.rollback_file+'\')">↩ Rollback</button>';
+    actionBtns+='</div>';
+    h+='<div class="log-entry"><div class="log-entry-dot '+x.status+'"></div><div class="log-entry-info"><div class="log-entry-title">'+(x.csv_file||'inline')+'</div><div class="log-entry-meta">'+x.timestamp+' · '+x.deployment_count+' items · '+x.duration_seconds+'s</div></div><span class="log-entry-type '+x.type+'">'+(labels[x.type]||x.type)+'</span><div class="log-entry-saved">-'+fmtMin(x.time_saved_minutes)+'</div>'+actionBtns+'</div>'}
   c.innerHTML=h}).catch(()=>{})}
 function clearLog(){if(!confirm('Clear all deployment log entries?'))return;fetch('/api/logs/clear',{method:'POST'}).then(()=>refreshLog())}
+function downloadLog(filename){window.open('/api/saved-logs/'+encodeURIComponent(filename),'_blank')}
+function downloadRollback(filename){window.open('/api/rollback/'+encodeURIComponent(filename),'_blank')}
 
+// Init
+checkCredentials();
 selectView('welcome');
 </script>
 </body></html>
@@ -822,6 +1517,29 @@ def api_upload():
     f.save(filepath)
     return jsonify({'status': 'ok', 'path': filepath, 'filename': filename})
 
+@app.route('/api/credentials', methods=['GET', 'POST', 'DELETE'])
+def api_credentials():
+    global stored_credentials
+    if request.method == 'GET':
+        return jsonify({'set': stored_credentials.get('set', False), 'username': stored_credentials.get('username', '')})
+    elif request.method == 'POST':
+        data = request.json
+        stored_credentials['username'] = data.get('username', '')
+        stored_credentials['password'] = data.get('password', '')
+        stored_credentials['set'] = bool(stored_credentials['username'] and stored_credentials['password'])
+        return jsonify({'status': 'saved', 'set': stored_credentials['set']})
+    elif request.method == 'DELETE':
+        stored_credentials = {"username": None, "password": None, "set": False}
+        return jsonify({'status': 'cleared'})
+
+@app.route('/api/validate-csv', methods=['POST'])
+def api_validate_csv():
+    data = request.json
+    filepath = data.get('path', '')
+    script_type = data.get('type', '')
+    results = validate_csv_file(filepath, script_type)
+    return jsonify(results)
+
 @app.route('/api/logs')
 def api_logs():
     return jsonify(load_log())
@@ -831,14 +1549,31 @@ def api_logs_clear():
     save_log({"entries": [], "total_time_saved_minutes": 0, "total_deployments": 0})
     return jsonify({'status': 'cleared'})
 
+@app.route('/api/saved-logs/<filename>')
+def api_saved_log_download(filename):
+    safe_name = filename.replace('..', '').replace('/', '_').replace('\\', '_')
+    filepath = os.path.join(SAVED_LOGS_FOLDER, safe_name)
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=True, download_name=safe_name)
+    return jsonify({'status': 'error', 'message': 'Log file not found'}), 404
+
+@app.route('/api/rollback/<filename>')
+def api_rollback_download(filename):
+    safe_name = filename.replace('..', '').replace('/', '_').replace('\\', '_')
+    filepath = os.path.join(ROLLBACK_FOLDER, safe_name)
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=True, download_name=safe_name)
+    return jsonify({'status': 'error', 'message': 'Rollback script not found'}), 404
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
 if __name__ == '__main__':
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    for folder in [UPLOAD_FOLDER, SAVED_LOGS_FOLDER, ROLLBACK_FOLDER]:
+        os.makedirs(folder, exist_ok=True)
     print("\n" + "=" * 60)
-    print(" ACI BULK DEPLOYMENT WEB APPLICATION v1.2.0")
+    print(" ACI BULK DEPLOYMENT WEB APPLICATION v1.3.0")
     print("=" * 60)
     print("\n Starting server...")
     print(" Open http://localhost:5000 in your browser")
