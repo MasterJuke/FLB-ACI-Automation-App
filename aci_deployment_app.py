@@ -66,10 +66,10 @@ DEFAULT_CONFIG = {
 }
 
 TIME_ESTIMATES = {
-    "vpc": {"per_deployment": 18, "label": "VPC Port Channel + EPG Bindings"},
-    "individual": {"per_deployment": 12, "label": "Static Port Policy + EPG Bindings"},
-    "epgadd": {"per_deployment": 6, "label": "EPG Static Path Binding Addition"},
-    "epgdelete": {"per_deployment": 5, "label": "EPG Static Path Binding Removal"}
+    "vpc": {"per_deployment": 4, "label": "VPC Port Channel + EPG Bindings"},
+    "individual": {"per_deployment": 3, "label": "Static Port Policy + EPG Bindings"},
+    "epgadd": {"per_deployment": 2, "label": "EPG Static Path Binding Addition"},
+    "epgdelete": {"per_deployment": 1.5, "label": "EPG Static Path Binding Removal"}
 }
 
 # CSV column requirements per script type
@@ -958,13 +958,20 @@ def run_script_thread(script_path, csv_path):
                                     pass
 
                         # AUTO-TENANT SELECTION
-                        # Detect numbered selection prompts with tenant context
-                        # Patterns: "(1/2):", "Select [1-2]:", "select tenant", etc.
-                        is_selection = bool(re.search(r'\(\d+/\d+\)', tl) or
-                                           re.search(r'select\s*\[?\d', tl) or
-                                           re.search(r'choose\s*\[?\d', tl))
-                        has_tenant_context = any('tenant' in rl for rl in recent_prompt_lines)
-                        if is_selection and has_tenant_context:
+                        # Detect: "Select (Applies to all VLANS in this deployment):"
+                        is_tenant_prompt = ('applies to all' in tl and 'select' in tl) or \
+                                           ('select' in tl and 'tenant' in tl) or \
+                                           ('multiple tenants' in tl)
+                        # Also check recent output for tenant context (e.g. "found in multiple tenants")
+                        if not is_tenant_prompt:
+                            has_tenant_context = any(
+                                'tenant' in rl or 'multiple tenants' in rl
+                                for rl in recent_prompt_lines
+                            )
+                            is_tenant_prompt = has_tenant_context and (
+                                tl.startswith('select') and tl.endswith(':'))
+
+                        if is_tenant_prompt:
                             current_run["last_prompt_type"] = "tenant"
                             tenant_val = current_run.get("tenant_choice")
                             if tenant_val:
@@ -976,8 +983,6 @@ def run_script_thread(script_path, csv_path):
                                     current_run["output_lines"].append(f'[AUTO] Tenant selection: {tenant_val}')
                                 except:
                                     pass
-                        elif is_selection:
-                            current_run["last_prompt_type"] = "selection"
                         else:
                             current_run["last_prompt_type"] = None
 
