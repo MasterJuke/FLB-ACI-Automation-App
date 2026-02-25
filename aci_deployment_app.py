@@ -1780,6 +1780,7 @@ def api_rollback_download(filename):
 
 if __name__ == '__main__':
     import logging
+    import webbrowser
     # Suppress Flask/Werkzeug dev server warning (internal tool, not public-facing)
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
@@ -1792,4 +1793,8 @@ if __name__ == '__main__':
     print("\n  Server running on http://localhost:5000")
     print("  Press Ctrl+C to stop")
     print("\n" + "=" * 60 + "\n")
+
+    # Auto-open browser after a short delay (server needs to bind first)
+    threading.Timer(1.2, lambda: webbrowser.open('http://localhost:5000')).start()
+
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
