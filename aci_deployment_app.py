@@ -1361,7 +1361,7 @@ function switchReadmeTab(tab){document.querySelectorAll('.readme-tab').forEach(t
 function toggleCsvRef(type){const ref=document.getElementById(type+'CsvRef'),t=ref.querySelector('.csv-table'),e=ref.querySelector('.csv-example'),tog=ref.querySelector('.csv-reference-toggle');if(t.style.display==='none'){t.style.display='';e.style.display='';tog.textContent='Hide'}else{t.style.display='none';e.style.display='none';tog.textContent='Show'}}
 
 // TERMINAL
-function highlightBracketNums(html){return html.replace(/\[(\d+|[A-Za-z])\]/g,'<span class="bracket-num">[$1]</span>')}
+function highlightBracketNums(html){return html.replace(/\[\s*(\d+|[A-Za-z])\]/g,'<span class="bracket-num">[$1]</span>')}
 
 function addLine(type,text,lineType='normal'){
   const output=document.getElementById(type+'Output'),line=document.createElement('div');
