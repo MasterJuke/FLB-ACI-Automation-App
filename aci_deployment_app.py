@@ -821,6 +821,8 @@ def run_script_thread(script_path, csv_path):
     current_run["start_time"] = time.time()
     current_run["output_lines"] = []
     current_run["token_failures"] = 0
+    current_run["tenant_choice"] = None       # Remembered tenant selection (e.g. "1")
+    current_run["last_prompt_type"] = None     # Track what kind of prompt we're at
 
     try:
         env = os.environ.copy()
@@ -844,6 +846,7 @@ def run_script_thread(script_path, csv_path):
 
         # Auto-credential tracking
         cred_state = {"awaiting": None}  # None, "username", "password"
+        recent_prompt_lines = []  # Track recent output for tenant detection
 
         def reader_thread():
             while True:
@@ -871,6 +874,10 @@ def run_script_thread(script_path, csv_path):
                     if line:
                         output_queue.put(('output', line))
                         current_run["output_lines"].append(line)
+                        # Keep rolling buffer of recent lines for context detection
+                        recent_prompt_lines.append(line.lower())
+                        if len(recent_prompt_lines) > 8:
+                            recent_prompt_lines.pop(0)
                         # TOKEN FAILURE DETECTION
                         ll = line.lower()
                         if 'token was invalid' in ll or 'token timeout' in ll or (
@@ -949,6 +956,30 @@ def run_script_thread(script_path, csv_path):
                                     current_run["output_lines"].append('[AUTO] Rollback confirmed: YES')
                                 except:
                                     pass
+
+                        # AUTO-TENANT SELECTION
+                        # Detect numbered selection prompts with tenant context
+                        # Patterns: "(1/2):", "Select [1-2]:", "select tenant", etc.
+                        is_selection = bool(re.search(r'\(\d+/\d+\)', tl) or
+                                           re.search(r'select\s*\[?\d', tl) or
+                                           re.search(r'choose\s*\[?\d', tl))
+                        has_tenant_context = any('tenant' in rl for rl in recent_prompt_lines)
+                        if is_selection and has_tenant_context:
+                            current_run["last_prompt_type"] = "tenant"
+                            tenant_val = current_run.get("tenant_choice")
+                            if tenant_val:
+                                time.sleep(0.1)
+                                try:
+                                    running_process.stdin.write((str(tenant_val) + '\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    output_queue.put(('output', f'[AUTO] Tenant selection applied: {tenant_val}'))
+                                    current_run["output_lines"].append(f'[AUTO] Tenant selection: {tenant_val}')
+                                except:
+                                    pass
+                        elif is_selection:
+                            current_run["last_prompt_type"] = "selection"
+                        else:
+                            current_run["last_prompt_type"] = None
 
         reader.join(timeout=1.0)
         with buffer_lock:
@@ -1261,6 +1292,17 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .row-actions{width:36px;text-align:center}
 .delete-row{background:none;border:none;color:var(--accent-red);cursor:pointer;font-size:14px;opacity:.5}
 .delete-row:hover{opacity:1}
+/* Tenant Memory Bar */
+.tenant-bar{display:flex;align-items:center;gap:10px;padding:8px 16px;background:rgba(163,113,247,.1);border-top:1px solid rgba(163,113,247,.3)}
+.tenant-bar.locked{background:rgba(63,185,80,.08);border-color:rgba(63,185,80,.3)}
+.tenant-bar-icon{font-size:14px}
+.tenant-bar-text{flex:1;font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--text-secondary)}
+.tenant-bar-text strong{color:var(--accent-green)}
+.tenant-bar-btn{padding:4px 12px;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;border:none;font-family:inherit;transition:all .2s}
+.tenant-bar-btn.apply{background:rgba(163,113,247,.2);color:var(--accent-purple)}
+.tenant-bar-btn.apply:hover{background:rgba(163,113,247,.35)}
+.tenant-bar-btn.clear{background:rgba(248,81,73,.12);color:var(--accent-red);font-size:10px}
+.tenant-bar-btn.clear:hover{background:rgba(248,81,73,.25)}
 .hidden{display:none!important}
 </style>
 </head>
@@ -1373,6 +1415,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <script>
 let currentView='welcome',isRunning=false,pollInterval=null,csvModes={vpc:'file',individual:'file',epgadd:'file',epgdelete:'file'};
 let credSet=false;
+let tenantLocked=false,lastUserInput='',tenantPromptActive=false;
 
 // Build deployment screens dynamically
 const screenDefs = [
@@ -1410,7 +1453,7 @@ screenDefs.forEach(s => {
 <div id="${s.id}InlineMode" style="display:none"><div class="csv-editor-section" style="padding:0"><div class="csv-editor-header"><span class="csv-editor-title">Inline CSV Editor</span><div class="csv-editor-actions"><button class="csv-editor-btn add" onclick="addCsvRow('${s.id}')">+ Add Row</button><button class="csv-editor-btn" onclick="exportCsv('${s.id}')">Export CSV</button></div></div><table class="csv-editor-table" id="${s.id}CsvTable"><thead><tr>${thRow}</tr></thead><tbody><tr>${tdRow}</tr></tbody></table></div></div>
 </div>
 <div class="csv-reference" id="${s.id}CsvRef"><div class="csv-reference-header"><span class="csv-reference-title">📋 CSV Format Reference</span><span class="csv-reference-toggle" onclick="toggleCsvRef('${s.id}')">Hide</span></div><table class="csv-table">${s.csvRef}</table><div class="csv-example"><div class="csv-example-label"># Example:</div>${s.csvEx}</div></div>
-<div class="terminal-container"><div class="terminal-header"><div class="terminal-dots"><div class="terminal-dot red"></div><div class="terminal-dot yellow"></div><div class="terminal-dot green"></div></div><span class="terminal-title">${s.console}</span><div class="terminal-status" id="${s.id}TerminalStatus"><div class="terminal-status-dot"></div><span>Ready</span></div></div><div class="terminal-output" id="${s.id}Output"><div class="terminal-line muted">// ${s.title}</div><div class="terminal-line muted">// Select a CSV file and click "Run Script" to begin</div></div><div class="post-run-bar hidden" id="${s.id}PostRun"><div class="post-run-label">✅ Run complete</div><div class="post-run-actions"><button class="post-run-btn log-btn" id="${s.id}PostRunLog" onclick="postRunDownloadLog('${s.id}')">📥 Download Log</button><button class="post-run-btn rollback-btn" id="${s.id}PostRunRollback" onclick="postRunDownloadRollback('${s.id}')">↩️ Rollback Script</button><button class="post-run-btn run-rb-btn" id="${s.id}PostRunExec" onclick="postRunExecRollback('${s.id}')">▶ Run Rollback</button><button class="post-run-dismiss" onclick="document.getElementById('${s.id}PostRun').classList.add('hidden')" title="Dismiss">✕</button></div></div><div class="terminal-input-area"><span class="terminal-prompt">❯</span><input type="text" class="terminal-input" id="${s.id}Input" placeholder="Type response here..." onkeypress="handleInputKeypress(event,'${s.id}')" disabled><button class="terminal-submit" id="${s.id}SubmitBtn" onclick="submitInput('${s.id}')" disabled>Send</button></div></div>`;
+<div class="terminal-container"><div class="terminal-header"><div class="terminal-dots"><div class="terminal-dot red"></div><div class="terminal-dot yellow"></div><div class="terminal-dot green"></div></div><span class="terminal-title">${s.console}</span><div class="terminal-status" id="${s.id}TerminalStatus"><div class="terminal-status-dot"></div><span>Ready</span></div></div><div class="terminal-output" id="${s.id}Output"><div class="terminal-line muted">// ${s.title}</div><div class="terminal-line muted">// Select a CSV file and click "Run Script" to begin</div></div><div class="post-run-bar hidden" id="${s.id}PostRun"><div class="post-run-label">✅ Run complete</div><div class="post-run-actions"><button class="post-run-btn log-btn" id="${s.id}PostRunLog" onclick="postRunDownloadLog('${s.id}')">📥 Download Log</button><button class="post-run-btn rollback-btn" id="${s.id}PostRunRollback" onclick="postRunDownloadRollback('${s.id}')">↩️ Rollback Script</button><button class="post-run-btn run-rb-btn" id="${s.id}PostRunExec" onclick="postRunExecRollback('${s.id}')">▶ Run Rollback</button><button class="post-run-dismiss" onclick="document.getElementById('${s.id}PostRun').classList.add('hidden')" title="Dismiss">✕</button></div></div><div class="tenant-bar hidden" id="${s.id}TenantBar"><span class="tenant-bar-icon">🏢</span><span class="tenant-bar-text" id="${s.id}TenantText">Tenant prompt detected</span><button class="tenant-bar-btn apply" id="${s.id}TenantApply" onclick="rememberTenant('${s.id}')">Apply to all remaining</button><button class="tenant-bar-btn clear hidden" id="${s.id}TenantClear" onclick="clearTenant('${s.id}')">✕ Clear</button></div><div class="terminal-input-area"><span class="terminal-prompt">❯</span><input type="text" class="terminal-input" id="${s.id}Input" placeholder="Type response here..." onkeypress="handleInputKeypress(event,'${s.id}')" disabled><button class="terminal-submit" id="${s.id}SubmitBtn" onclick="submitInput('${s.id}')" disabled>Send</button></div></div>`;
 });
 
 function selectView(view){
@@ -1529,9 +1572,9 @@ function runScript(type){
   .catch(e=>{addLine(type,'[ERROR] '+e,'error');scriptEnded(type)});
 }
 
-function startPolling(type){pollInterval=setInterval(()=>{fetch('/api/output').then(r=>r.json()).then(d=>{d.lines.forEach(item=>{if(item.type==='output'){let lt='normal';if(item.text.includes('===')||item.text.includes('---'))lt='header';else if(item.text.includes('[SUCCESS]')||item.text.includes(' OK'))lt='success';else if(item.text.includes('[ERROR]')||item.text.includes('[FAILED]'))lt='error';else if(item.text.includes('[WARNING]'))lt='warning';else if(item.text.includes('[INFO]'))lt='info';else if(item.text.includes('[CREDENTIALS]')||item.text.includes('[AUTO]'))lt='credential';else if(item.text.includes('Select')||item.text.endsWith(':')||item.text.endsWith('?'))lt='prompt';addLine(type,item.text,lt)}else if(item.type==='exit'){addLine(type,'[EXIT] Code: '+item.code,'error');scriptEnded(type)}else if(item.type==='error'){addLine(type,'[ERROR] '+item.text,'error');scriptEnded(type)}})})},100)}
+function startPolling(type){pollInterval=setInterval(()=>{fetch('/api/output').then(r=>r.json()).then(d=>{d.lines.forEach(item=>{if(item.type==='output'){let lt='normal';if(item.text.includes('===')||item.text.includes('---'))lt='header';else if(item.text.includes('[SUCCESS]')||item.text.includes(' OK'))lt='success';else if(item.text.includes('[ERROR]')||item.text.includes('[FAILED]'))lt='error';else if(item.text.includes('[WARNING]'))lt='warning';else if(item.text.includes('[INFO]'))lt='info';else if(item.text.includes('[CREDENTIALS]')||item.text.includes('[AUTO]'))lt='credential';else if(item.text.includes('Select')||item.text.endsWith(':')||item.text.endsWith('?'))lt='prompt';addLine(type,item.text,lt)}else if(item.type==='exit'){addLine(type,'[EXIT] Code: '+item.code,item.code===0?'success':'error');scriptEnded(type)}else if(item.type==='error'){addLine(type,'[ERROR] '+item.text,'error');scriptEnded(type)}});updateTenantBar(type,d.prompt_type,d.tenant_choice)})},100)}
 
-function scriptEnded(type){isRunning=false;if(pollInterval){clearInterval(pollInterval);pollInterval=null}setStatus(type,'Ready',false);document.getElementById(type+'RunBtn').disabled=false;document.getElementById(type+'StopBtn').disabled=true;document.getElementById(type+'Input').disabled=true;document.getElementById(type+'SubmitBtn').disabled=true;showPostRunBar(type)}
+function scriptEnded(type){isRunning=false;if(pollInterval){clearInterval(pollInterval);pollInterval=null}setStatus(type,'Ready',false);document.getElementById(type+'RunBtn').disabled=false;document.getElementById(type+'StopBtn').disabled=true;document.getElementById(type+'Input').disabled=true;document.getElementById(type+'SubmitBtn').disabled=true;tenantLocked=false;tenantPromptActive=false;const tb=document.getElementById(type+'TenantBar');if(tb)tb.classList.add('hidden');showPostRunBar(type)}
 function showPostRunBar(type){
   const bar=document.getElementById(type+'PostRun');if(!bar)return;
   // Fetch latest log to get filenames
@@ -1582,8 +1625,54 @@ function executeRollbackScript(filename,type){
   .catch(e=>{addLine(type,'[ERROR] '+e,'error');scriptEnded(type)});
 }
 function stopScript(){fetch('/api/stop',{method:'POST'}).then(()=>{addLine(currentView,'[STOPPED] Terminated by user','warning');scriptEnded(currentView)})}
-function submitInput(type){const input=document.getElementById(type+'Input');if(!input.value&&input.value!=='')return;addLine(type,'> '+input.value,'info');fetch('/api/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:input.value})});input.value=''}
+function submitInput(type){const input=document.getElementById(type+'Input');if(!input.value&&input.value!=='')return;lastUserInput=input.value.trim();addLine(type,'> '+input.value,'info');fetch('/api/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:input.value})});input.value='';if(tenantPromptActive&&lastUserInput&&!tenantLocked){showTenantOffer(type,lastUserInput)}}
 function handleInputKeypress(e,type){if(e.key==='Enter')submitInput(type)}
+
+// TENANT MEMORY
+function updateTenantBar(type,promptType,tenantChoice){
+  const bar=document.getElementById(type+'TenantBar');if(!bar)return;
+  if(tenantChoice){
+    tenantLocked=true;tenantPromptActive=false;
+    bar.classList.remove('hidden');bar.classList.add('locked');
+    document.getElementById(type+'TenantText').innerHTML='Tenant locked: <strong>'+tenantChoice+'</strong> — auto-applying to all';
+    document.getElementById(type+'TenantApply').classList.add('hidden');
+    document.getElementById(type+'TenantClear').classList.remove('hidden');
+  } else if(promptType==='tenant'&&!tenantLocked){
+    tenantPromptActive=true;
+  } else if(promptType!=='tenant'){
+    tenantPromptActive=false;
+  }
+}
+function showTenantOffer(type,val){
+  const bar=document.getElementById(type+'TenantBar');if(!bar)return;
+  bar.classList.remove('hidden','locked');
+  document.getElementById(type+'TenantText').innerHTML='You selected <strong>'+val+'</strong> for tenant — apply to all remaining?';
+  document.getElementById(type+'TenantApply').classList.remove('hidden');
+  document.getElementById(type+'TenantApply').setAttribute('data-val',val);
+  document.getElementById(type+'TenantClear').classList.add('hidden');
+}
+function rememberTenant(type){
+  const btn=document.getElementById(type+'TenantApply');
+  const val=btn?btn.getAttribute('data-val')||lastUserInput:lastUserInput;
+  if(!val)return;
+  fetch('/api/tenant-choice',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice:val})})
+  .then(r=>r.json()).then(()=>{
+    tenantLocked=true;const bar=document.getElementById(type+'TenantBar');
+    bar.classList.add('locked');
+    document.getElementById(type+'TenantText').innerHTML='Tenant locked: <strong>'+val+'</strong> — auto-applying to all';
+    document.getElementById(type+'TenantApply').classList.add('hidden');
+    document.getElementById(type+'TenantClear').classList.remove('hidden');
+    addLine(type,'[AUTO] Tenant selection remembered: '+val+' — will auto-apply to remaining deployments','credential');
+  });
+}
+function clearTenant(type){
+  fetch('/api/tenant-choice',{method:'DELETE'}).then(()=>{
+    tenantLocked=false;tenantPromptActive=false;
+    const bar=document.getElementById(type+'TenantBar');
+    bar.classList.add('hidden');bar.classList.remove('locked');
+    addLine(type,'[INFO] Tenant memory cleared — will prompt again next time','info');
+  });
+}
 
 function saveSettings(){const s={vpc_script:document.getElementById('settingsVpcScript').value,individual_script:document.getElementById('settingsIndividualScript').value,epgadd_script:document.getElementById('settingsEpgaddScript').value,epgdelete_script:document.getElementById('settingsEpgdeleteScript').value,version:document.getElementById('settingsVersion').value};fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)}).then(r=>r.json()).then(d=>{if(d.status==='saved'){alert('Settings saved!');document.getElementById('versionBadge').textContent='v'+s.version}})}
 
@@ -1661,11 +1750,36 @@ def api_output():
             elif item[0] == 'exit': lines.append({'type': 'exit', 'code': item[1]})
             elif item[0] == 'error': lines.append({'type': 'error', 'text': item[1]})
         except: break
-    return jsonify({'lines': lines})
+    return jsonify({
+        'lines': lines,
+        'prompt_type': current_run.get("last_prompt_type"),
+        'tenant_choice': current_run.get("tenant_choice")
+    })
 
 @app.route('/api/input', methods=['POST'])
 def api_input():
-    return jsonify({'status': 'sent' if send_input_to_process(request.json.get('text', '')) else 'failed'})
+    data = request.json
+    text = data.get('text', '')
+    sent = send_input_to_process(text)
+    # If user answered a tenant prompt, frontend may also send remember_tenant flag
+    if data.get('remember_tenant') and text.strip():
+        current_run["tenant_choice"] = text.strip()
+    return jsonify({'status': 'sent' if sent else 'failed'})
+
+@app.route('/api/tenant-choice', methods=['GET', 'POST', 'DELETE'])
+def api_tenant_choice():
+    if request.method == 'GET':
+        return jsonify({
+            'tenant_choice': current_run.get("tenant_choice"),
+            'last_prompt_type': current_run.get("last_prompt_type")
+        })
+    elif request.method == 'POST':
+        data = request.json
+        current_run["tenant_choice"] = data.get('choice', '').strip()
+        return jsonify({'status': 'saved', 'choice': current_run["tenant_choice"]})
+    elif request.method == 'DELETE':
+        current_run["tenant_choice"] = None
+        return jsonify({'status': 'cleared'})
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
