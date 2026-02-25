@@ -1570,13 +1570,17 @@ def api_rollback_download(filename):
 # =============================================================================
 
 if __name__ == '__main__':
+    import logging
+    # Suppress Flask/Werkzeug dev server warning (internal tool, not public-facing)
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+
     for folder in [UPLOAD_FOLDER, SAVED_LOGS_FOLDER, ROLLBACK_FOLDER]:
         os.makedirs(folder, exist_ok=True)
     print("\n" + "=" * 60)
     print(" ACI BULK DEPLOYMENT WEB APPLICATION v1.3.0")
     print("=" * 60)
-    print("\n Starting server...")
-    print(" Open http://localhost:5000 in your browser")
-    print("\n Press Ctrl+C to stop")
-    print("=" * 60 + "\n")
+    print("\n  Server running on http://localhost:5000")
+    print("  Press Ctrl+C to stop")
+    print("\n" + "=" * 60 + "\n")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
