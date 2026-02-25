@@ -613,7 +613,7 @@ def main():
     # Action {action_num}: Delete static binding VLAN {vlan}
     print(f"  [{action_num}] Deleting static binding VLAN {vlan} from {epg}...")
     try:
-        path = "topology/pod-{POD_ID}/protpaths-{node1}-{node2}/pathep-[{pg}]"
+        path = "topology/pod-{{POD_ID}}/protpaths-{node1}-{node2}/pathep-[{pg}]"
         dn = f"uni/tn-{tenant}/ap-{ap}/epg-{epg}/rspathAtt-[{{path}}]"
         r = safe_request('delete', session, f"{{apic_url}}/api/mo/{{dn}}.json", apic_url, username, password, auth_state)
         print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
@@ -627,7 +627,7 @@ def main():
     # Action {action_num}: Delete static binding VLAN {vlan}
     print(f"  [{action_num}] Deleting static binding VLAN {vlan} from {epg}...")
     try:
-        path = "topology/pod-{POD_ID}/paths-{node_id}/pathep-[eth{interface}]"
+        path = "topology/pod-{{POD_ID}}/paths-{node_id}/pathep-[eth{interface}]"
         dn = f"uni/tn-{tenant}/ap-{ap}/epg-{epg}/rspathAtt-[{{path}}]"
         r = safe_request('delete', session, f"{{apic_url}}/api/mo/{{dn}}.json", apic_url, username, password, auth_state)
         print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
@@ -684,7 +684,7 @@ def main():
     # Action {action_num}: Clear port description
     print(f"  [{action_num}] Clearing description on node {node_id} eth{interface}...")
     try:
-        dn = f"topology/pod-{POD_ID}/node-{node_id}/sys/phys-[eth{interface}]"
+        dn = f"topology/pod-{{POD_ID}}/node-{node_id}/sys/phys-[eth{interface}]"
         r = safe_request('post', session, f"{{apic_url}}/api/node/mo/{{dn}}.json",
             apic_url, username, password, auth_state,
             json={{"l1PhysIf": {{"attributes": {{"descr": ""}}}}}})
