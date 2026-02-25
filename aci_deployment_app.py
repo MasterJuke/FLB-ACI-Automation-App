@@ -52,6 +52,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'csv_uploads')
 SAVED_LOGS_FOLDER = os.path.join(BASE_DIR, 'saved_logs')
 ROLLBACK_FOLDER = os.path.join(BASE_DIR, 'rollback_scripts')
+RESULTS_FOLDER = os.path.join(BASE_DIR, 'deployment_results')
 
 DEFAULT_CONFIG = {
     "vpc_script": "aci_bulk_vpc_deploy.py",
@@ -62,6 +63,7 @@ DEFAULT_CONFIG = {
     "default_individual_csv": "individual_port_deployments.csv",
     "default_epgadd_csv": "epg_add.csv",
     "default_epgdelete_csv": "epg_delete.csv",
+    "auto_select_port": True,
     "version": "1.3.0"
 }
 
@@ -155,7 +157,8 @@ def add_log_entry(deploy_type, csv_path, status, deployment_count, duration_seco
         "time_saved_minutes": saved_minutes,
         "output_summary": output_lines[-8:] if output_lines else [],
         "saved_log_file": None,
-        "rollback_file": None
+        "rollback_file": None,
+        "results_file": None
     }
 
     # Auto-save sanitized log
@@ -167,6 +170,13 @@ def add_log_entry(deploy_type, csv_path, status, deployment_count, duration_seco
     rollback = generate_rollback_script(deploy_type, entry_id, timestamp, output_lines)
     if rollback:
         entry["rollback_file"] = rollback
+
+    # Generate results CSV (only meaningful for vpc/individual where ports are selected)
+    tracked_ports = current_run.get("deployed_ports", [])
+    if csv_path and tracked_ports and deploy_type in ('vpc', 'individual'):
+        results = generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_lines, tracked_ports)
+        if results:
+            entry["results_file"] = results
 
     log["entries"].append(entry)
     log["total_time_saved_minutes"] = round(sum(e.get("time_saved_minutes", 0) for e in log["entries"]), 1)
@@ -189,14 +199,11 @@ def sanitize_line(line):
     """Remove sensitive data from a log line."""
     for pattern in SENSITIVE_PATTERNS:
         if pattern.search(line):
-            # For credential auto-fill lines, keep the info but redact
             if 'Auto-filled password' in line:
                 return '[CREDENTIALS] Auto-filled password: ••••••••'
-            return None  # Skip this line entirely
-    # Also catch lines that are just the raw password input echo
+            return None
     if stored_credentials.get('password') and stored_credentials['password']:
         pwd = stored_credentials['password']
-        # Check if line IS the password (echoed from stdin) or contains it
         stripped = line.strip()
         if stripped == pwd or (line.startswith('> ') and pwd in line):
             return '> [PASSWORD REDACTED]'
@@ -243,13 +250,11 @@ def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):
         filename = f"rollback_{ts}_{deploy_type}_run{entry_id}.py"
         filepath = os.path.join(ROLLBACK_FOLDER, filename)
 
-        # Parse output to find created objects
         rollback_actions = parse_deployment_output(deploy_type, output_lines)
 
         if not rollback_actions:
             return None
 
-        # Generate the rollback script
         script = build_rollback_script(deploy_type, entry_id, timestamp, rollback_actions)
 
         with open(filepath, 'w') as f:
@@ -262,45 +267,30 @@ def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):
 
 
 def parse_deployment_output(deploy_type, lines):
-    """
-    Parse terminal output to extract created ACI objects for rollback.
-    Matches exact print statements from deployment scripts:
-      VPC:        deploy_vpc() in aci_bulk_vpc_deploy.py
-      Individual: deploy_individual_port() in aci_bulk_individual_deploy.py
-      EPG Add:    main() in aci_bulk_epg_add.py
-      EPG Delete: main() in aci_bulk_epg_delete.py
-    """
     actions = []
     full_text = '\n'.join(lines)
 
     if deploy_type == 'vpc':
-        # VPC policy group: "[2/4] Creating VPC Interface Policy Group: {name}"
         for m in re.finditer(r'Creating VPC Interface Policy Group:\s*(\S+)', full_text):
             actions.append({"action": "delete_vpc_ipg", "name": m.group(1)})
 
-        # Port selector (VPC uses policy_group as selector name):
-        # "[3/4] Creating Access Port Selector: {name}"
         for m in re.finditer(r'Creating Access Port Selector:\s*(\S+)', full_text):
             actions.append({"action": "delete_port_selector_vpc", "name": m.group(1)})
 
-        # Interface profile: "Interface Profile: {name}" (printed right after selector)
         int_profile_matches = re.findall(r'Interface Profile:\s*(\S+)', full_text)
         if int_profile_matches:
             for a in actions:
                 if a["action"] == "delete_port_selector_vpc" and "int_profile" not in a:
                     a["int_profile"] = int_profile_matches[0]
 
-        # Node pair from preview: "vPC Leaf Switch Pair:   {node1}-{node2}"
         node_pair = re.search(r'vPC Leaf Switch Pair:\s+(\d+)-(\d+)', full_text)
 
-        # VPC policy group name (used in path construction)
         vpc_pg_name = None
         for a in actions:
             if a["action"] == "delete_vpc_ipg":
                 vpc_pg_name = a["name"]
                 break
 
-        # Successful bindings: "VLAN {vlan}: OK"
         for m in re.finditer(r'VLAN\s+(\d+):\s*OK', full_text):
             vlan = m.group(1)
             binding = {"action": "delete_binding", "vlan": vlan}
@@ -311,7 +301,6 @@ def parse_deployment_output(deploy_type, lines):
                 binding["vpc_pg"] = vpc_pg_name
             actions.append(binding)
 
-        # EPG info from preview lines: "VLAN   32 -> AppProf / EPG_Name [TenantName]"
         epg_map = {}
         for m in re.finditer(r'VLAN\s+(\d+)\s*->\s*(\S+)\s*/\s*(\S+?)(?:\s+\[(\S+?)\])?\s*$', full_text, re.MULTILINE):
             epg_map[m.group(1)] = {"app_profile": m.group(2), "epg": m.group(3), "tenant": m.group(4) or ""}
@@ -320,32 +309,25 @@ def parse_deployment_output(deploy_type, lines):
             if a["action"] == "delete_binding" and a.get("vlan") in epg_map:
                 a.update(epg_map[a["vlan"]])
 
-        # Port descriptions: "Node {node_id} eth{interface}: [SUCCESS]"
         for m in re.finditer(r'Node\s+(\d+)\s+eth([\d/]+):\s*\[SUCCESS\]', full_text):
             actions.append({"action": "clear_description", "node_id": m.group(1), "interface": m.group(2)})
 
     elif deploy_type == 'individual':
-        # Policy group: "[2/4] Creating Leaf Access Port Policy Group: {name}"
         for m in re.finditer(r'Creating Leaf Access Port Policy Group:\s*(\S+)', full_text):
             actions.append({"action": "delete_access_ipg", "name": m.group(1)})
 
-        # Port selector: "[3/4] Creating Port Selector: {name}"
         for m in re.finditer(r'Creating Port Selector:\s*(\S+)', full_text):
             actions.append({"action": "delete_port_selector_individual", "name": m.group(1)})
 
-        # Interface profile: "Interface Profile: {name}"
         int_profile_matches = re.findall(r'Interface Profile:\s*(\S+)', full_text)
         if int_profile_matches:
             for a in actions:
                 if a["action"] == "delete_port_selector_individual" and "int_profile" not in a:
                     a["int_profile"] = int_profile_matches[0]
 
-        # Node ID from preview: "Node ID:               {node_id}"
         node_match = re.search(r'Node ID:\s+(\d+)', full_text)
-        # Interface from preview: "Interface:             eth{interface}"
         int_match = re.search(r'Interface:\s+eth([\d/]+)', full_text)
 
-        # Successful bindings: "VLAN {vlan}: OK"
         for m in re.finditer(r'VLAN\s+(\d+):\s*OK', full_text):
             binding = {"action": "delete_binding", "vlan": m.group(1)}
             if node_match:
@@ -354,7 +336,6 @@ def parse_deployment_output(deploy_type, lines):
                 binding["interface"] = int_match.group(1)
             actions.append(binding)
 
-        # EPG info from preview: "VLAN   32 -> AppProf / EPG_Name [TenantName]"
         epg_map = {}
         for m in re.finditer(r'VLAN\s+(\d+)\s*->\s*(\S+)\s*/\s*(\S+?)(?:\s+\[(\S+?)\])?\s*$', full_text, re.MULTILINE):
             epg_map[m.group(1)] = {"app_profile": m.group(2), "epg": m.group(3), "tenant": m.group(4) or ""}
@@ -362,19 +343,16 @@ def parse_deployment_output(deploy_type, lines):
             if a["action"] == "delete_binding" and a.get("vlan") in epg_map:
                 a.update(epg_map[a["vlan"]])
 
-        # Port description: "[1/4] Setting port description: ..." then "[SUCCESS]"
         if node_match and int_match:
             desc_success = re.search(r'\[1/4\].*description.*\n.*\[SUCCESS\]', full_text)
             if desc_success:
                 actions.append({"action": "clear_description", "node_id": node_match.group(1), "interface": int_match.group(1)})
 
     elif deploy_type == 'epgadd':
-        # EPG Add output: "[OK] {switch} port {port}: VLAN {vlan}"
         for m in re.finditer(r'\[OK\]\s+(\S+)\s+port\s+([\d/]+):\s*VLAN\s+(\d+)', full_text):
             actions.append({"action": "delete_binding", "switch": m.group(1), "port": m.group(2), "vlan": m.group(3)})
 
     elif deploy_type == 'epgdelete':
-        # EPG Delete output: "[DELETED] {switch} port {port}: VLAN {vlan}"
         for m in re.finditer(r'\[DELETED\]\s+(\S+)\s+port\s+([\d/]+):\s*VLAN\s+(\d+)', full_text):
             actions.append({"action": "recreate_binding", "switch": m.group(1), "port": m.group(2), "vlan": m.group(3)})
 
@@ -383,12 +361,10 @@ def parse_deployment_output(deploy_type, lines):
 
 def build_rollback_script(deploy_type, entry_id, timestamp, actions):
     """Build a Python rollback script from parsed actions."""
-    # Count meaningful actions
     meaningful = [a for a in actions if a["action"] not in ["clear_description"]]
     if not meaningful:
         meaningful = actions
 
-    # Grab current APIC URLs from credential store
     apic_d1 = stored_credentials.get("apic_urls", {}).get("D1", "")
     apic_d2 = stored_credentials.get("apic_urls", {}).get("D2", "")
     apic_d3 = stored_credentials.get("apic_urls", {}).get("D3", "")
@@ -520,7 +496,6 @@ def main():
     print(f" Original: {deploy_type.upper()} Run #{entry_id} ({timestamp})")
     print("=" * 60)
 
-    # Authenticate — uses input() so web UI auto-inject can detect prompts
     username = input("\\nUsername: ").strip()
     password = input("Password: ").strip()
 
@@ -528,24 +503,12 @@ def main():
     needed_envs = set()
 '''
 
-    # Add environment detection based on actions
-    env_refs = set()
-    for a in actions:
-        if a.get("node1"):
-            env_refs.add("node_pair")
-        if a.get("node_id"):
-            env_refs.add("single_node")
-        if a.get("switch"):
-            env_refs.add("switch")
-
-    # Determine which environments to authenticate to
     script += '''
     # Determine needed environments
 '''
 
     if deploy_type in ['vpc', 'individual']:
-        script += f'''    # Based on original deployment
-    needed_envs = set()
+        script += f'''    needed_envs = set()
 '''
         for a in actions:
             if a.get("node_id"):
@@ -567,8 +530,8 @@ def main():
         session = requests.Session()
         result = login_to_apic(session, APIC_URLS[env], username, password)
         if result["ok"]:
-            sessions[env] = {{"session": session, "auth": result}}
-            print(f"       [SUCCESS] (token lifetime: {{result['lifetime']}}s)")
+            sessions[env] = {"session": session, "auth": result}
+            print(f"       [SUCCESS] (token lifetime: {result['lifetime']}s)")
         else:
             print(f"       [FAILED]")
 
@@ -576,7 +539,6 @@ def main():
         print("\\n[ERROR] No successful authentications.")
         sys.exit(1)
 
-    # Use first available session
     env = list(sessions.keys())[0]
     session = sessions[env]["session"]
     auth_state = sessions[env]["auth"]
@@ -588,10 +550,8 @@ def main():
     print()
 '''
 
-    # Generate specific rollback code for each action
     action_num = 0
 
-    # Delete bindings first (reverse order of creation)
     binding_actions = [a for a in actions if a["action"] in ["delete_binding"]]
     for a in binding_actions:
         action_num += 1
@@ -635,7 +595,6 @@ def main():
         print(f"      [ERROR] {{e}}")
 '''
 
-    # Delete port selectors
     selector_actions = [a for a in actions if "port_selector" in a["action"]]
     for a in selector_actions:
         action_num += 1
@@ -653,7 +612,6 @@ def main():
         print(f"      [ERROR] {{e}}")
 '''
 
-    # Delete policy groups
     ipg_actions = [a for a in actions if a["action"] in ["delete_vpc_ipg", "delete_access_ipg"]]
     for a in ipg_actions:
         action_num += 1
@@ -674,7 +632,6 @@ def main():
         print(f"      [ERROR] {{e}}")
 '''
 
-    # Clear port descriptions
     desc_actions = [a for a in actions if a["action"] == "clear_description"]
     for a in desc_actions:
         action_num += 1
@@ -693,7 +650,6 @@ def main():
         print(f"      [ERROR] {{e}}")
 '''
 
-    # EPG Add rollback = delete bindings
     epgadd_actions = [a for a in actions if a["action"] == "delete_binding" and deploy_type == "epgadd"]
     for a in epgadd_actions:
         action_num += 1
@@ -703,12 +659,9 @@ def main():
         script += f'''
     # Action {action_num}: Delete EPG binding VLAN {vlan} from {switch} port {port}
     print(f"  [{action_num}] Deleting VLAN {vlan} from {switch} port {port}...")
-    # NOTE: You need to fill in tenant/ap/epg for this VLAN
-    # This requires querying the APIC for the EPG containing VLAN {vlan}
     print(f"      [MANUAL] Locate and delete fvRsPathAtt for VLAN {vlan} on node/pathep")
 '''
 
-    # EPG Delete rollback = recreate bindings
     recreate_actions = [a for a in actions if a["action"] == "recreate_binding"]
     for a in recreate_actions:
         action_num += 1
@@ -718,8 +671,6 @@ def main():
         script += f'''
     # Action {action_num}: Re-create binding VLAN {vlan} on {switch} port {port}
     print(f"  [{action_num}] Re-creating VLAN {vlan} on {switch} port {port}...")
-    # NOTE: Requires tenant/ap/epg info and original mode (trunk/access)
-    # Query APIC for EPG containing VLAN {vlan}, then re-create fvRsPathAtt
     print(f"      [MANUAL] Use EPG Add script to re-bind VLAN {vlan} to {switch} port {port}")
 '''
 
@@ -763,18 +714,15 @@ def validate_csv_file(filepath, script_type):
                 results["errors"].append("CSV file is empty or has no headers")
                 return results
 
-            # Normalize headers
             headers = [h.strip().upper() for h in reader.fieldnames if h]
             results["columns_found"] = headers
 
-            # Check required columns
             missing = [col for col in reqs["required"] if col not in headers]
             if missing:
                 results["valid"] = False
                 results["errors"].append(f"Missing columns: {', '.join(missing)}")
                 return results
 
-            # Validate rows
             rows = list(reader)
             results["row_count"] = len(rows)
             if not rows:
@@ -782,7 +730,6 @@ def validate_csv_file(filepath, script_type):
                 results["errors"].append("CSV has headers but no data rows")
                 return results
 
-            # Validate each row
             validators = reqs.get("validators", {})
             for i, row in enumerate(rows, 1):
                 normalized = {k.strip().upper(): (v.strip() if v else "") for k, v in row.items() if k}
@@ -791,7 +738,6 @@ def validate_csv_file(filepath, script_type):
                     if val and not re.match(pattern, val, re.IGNORECASE):
                         results["warnings"].append(f"Row {i}: {col} value '{val}' may be invalid")
 
-                # Check for empty required fields
                 for col in reqs["required"]:
                     if not normalized.get(col, "").strip():
                         results["warnings"].append(f"Row {i}: {col} is empty")
@@ -803,7 +749,6 @@ def validate_csv_file(filepath, script_type):
         results["valid"] = False
         results["errors"].append(f"Parse error: {str(e)}")
 
-    # Cap warnings
     if len(results["warnings"]) > 10:
         total = len(results["warnings"])
         results["warnings"] = results["warnings"][:10]
@@ -813,22 +758,154 @@ def validate_csv_file(filepath, script_type):
 
 
 # =============================================================================
+# RESULTS CSV GENERATION
+# =============================================================================
+
+def extract_deployed_ports(output_lines, tracked_ports):
+    """
+    Resolve the final list of deployed ports (one per CSV row).
+
+    tracked_ports is the list built during execution:
+      - "1/93"      → port was pre-selected and matched from the menu
+      - "__auto__"  → script fell back to auto-select (port 1); resolve from output
+      - ""          → port was specified but not found in menu; unresolvable
+
+    For __auto__ slots we scan Node success lines, subtract any already-matched
+    ports, and assign the remainder in order.
+    """
+    matched = {p for p in tracked_ports if p and p != '__auto__'}
+
+    # Collect unique physical ports from Node success lines, in order, excluding
+    # ports that were explicitly pre-selected (they're already accounted for).
+    # VPC deploys the same port on two nodes — (node_id, port) dedup collapses
+    # those pairs into a single port entry.
+    seen_node_port = set()
+    auto_resolved = []
+    for line in output_lines:
+        m = re.search(r'Node\s+(\d+)\s+eth([\d/]+):\s*\[SUCCESS\]', line, re.IGNORECASE)
+        if m:
+            node_id, port = m.group(1), m.group(2)
+            key = (node_id, port)
+            if key not in seen_node_port:
+                seen_node_port.add(key)
+                if port not in matched:
+                    auto_resolved.append(port)
+
+    auto_iter = iter(auto_resolved)
+    result = []
+    for p in tracked_ports:
+        if p == '__auto__':
+            result.append(next(auto_iter, ''))
+        else:
+            result.append(p)
+    return result
+
+
+def generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_lines, tracked_ports):
+    """
+    Write a copy of the original CSV with a DEPLOYED_PORT column appended.
+    Returns the filename on success, None otherwise.
+    """
+    try:
+        if not csv_path or not os.path.exists(csv_path):
+            return None
+
+        os.makedirs(RESULTS_FOLDER, exist_ok=True)
+        ts = timestamp.replace(":", "").replace("-", "").replace(" ", "_")
+        filename = f"results_{ts}_{deploy_type}_run{entry_id}.csv"
+        filepath = os.path.join(RESULTS_FOLDER, filename)
+
+        with open(csv_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            orig_headers = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        if not rows:
+            return None
+
+        deployed = extract_deployed_ports(output_lines, tracked_ports)
+
+        result_headers = orig_headers + ['DEPLOYED_PORT']
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=result_headers, extrasaction='ignore')
+            writer.writeheader()
+            for i, row in enumerate(rows):
+                row['DEPLOYED_PORT'] = deployed[i] if i < len(deployed) else ''
+                writer.writerow(row)
+
+        return filename
+    except Exception as e:
+        print(f"[WARNING] Failed to generate results CSV: {e}")
+        return None
+
+
+# =============================================================================
 # PROCESS MANAGEMENT
 # =============================================================================
+
+def find_port_in_output(desired_port, output_lines):
+    """
+    Scan terminal output for a numbered port menu and return the menu number
+    that corresponds to the desired port (e.g. '1/93' → '73').
+
+    Handles output formats such as:
+        73. eth1/93
+        73: 1/93
+        73)  eth1/93    [free]
+        73   1/93
+    """
+    m = re.match(r'(?:eth)?(\d+)/(\d+)', desired_port.strip())
+    if not m:
+        return None
+    desired_slot, desired_num = m.group(1), m.group(2)
+
+    # Scan the last 200 lines (port lists can be long on busy switches)
+    for line in reversed(output_lines[-200:]):
+        lm = re.match(r'^\s*(\d+)[.:)\s]+(?:eth)?(\d+)/(\d+)', line.strip())
+        if lm:
+            menu_num, slot, port_num = lm.group(1), lm.group(2), lm.group(3)
+            if slot == desired_slot and port_num == desired_num:
+                return menu_num
+    return None
+
+
+def parse_port_column(csv_path):
+    """
+    Read the CSV file and return a list of PORT values (one per data row).
+    Returns an empty list if the column is absent or the file can't be read.
+    """
+    if not csv_path or not os.path.exists(csv_path):
+        return []
+    try:
+        with open(csv_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            headers = [h.strip().upper() for h in (reader.fieldnames or [])]
+            if 'PORT' not in headers:
+                return []
+            return [
+                {k.strip().upper(): (v.strip() if v else '') for k, v in row.items() if k}
+                .get('PORT', '').strip()
+                for row in reader
+            ]
+    except Exception:
+        return []
+
 
 def run_script_thread(script_path, csv_path):
     global running_process, current_run
     current_run["start_time"] = time.time()
     current_run["output_lines"] = []
     current_run["token_failures"] = 0
-    current_run["tenant_choice"] = None       # Remembered tenant selection (e.g. "1")
-    current_run["last_prompt_type"] = None     # Track what kind of prompt we're at
+    current_run["tenant_choice"] = None
+    current_run["last_prompt_type"] = None
+    current_run["port_prompt_index"] = 0   # counts how many port prompts have been seen
+    current_run["deployed_ports"] = []     # tracks actual port per CSV row
 
     try:
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
         env['ACI_WEB_UI'] = '1'
-        env['ACI_SESSION_TIMEOUT'] = '600'  # Request 10-min token from APIC
+        env['ACI_SESSION_TIMEOUT'] = '600'
 
         running_process = subprocess.Popen(
             [sys.executable, '-u', script_path],
@@ -844,9 +921,8 @@ def run_script_thread(script_path, csv_path):
         last_char_time = [time.time()]
         read_complete = [False]
 
-        # Auto-credential tracking
-        cred_state = {"awaiting": None}  # None, "username", "password"
-        recent_prompt_lines = []  # Track recent output for tenant detection
+        cred_state = {"awaiting": None}
+        recent_prompt_lines = []
 
         def reader_thread():
             while True:
@@ -874,11 +950,9 @@ def run_script_thread(script_path, csv_path):
                     if line:
                         output_queue.put(('output', line))
                         current_run["output_lines"].append(line)
-                        # Keep rolling buffer of recent lines for context detection
                         recent_prompt_lines.append(line.lower())
                         if len(recent_prompt_lines) > 8:
                             recent_prompt_lines.pop(0)
-                        # TOKEN FAILURE DETECTION
                         ll = line.lower()
                         if 'token was invalid' in ll or 'token timeout' in ll or (
                                 'not authenticated' in ll and 'error' in ll):
@@ -930,7 +1004,6 @@ def run_script_thread(script_path, csv_path):
                                     pass
 
                         # AUTO-CSV PATH INJECTION
-                        # Scripts prompt: "Press Enter to use default, or enter filename:"
                         if ('enter filename' in tl or 'use default' in tl) and tl.endswith(':'):
                             csv_path = current_run.get("csv_path", "")
                             if csv_path:
@@ -943,6 +1016,44 @@ def run_script_thread(script_path, csv_path):
                                     current_run["output_lines"].append(f'[AUTO] CSV path injected: {csv_path}')
                                 except:
                                     pass
+
+                        # AUTO-PORT SELECTION
+                        # Scripts prompt: "Select port number:"
+                        if 'select port number' in tl and tl.endswith(':'):
+                            cfg = load_config()
+                            port_selections = current_run.get("port_selections", [])
+                            port_idx = current_run.get("port_prompt_index", 0)
+                            desired_iface = port_selections[port_idx] if port_idx < len(port_selections) else ''
+
+                            if desired_iface:
+                                # Find the menu number that matches the desired interface
+                                menu_num = find_port_in_output(desired_iface, current_run["output_lines"])
+                                if menu_num:
+                                    time.sleep(0.1)
+                                    try:
+                                        running_process.stdin.write((menu_num + '\n').encode('utf-8'))
+                                        running_process.stdin.flush()
+                                        output_queue.put(('output', f'[AUTO] Port matched: {desired_iface} → option {menu_num}'))
+                                        current_run["output_lines"].append(f'[AUTO] Port matched: {desired_iface} → option {menu_num}')
+                                        current_run["deployed_ports"].append(desired_iface)
+                                    except:
+                                        current_run["deployed_ports"].append('')
+                                else:
+                                    output_queue.put(('output', f'[WARNING] Port {desired_iface} not found in menu — waiting for manual input'))
+                                    current_run["output_lines"].append(f'[WARNING] Port {desired_iface} not found in port list')
+                                    current_run["deployed_ports"].append('')
+                            elif cfg.get('auto_select_port', True):
+                                time.sleep(0.1)
+                                try:
+                                    running_process.stdin.write(('1\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    output_queue.put(('output', '[AUTO] Port auto-selected: 1'))
+                                    current_run["output_lines"].append('[AUTO] Port auto-selected: 1')
+                                    current_run["deployed_ports"].append('__auto__')
+                                except:
+                                    current_run["deployed_ports"].append('')
+
+                            current_run["port_prompt_index"] = port_idx + 1
 
                         # AUTO-ROLLBACK CONFIRMATION
                         # Rollback scripts prompt: "Type YES to confirm rollback:"
@@ -958,11 +1069,9 @@ def run_script_thread(script_path, csv_path):
                                     pass
 
                         # AUTO-TENANT SELECTION
-                        # Detect: "Select (Applies to all VLANS in this deployment):"
                         is_tenant_prompt = ('applies to all' in tl and 'select' in tl) or \
                                            ('select' in tl and 'tenant' in tl) or \
                                            ('multiple tenants' in tl)
-                        # Also check recent output for tenant context (e.g. "found in multiple tenants")
                         if not is_tenant_prompt:
                             has_tenant_context = any(
                                 'tenant' in rl or 'multiple tenants' in rl
@@ -1173,7 +1282,8 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .post-run-label{font-size:13px;font-weight:600;color:var(--accent-green);font-family:'JetBrains Mono',monospace}
 .post-run-actions{display:flex;gap:8px}
 .post-run-btn{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:none;font-family:'IBM Plex Sans',sans-serif;transition:all .2s}
-.post-run-btn.log-btn{background:rgba(88,166,255,.15);color:var(--accent-blue)}
+.post-run-btn.results-btn{background:rgba(63,185,80,.15);color:var(--accent-green)}
+.post-run-btn.results-btn:hover{background:rgba(63,185,80,.3)}
 .post-run-btn.log-btn:hover{background:rgba(88,166,255,.3)}
 .post-run-btn.rollback-btn{background:rgba(248,81,73,.12);color:var(--accent-red)}
 .post-run-btn.rollback-btn:hover{background:rgba(248,81,73,.25)}
@@ -1203,7 +1313,6 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .ts-value{font-size:28px;font-weight:700;font-family:'JetBrains Mono',monospace;background:linear-gradient(135deg,var(--accent-cyan),var(--accent-green));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .ts-value.blue{background:linear-gradient(135deg,var(--accent-blue),var(--accent-purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .ts-value.purple{-webkit-text-fill-color:var(--accent-purple)}
-.ts-label{font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
 .ts-divider{width:1px;height:40px;background:var(--border-color)}
 /* Credential Panel */
 .cred-panel{padding:32px;overflow-y:auto;flex:1}
@@ -1223,7 +1332,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .cred-btn.save:hover{box-shadow:0 4px 16px rgba(247,151,30,.3)}
 .cred-btn.clear{background:transparent;border:1px solid var(--accent-red);color:var(--accent-red)}
 .cred-btn.clear:hover{background:rgba(248,81,73,.1)}
-/* Settings, Readme, Logs panels - same as v1.2.0 */
+/* Settings, Readme, Logs panels */
 .settings-panel{padding:24px;overflow-y:auto;flex:1}
 .settings-section{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:12px;padding:20px;margin-bottom:20px}
 .settings-section-title{font-size:14px;font-weight:600;color:var(--accent-cyan);margin-bottom:16px}
@@ -1232,6 +1341,21 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .settings-input{width:100%;padding:12px 16px;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px}
 .settings-input:focus{outline:none;border-color:var(--accent-cyan)}
 .settings-hint{font-size:11px;color:var(--text-muted);margin-top:6px}
+/* Toggle switch */
+.toggle-row{display:flex;align-items:center;gap:14px;padding:14px 16px;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;cursor:pointer;transition:border-color .2s}
+.toggle-row:hover{border-color:var(--accent-cyan)}
+.toggle-switch{position:relative;width:42px;height:24px;flex-shrink:0}
+.toggle-switch input{opacity:0;width:0;height:0;position:absolute}
+.toggle-slider{position:absolute;inset:0;background:#30363d;border-radius:24px;transition:.3s;cursor:pointer}
+.toggle-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
+.toggle-switch input:checked+.toggle-slider{background:rgba(57,212,212,.3);border:1px solid var(--accent-cyan)}
+.toggle-switch input:checked+.toggle-slider:before{transform:translateX(18px);background:var(--accent-cyan);box-shadow:0 0 8px rgba(57,212,212,.5)}
+.toggle-info{flex:1}
+.toggle-title{font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:3px}
+.toggle-desc{font-size:11px;color:var(--text-muted);line-height:1.5}
+.toggle-badge{padding:2px 8px;border-radius:8px;font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;transition:all .3s}
+.toggle-badge.on{background:rgba(57,212,212,.15);color:var(--accent-cyan)}
+.toggle-badge.off{background:rgba(110,118,129,.15);color:var(--text-muted)}
 .readme-panel{padding:24px;overflow-y:auto;flex:1}
 .readme-section{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:12px;padding:24px;margin-bottom:20px}
 .readme-section-title{font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:16px;display:flex;align-items:center;gap:10px}
@@ -1297,6 +1421,9 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .row-actions{width:36px;text-align:center}
 .delete-row{background:none;border:none;color:var(--accent-red);cursor:pointer;font-size:14px;opacity:.5}
 .delete-row:hover{opacity:1}
+.csv-port-select{width:100%;padding:5px 6px;background:var(--bg-terminal);border:1px solid transparent;border-radius:4px;color:var(--accent-cyan);font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2339d4d4' opacity='.5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center;padding-right:22px}
+.csv-port-select:focus{border-color:var(--accent-cyan);outline:none}
+.csv-port-select option{background:var(--bg-darkest);color:var(--text-primary)}
 /* Tenant Memory Bar */
 .tenant-bar{display:flex;align-items:center;gap:10px;padding:8px 16px;background:rgba(163,113,247,.1);border-top:1px solid rgba(163,113,247,.3)}
 .tenant-bar.locked{background:rgba(63,185,80,.08);border-color:rgba(63,185,80,.3)}
@@ -1390,6 +1517,22 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="settings-row"><label class="settings-label">EPG Add Script</label><input type="text" class="settings-input" id="settingsEpgaddScript" value="{{ config.epgadd_script }}"></div>
 <div class="settings-row"><label class="settings-label">EPG Delete Script</label><input type="text" class="settings-input" id="settingsEpgdeleteScript" value="{{ config.epgdelete_script }}"></div>
 </div>
+<div class="settings-section">
+<div class="settings-section-title">⚡ Automation Behaviour</div>
+<div class="settings-row">
+<label class="toggle-row" for="settingsAutoSelectPort">
+  <div class="toggle-switch">
+    <input type="checkbox" id="settingsAutoSelectPort" {% if config.auto_select_port %}checked{% endif %} onchange="updateToggleBadge(this)">
+    <span class="toggle-slider"></span>
+  </div>
+  <div class="toggle-info">
+    <div class="toggle-title">Auto-select port 1</div>
+    <div class="toggle-desc">When the script prompts <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:10px">Select port number:</code>, automatically respond with <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:10px">1</code> — skipping the manual prompt entirely.</div>
+  </div>
+  <span class="toggle-badge {% if config.auto_select_port %}on{% else %}off{% endif %}" id="autoPortBadge">{% if config.auto_select_port %}ON{% else %}OFF{% endif %}</span>
+</label>
+</div>
+</div>
 <div class="settings-section"><div class="settings-section-title">ℹ️ Application Info</div><div class="settings-row"><label class="settings-label">Version</label><input type="text" class="settings-input" id="settingsVersion" value="{{ config.version }}"></div></div>
 </div></div>
 
@@ -1422,19 +1565,40 @@ let currentView='welcome',isRunning=false,pollInterval=null,csvModes={vpc:'file'
 let credSet=false;
 let tenantLocked=false,lastUserInput='',tenantPromptActive=false;
 
+// Pre-build the port options HTML (1/1 → 1/110) used by PORT dropdowns
+const PORT_OPTIONS_HTML = '<option value="">— auto / skip —</option>' +
+  Array.from({length:110},(_,i)=>'<option value="1/'+(i+1)+'">1/'+(i+1)+'</option>').join('');
+
+function makeInlineCell(col, placeholder) {
+  // PORT on vpc/individual = pre-selected port dropdown (1/1–1/110)
+  // PORT on epgadd/epgdelete = plain text (already the target port address)
+  if (col === 'PORT' && placeholder === '') {
+    return '<select class="csv-port-select">'+PORT_OPTIONS_HTML+'</select>';
+  }
+  return '<input type="text" placeholder="'+placeholder+'">';
+}
+
+// Toggle badge live update
+function updateToggleBadge(checkbox){
+  const badge=document.getElementById('autoPortBadge');
+  if(!badge)return;
+  if(checkbox.checked){badge.textContent='ON';badge.className='toggle-badge on'}
+  else{badge.textContent='OFF';badge.className='toggle-badge off'}
+}
+
 // Build deployment screens dynamically
 const screenDefs = [
   {id:'vpc',title:'VPC Deploy',badge:'VPC',badgeCls:'vpc',console:'vpc-deployment-console',
-   csvCols:['Hostname','Switch1','Switch2','Speed','VLANS','WorkOrder'],
-   csvPh:['MEDHVIOP173_SEA_PROD','EDCLEAFACC1501','EDCLEAFACC1502','25G','32,64-67','WO123456'],
+   csvCols:['Hostname','Switch1','Switch2','Speed','VLANS','WorkOrder','PORT'],
+   csvPh:['MEDHVIOP173_SEA_PROD','EDCLEAFACC1501','EDCLEAFACC1502','25G','32,64-67','WO123456',''],
    csvRef:'<tr><th>Hostname</th><th>Switch1</th><th>Switch2</th><th>Speed</th><th>VLANS</th><th>WorkOrder</th></tr><tr><td>Device name</td><td>First VPC switch</td><td>Second VPC switch</td><td>1G, 10G, 25G</td><td>VLAN IDs</td><td>Work order #</td></tr>',
-   csvEx:'MEDHVIOP173_SEA_PROD,EDCLEAFACC1501,EDCLEAFACC1502,25G,&quot;32,64-67,92-95&quot;,WO123456',
+   csvEx:'MEDHVIOP173_SEA_PROD,EDCLEAFACC1501,EDCLEAFACC1502,25G,&quot;32,64-67,92-95&quot;,WO123456,1/93',
    defCsv:'{{ config.default_vpc_csv }}'},
   {id:'individual',title:'Static Port Deploy',badge:'STATIC',badgeCls:'individual',console:'static-port-console',
-   csvCols:['Hostname','Switch','Type','Speed','VLANS','WorkOrder'],
-   csvPh:['MEDHVIOP173_MGMT','EDCLEAFNSM2163','ACCESS','1G','2958','WO123456'],
+   csvCols:['Hostname','Switch','Type','Speed','VLANS','WorkOrder','PORT'],
+   csvPh:['MEDHVIOP173_MGMT','EDCLEAFNSM2163','ACCESS','1G','2958','WO123456',''],
    csvRef:'<tr><th>Hostname</th><th>Switch</th><th>Type</th><th>Speed</th><th>VLANS</th><th>WorkOrder</th></tr><tr><td>Device name</td><td>Target switch</td><td>ACCESS/TRUNK</td><td>1G, 10G, 25G</td><td>VLAN IDs</td><td>Work order #</td></tr>',
-   csvEx:'MEDHVIOP173_MGMT,EDCLEAFNSM2163,ACCESS,1G,2958,WO123456',
+   csvEx:'MEDHVIOP173_MGMT,EDCLEAFNSM2163,ACCESS,1G,2958,WO123456,1/15',
    defCsv:'{{ config.default_individual_csv }}'},
   {id:'epgadd',title:'EPG Add - Add EPGs to Existing Ports',badge:'ADD',badgeCls:'epgadd',console:'epg-add-console',
    csvCols:['Switch','Port','VLANS'],csvPh:['EDCLEAFACC1501','1/68','32,64-67'],
@@ -1448,8 +1612,12 @@ const screenDefs = [
 
 screenDefs.forEach(s => {
   const el = document.getElementById(s.id+'Screen');
-  const thRow = s.csvCols.map(c=>'<th>'+c+'</th>').join('')+'<th class="row-actions"></th>';
-  const tdRow = s.csvCols.map((c,i)=>'<td><input type="text" placeholder="'+s.csvPh[i]+'"></td>').join('')+'<td class="row-actions"><button class="delete-row" onclick="deleteCsvRow(this)">✕</button></td>';
+  const thRow = s.csvCols.map((c,i)=>
+    '<th>'+(c==='PORT' && s.csvPh[i]===''?'<span style="color:var(--accent-cyan)">PORT</span> <span style="font-size:9px;color:var(--text-muted);font-weight:400">(optional)</span>':c)+'</th>'
+  ).join('')+'<th class="row-actions"></th>';
+  const tdRow = s.csvCols.map((c,i)=>
+    '<td>'+makeInlineCell(c, s.csvPh[i]||'')+'</td>'
+  ).join('')+'<td class="row-actions"><button class="delete-row" onclick="deleteCsvRow(this)">✕</button></td>';
   el.innerHTML = `
 <div class="header-bar"><div class="header-title"><h2>${s.title}</h2><span class="header-badge ${s.badgeCls}">${s.badge}</span></div><div class="header-actions"><button class="header-btn" onclick="clearTerminal('${s.id}')">Clear</button><button class="header-btn danger" onclick="stopScript()" id="${s.id}StopBtn" disabled>Stop</button><button class="header-btn primary" onclick="runScript('${s.id}')" id="${s.id}RunBtn">Run Script</button></div></div>
 <div class="config-panel">
@@ -1458,7 +1626,7 @@ screenDefs.forEach(s => {
 <div id="${s.id}InlineMode" style="display:none"><div class="csv-editor-section" style="padding:0"><div class="csv-editor-header"><span class="csv-editor-title">Inline CSV Editor</span><div class="csv-editor-actions"><button class="csv-editor-btn add" onclick="addCsvRow('${s.id}')">+ Add Row</button><button class="csv-editor-btn" onclick="exportCsv('${s.id}')">Export CSV</button></div></div><table class="csv-editor-table" id="${s.id}CsvTable"><thead><tr>${thRow}</tr></thead><tbody><tr>${tdRow}</tr></tbody></table></div></div>
 </div>
 <div class="csv-reference" id="${s.id}CsvRef"><div class="csv-reference-header"><span class="csv-reference-title">📋 CSV Format Reference</span><span class="csv-reference-toggle" onclick="toggleCsvRef('${s.id}')">Hide</span></div><table class="csv-table">${s.csvRef}</table><div class="csv-example"><div class="csv-example-label"># Example:</div>${s.csvEx}</div></div>
-<div class="terminal-container"><div class="terminal-header"><div class="terminal-dots"><div class="terminal-dot red"></div><div class="terminal-dot yellow"></div><div class="terminal-dot green"></div></div><span class="terminal-title">${s.console}</span><div class="terminal-status" id="${s.id}TerminalStatus"><div class="terminal-status-dot"></div><span>Ready</span></div></div><div class="terminal-output" id="${s.id}Output"><div class="terminal-line muted">// ${s.title}</div><div class="terminal-line muted">// Select a CSV file and click "Run Script" to begin</div></div><div class="post-run-bar hidden" id="${s.id}PostRun"><div class="post-run-label">✅ Run complete</div><div class="post-run-actions"><button class="post-run-btn log-btn" id="${s.id}PostRunLog" onclick="postRunDownloadLog('${s.id}')">📥 Download Log</button><button class="post-run-btn rollback-btn" id="${s.id}PostRunRollback" onclick="postRunDownloadRollback('${s.id}')">↩️ Rollback Script</button><button class="post-run-btn run-rb-btn" id="${s.id}PostRunExec" onclick="postRunExecRollback('${s.id}')">▶ Run Rollback</button><button class="post-run-dismiss" onclick="document.getElementById('${s.id}PostRun').classList.add('hidden')" title="Dismiss">✕</button></div></div><div class="tenant-bar hidden" id="${s.id}TenantBar"><span class="tenant-bar-icon">🏢</span><span class="tenant-bar-text" id="${s.id}TenantText">Tenant prompt detected</span><button class="tenant-bar-btn apply" id="${s.id}TenantApply" onclick="rememberTenant('${s.id}')">Apply to all remaining</button><button class="tenant-bar-btn clear hidden" id="${s.id}TenantClear" onclick="clearTenant('${s.id}')">✕ Clear</button></div><div class="terminal-input-area"><span class="terminal-prompt">❯</span><input type="text" class="terminal-input" id="${s.id}Input" placeholder="Type response here..." onkeypress="handleInputKeypress(event,'${s.id}')" disabled><button class="terminal-submit" id="${s.id}SubmitBtn" onclick="submitInput('${s.id}')" disabled>Send</button></div></div>`;
+<div class="terminal-container"><div class="terminal-header"><div class="terminal-dots"><div class="terminal-dot red"></div><div class="terminal-dot yellow"></div><div class="terminal-dot green"></div></div><span class="terminal-title">${s.console}</span><div class="terminal-status" id="${s.id}TerminalStatus"><div class="terminal-status-dot"></div><span>Ready</span></div></div><div class="terminal-output" id="${s.id}Output"><div class="terminal-line muted">// ${s.title}</div><div class="terminal-line muted">// Select a CSV file and click "Run Script" to begin</div></div><div class="post-run-bar hidden" id="${s.id}PostRun"><div class="post-run-label">✅ Run complete</div><div class="post-run-actions"><button class="post-run-btn results-btn" id="${s.id}PostRunResults" onclick="postRunDownloadResults('${s.id}')" style="display:none">📋 Results CSV</button><button class="post-run-btn log-btn" id="${s.id}PostRunLog" onclick="postRunDownloadLog('${s.id}')">📥 Download Log</button><button class="post-run-btn rollback-btn" id="${s.id}PostRunRollback" onclick="postRunDownloadRollback('${s.id}')">↩️ Rollback Script</button><button class="post-run-btn run-rb-btn" id="${s.id}PostRunExec" onclick="postRunExecRollback('${s.id}')">▶ Run Rollback</button><button class="post-run-dismiss" onclick="document.getElementById('${s.id}PostRun').classList.add('hidden')" title="Dismiss">✕</button></div></div><div class="tenant-bar hidden" id="${s.id}TenantBar"><span class="tenant-bar-icon">🏢</span><span class="tenant-bar-text" id="${s.id}TenantText">Tenant prompt detected</span><button class="tenant-bar-btn apply" id="${s.id}TenantApply" onclick="rememberTenant('${s.id}')">Apply to all remaining</button><button class="tenant-bar-btn clear hidden" id="${s.id}TenantClear" onclick="clearTenant('${s.id}')">✕ Clear</button></div><div class="terminal-input-area"><span class="terminal-prompt">❯</span><input type="text" class="terminal-input" id="${s.id}Input" placeholder="Type response here..." onkeypress="handleInputKeypress(event,'${s.id}')" disabled><button class="terminal-submit" id="${s.id}SubmitBtn" onclick="submitInput('${s.id}')" disabled>Send</button></div></div>`;
 });
 
 function selectView(view){
@@ -1511,7 +1679,6 @@ function handleFileSelect(type,input){
       const dp=document.getElementById(type+'FpDisplay');
       dp.innerHTML='<span class="fp-icon">✅</span><span class="fp-name">'+d.filename+'</span>';
       dp.classList.add('has-file');
-      // Validate CSV
       fetch('/api/validate-csv',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:d.path,type:type})})
       .then(r=>r.json()).then(v=>{
         const vd=document.getElementById(type+'Validation');
@@ -1525,9 +1692,34 @@ function handleFileSelect(type,input){
 
 // CSV EDITOR
 function toggleCsvMode(type,mode){csvModes[type]=mode;const fm=document.getElementById(type+'FileMode'),im=document.getElementById(type+'InlineMode');document.querySelectorAll('#'+type+'Screen .csv-toggle').forEach(t=>t.classList.remove('active'));event.target.classList.add('active');if(mode==='file'){fm.style.display='block';im.style.display='none'}else{fm.style.display='none';im.style.display='block'}}
-function addCsvRow(type){const tb=document.getElementById(type+'CsvTable').getElementsByTagName('tbody')[0],row=tb.insertRow();const def=screenDefs.find(s=>s.id===type);if(!def)return;def.csvCols.forEach((c,i)=>{const cell=row.insertCell();const inp=document.createElement('input');inp.type='text';inp.placeholder=def.csvPh[i]||'';cell.appendChild(inp)});const ac=row.insertCell();ac.className='row-actions';ac.innerHTML='<button class="delete-row" onclick="deleteCsvRow(this)">✕</button>'}
+function addCsvRow(type){
+  const tb=document.getElementById(type+'CsvTable').getElementsByTagName('tbody')[0],row=tb.insertRow();
+  const def=screenDefs.find(s=>s.id===type);if(!def)return;
+  def.csvCols.forEach((c,i)=>{
+    const cell=row.insertCell();
+    cell.innerHTML=makeInlineCell(c, def.csvPh[i]||'');
+  });
+  const ac=row.insertCell();ac.className='row-actions';ac.innerHTML='<button class="delete-row" onclick="deleteCsvRow(this)">✕</button>';
+}
 function deleteCsvRow(btn){const r=btn.closest('tr');if(r.parentNode.rows.length>1)r.remove()}
-function exportCsv(type){const table=document.getElementById(type+'CsvTable'),rows=table.getElementsByTagName('tbody')[0].rows,headers=Array.from(table.getElementsByTagName('th')).map(th=>th.textContent).filter(h=>h);let csv=headers.join(',')+'\n';for(let row of rows){const vals=Array.from(row.getElementsByTagName('input')).map(inp=>{let v=inp.value.trim();if(v.includes(',')||v.includes('-'))v='"'+v+'"';return v});if(vals.some(v=>v))csv+=vals.join(',')+'\n'}const blob=new Blob([csv],{type:'text/csv'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=type+'_export.csv';a.click()}
+function exportCsv(type){
+  const table=document.getElementById(type+'CsvTable');
+  const rows=table.getElementsByTagName('tbody')[0].rows;
+  const headers=Array.from(table.getElementsByTagName('th')).map(th=>th.textContent.replace(/\(optional\)/,'').trim()).filter(h=>h);
+  let csv=headers.join(',')+'\n';
+  for(let row of rows){
+    const vals=Array.from(row.querySelectorAll('td:not(.row-actions)')).map(cell=>{
+      const inp=cell.querySelector('input');
+      const sel=cell.querySelector('select');
+      let v=(inp?inp.value:sel?sel.value:'').trim();
+      if(v.includes(',')||v.includes('-'))v='"'+v+'"';
+      return v;
+    });
+    if(vals.some(v=>v))csv+=vals.join(',')+'\n';
+  }
+  const blob=new Blob([csv],{type:'text/csv'}),a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download=type+'_export.csv';a.click();
+}
 
 // README
 function switchReadmeTab(tab){document.querySelectorAll('.readme-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.readme-tab-content').forEach(c=>c.classList.remove('active'));event.target.classList.add('active');const map={ui:'readmeTabUi',vpc:'readmeTabVpc',individual:'readmeTabIndividual',troubleshoot:'readmeTabTroubleshoot'};const el=document.getElementById(map[tab]);if(el)el.classList.add('active')}
@@ -1582,12 +1774,12 @@ function startPolling(type){pollInterval=setInterval(()=>{fetch('/api/output').t
 function scriptEnded(type){isRunning=false;if(pollInterval){clearInterval(pollInterval);pollInterval=null}setStatus(type,'Ready',false);document.getElementById(type+'RunBtn').disabled=false;document.getElementById(type+'StopBtn').disabled=true;document.getElementById(type+'Input').disabled=true;document.getElementById(type+'SubmitBtn').disabled=true;tenantLocked=false;tenantPromptActive=false;const tb=document.getElementById(type+'TenantBar');if(tb)tb.classList.add('hidden');showPostRunBar(type)}
 function showPostRunBar(type){
   const bar=document.getElementById(type+'PostRun');if(!bar)return;
-  // Fetch latest log to get filenames
   fetch('/api/logs').then(r=>r.json()).then(log=>{
     const entries=log.entries||[];if(!entries.length){bar.classList.add('hidden');return}
     const latest=entries[entries.length-1];
     const logBtn=document.getElementById(type+'PostRunLog');
     const rbBtn=document.getElementById(type+'PostRunRollback');
+    const resBtn=document.getElementById(type+'PostRunResults');
     const label=bar.querySelector('.post-run-label');
     if(latest.status==='success'){label.textContent='✅ Run complete';label.style.color='var(--accent-green)'}
     else if(latest.status==='failed'){label.textContent='❌ Run failed';label.style.color='var(--accent-red)'}
@@ -1596,11 +1788,16 @@ function showPostRunBar(type){
     if(latest.rollback_file){rbBtn.style.display='';rbBtn.dataset.file=latest.rollback_file;
       const execBtn=document.getElementById(type+'PostRunExec');if(execBtn){execBtn.style.display='';execBtn.dataset.file=latest.rollback_file}
     }else{rbBtn.style.display='none';const execBtn=document.getElementById(type+'PostRunExec');if(execBtn)execBtn.style.display='none'}
+    if(resBtn){
+      if(latest.results_file){resBtn.style.display='';resBtn.dataset.file=latest.results_file}
+      else{resBtn.style.display='none'}
+    }
     bar.classList.remove('hidden');
   }).catch(()=>{});
 }
 function postRunDownloadLog(type){const btn=document.getElementById(type+'PostRunLog');if(btn&&btn.dataset.file)window.open('/api/saved-logs/'+encodeURIComponent(btn.dataset.file),'_blank')}
 function postRunDownloadRollback(type){const btn=document.getElementById(type+'PostRunRollback');if(btn&&btn.dataset.file)window.open('/api/rollback/'+encodeURIComponent(btn.dataset.file),'_blank')}
+function postRunDownloadResults(type){const btn=document.getElementById(type+'PostRunResults');if(btn&&btn.dataset.file)window.open('/api/results/'+encodeURIComponent(btn.dataset.file),'_blank')}
 function postRunExecRollback(type){
   const btn=document.getElementById(type+'PostRunExec');
   if(!btn||!btn.dataset.file)return;
@@ -1609,7 +1806,6 @@ function postRunExecRollback(type){
 }
 function runRollbackFromLog(filename,deployType){
   if(!confirm('⚠️ This will REVERSE the deployment. Continue?'))return;
-  // Switch to the deploy type's tab to show terminal output
   const type=deployType||'vpc';
   selectView(type);
   setTimeout(()=>executeRollbackScript(filename,type),200);
@@ -1679,7 +1875,18 @@ function clearTenant(type){
   });
 }
 
-function saveSettings(){const s={vpc_script:document.getElementById('settingsVpcScript').value,individual_script:document.getElementById('settingsIndividualScript').value,epgadd_script:document.getElementById('settingsEpgaddScript').value,epgdelete_script:document.getElementById('settingsEpgdeleteScript').value,version:document.getElementById('settingsVersion').value};fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)}).then(r=>r.json()).then(d=>{if(d.status==='saved'){alert('Settings saved!');document.getElementById('versionBadge').textContent='v'+s.version}})}
+function saveSettings(){
+  const s={
+    vpc_script:document.getElementById('settingsVpcScript').value,
+    individual_script:document.getElementById('settingsIndividualScript').value,
+    epgadd_script:document.getElementById('settingsEpgaddScript').value,
+    epgdelete_script:document.getElementById('settingsEpgdeleteScript').value,
+    auto_select_port:document.getElementById('settingsAutoSelectPort').checked,
+    version:document.getElementById('settingsVersion').value
+  };
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
+  .then(r=>r.json()).then(d=>{if(d.status==='saved'){alert('Settings saved!');document.getElementById('versionBadge').textContent='v'+s.version}})
+}
 
 // LOG with download + rollback buttons
 function fmtMin(m){if(m<60)return Math.round(m)+'m';return Math.floor(m/60)+'h '+Math.round(m%60)+'m'}
@@ -1695,12 +1902,14 @@ function refreshLog(){fetch('/api/logs').then(r=>r.json()).then(log=>{
     if(x.saved_log_file) actionBtns+='<button class="log-action-btn download" onclick="downloadLog(\''+x.saved_log_file+'\')">📥 Log</button>';
     if(x.rollback_file) actionBtns+='<button class="log-action-btn rollback" onclick="downloadRollback(\''+x.rollback_file+'\')">↩ Rollback</button>';
     if(x.rollback_file) actionBtns+='<button class="log-action-btn run-rollback" onclick="runRollbackFromLog(\''+x.rollback_file+'\',\''+x.type+'\')">▶ Run</button>';
+    if(x.results_file) actionBtns+='<button class="log-action-btn" style="background:rgba(63,185,80,.15);color:var(--accent-green)" onclick="downloadResults(\''+x.results_file+'\')">📋 Results</button>';
     actionBtns+='</div>';
     h+='<div class="log-entry"><div class="log-entry-dot '+x.status+'"></div><div class="log-entry-info"><div class="log-entry-title">'+(x.csv_file||'inline')+'</div><div class="log-entry-meta">'+x.timestamp+' · '+x.deployment_count+' items · '+x.duration_seconds+'s</div></div><span class="log-entry-type '+x.type+'">'+(labels[x.type]||x.type)+'</span><div class="log-entry-saved">-'+fmtMin(x.time_saved_minutes)+'</div>'+actionBtns+'</div>'}
   c.innerHTML=h}).catch(()=>{})}
 function clearLog(){if(!confirm('Clear all deployment log entries?'))return;fetch('/api/logs/clear',{method:'POST'}).then(()=>refreshLog())}
 function downloadLog(filename){window.open('/api/saved-logs/'+encodeURIComponent(filename),'_blank')}
 function downloadRollback(filename){window.open('/api/rollback/'+encodeURIComponent(filename),'_blank')}
+function downloadResults(filename){window.open('/api/results/'+encodeURIComponent(filename),'_blank')}
 
 // Init
 checkCredentials();
@@ -1740,6 +1949,8 @@ def api_run():
     current_run["start_time"] = None
     current_run["output_lines"] = []
     current_run["is_rollback"] = False
+    current_run["port_selections"] = parse_port_column(data.get('csv_path', ''))
+    current_run["port_prompt_index"] = 0
     thread = threading.Thread(target=run_script_thread, args=(script_path, data.get('csv_path')))
     thread.daemon = True
     thread.start()
@@ -1766,7 +1977,6 @@ def api_input():
     data = request.json
     text = data.get('text', '')
     sent = send_input_to_process(text)
-    # If user answered a tenant prompt, frontend may also send remember_tenant flag
     if data.get('remember_tenant') and text.strip():
         current_run["tenant_choice"] = text.strip()
     return jsonify({'status': 'sent' if sent else 'failed'})
@@ -1893,6 +2103,14 @@ def api_rollback_download(filename):
         return send_file(filepath, as_attachment=True, download_name=safe_name)
     return jsonify({'status': 'error', 'message': 'Rollback script not found'}), 404
 
+@app.route('/api/results/<filename>')
+def api_results_download(filename):
+    safe_name = filename.replace('..', '').replace('/', '_').replace('\\', '_')
+    filepath = os.path.join(RESULTS_FOLDER, safe_name)
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=True, download_name=safe_name)
+    return jsonify({'status': 'error', 'message': 'Results file not found'}), 404
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1900,11 +2118,10 @@ def api_rollback_download(filename):
 if __name__ == '__main__':
     import logging
     import webbrowser
-    # Suppress Flask/Werkzeug dev server warning (internal tool, not public-facing)
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
 
-    for folder in [UPLOAD_FOLDER, SAVED_LOGS_FOLDER, ROLLBACK_FOLDER]:
+    for folder in [UPLOAD_FOLDER, SAVED_LOGS_FOLDER, ROLLBACK_FOLDER, RESULTS_FOLDER]:
         os.makedirs(folder, exist_ok=True)
     print("\n" + "=" * 60)
     print(" ACI AUTOMATION CONSOLE v1.3.0")
@@ -1913,7 +2130,6 @@ if __name__ == '__main__':
     print("  Press Ctrl+C to stop")
     print("\n" + "=" * 60 + "\n")
 
-    # Auto-open browser after a short delay (server needs to bind first)
     threading.Timer(1.2, lambda: webbrowser.open('http://localhost:5000')).start()
 
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
