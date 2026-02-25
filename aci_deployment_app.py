@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ACI Bulk Deployment Web Application
+ACI Automation Console
 ====================================
 Flask-based web UI for running ACI deployment scripts.
 
@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
 
 TIME_ESTIMATES = {
     "vpc": {"per_deployment": 18, "label": "VPC Port Channel + EPG Bindings"},
-    "individual": {"per_deployment": 12, "label": "Individual Port Policy + EPG Bindings"},
+    "individual": {"per_deployment": 12, "label": "Static Port Policy + EPG Bindings"},
     "epgadd": {"per_deployment": 6, "label": "EPG Static Path Binding Addition"},
     "epgdelete": {"per_deployment": 5, "label": "EPG Static Path Binding Removal"}
 }
@@ -90,7 +90,7 @@ output_queue = queue.Queue()
 input_queue = queue.Queue()
 
 # In-memory credential storage (NEVER written to disk)
-stored_credentials = {"username": None, "password": None, "set": False}
+stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
 
 # Track current run for logging
 current_run = {"type": None, "start_time": None, "csv_path": None, "output_lines": [], "status": None}
@@ -388,6 +388,11 @@ def build_rollback_script(deploy_type, entry_id, timestamp, actions):
     if not meaningful:
         meaningful = actions
 
+    # Grab current APIC URLs from credential store
+    apic_d1 = stored_credentials.get("apic_urls", {}).get("D1", "")
+    apic_d2 = stored_credentials.get("apic_urls", {}).get("D2", "")
+    apic_d3 = stored_credentials.get("apic_urls", {}).get("D3", "")
+
     script = f'''#!/usr/bin/env python3
 """
 ACI ROLLBACK SCRIPT
@@ -421,7 +426,6 @@ Actions to perform:
 
 import os
 import sys
-import getpass
 import requests
 import urllib3
 import re
@@ -429,16 +433,17 @@ import re
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =============================================================================
-# APIC CONFIGURATION - Update these if different from deployment scripts
+# APIC CONFIGURATION
 # =============================================================================
 
 APIC_URLS = {{
-    "D1": "",  # <-- UPDATE or copy from your deployment script
-    "D2": "",  # <-- UPDATE or copy from your deployment script
-    "D3": ""   # <-- UPDATE or copy from your deployment script
+    "D1": "{apic_d1}",
+    "D2": "{apic_d2}",
+    "D3": "{apic_d3}"
 }}
 
 POD_ID = "1"
+WEB_UI = os.environ.get("ACI_WEB_UI", "")
 
 def detect_environment(switch_name):
     s = switch_name.upper()
@@ -466,9 +471,9 @@ def main():
     print(f" Original: {deploy_type.upper()} Run #{entry_id} ({timestamp})")
     print("=" * 60)
 
-    # Authenticate
+    # Authenticate — uses input() so web UI auto-inject can detect prompts
     username = input("\\nUsername: ").strip()
-    password = getpass.getpass("Password: ")
+    password = input("Password: ").strip()
 
     sessions = {{}}
     needed_envs = set()
@@ -677,7 +682,7 @@ def main():
 
 if __name__ == "__main__":
     print("\\n[WARNING] This will REVERSE changes from {deploy_type.upper()} Run #{entry_id}")
-    confirm = input("Type 'YES' to confirm rollback: ").strip()
+    confirm = input("Type YES to confirm rollback: ").strip()
     if confirm != "YES":
         print("\\n[CANCELLED]")
         sys.exit(0)
@@ -853,6 +858,34 @@ def run_script_thread(script_path, csv_path):
                                 except:
                                     pass
 
+                        # AUTO-CSV PATH INJECTION
+                        # Scripts prompt: "Press Enter to use default, or enter filename:"
+                        if ('enter filename' in tl or 'use default' in tl) and tl.endswith(':'):
+                            csv_path = current_run.get("csv_path", "")
+                            if csv_path:
+                                time.sleep(0.1)
+                                try:
+                                    running_process.stdin.write((csv_path + '\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    basename = os.path.basename(csv_path)
+                                    output_queue.put(('output', f'[AUTO] CSV path injected: {basename}'))
+                                    current_run["output_lines"].append(f'[AUTO] CSV path injected: {csv_path}')
+                                except:
+                                    pass
+
+                        # AUTO-ROLLBACK CONFIRMATION
+                        # Rollback scripts prompt: "Type YES to confirm rollback:"
+                        if 'confirm rollback' in tl and tl.endswith(':'):
+                            if current_run.get("is_rollback"):
+                                time.sleep(0.1)
+                                try:
+                                    running_process.stdin.write(('YES\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    output_queue.put(('output', '[AUTO] Rollback confirmed: YES'))
+                                    current_run["output_lines"].append('[AUTO] Rollback confirmed: YES')
+                                except:
+                                    pass
+
         reader.join(timeout=1.0)
         with buffer_lock:
             if buffer:
@@ -921,7 +954,7 @@ HTML_TEMPLATE = r'''
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ACI Bulk Deployment Console</title>
+<title>ACI Automation Console</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
 :root{--bg-darkest:#0d1117;--bg-dark:#161b22;--bg-sidebar:#0d1117;--bg-terminal:#1e1e2e;--bg-input:#252535;--border-color:#30363d;--text-primary:#e6edf3;--text-secondary:#8b949e;--text-muted:#6e7681;--accent-blue:#58a6ff;--accent-cyan:#39d4d4;--accent-green:#3fb950;--accent-orange:#f0883e;--accent-red:#f85149;--accent-purple:#a371f7;--accent-yellow:#d29922;--glow-cyan:rgba(57,212,212,0.15)}
@@ -1035,6 +1068,17 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .terminal-line.credential{color:var(--accent-yellow)}
 .bracket-num{color:var(--accent-blue)!important;font-weight:700}
 .terminal-input-area{display:flex;align-items:center;padding:12px 16px;background:rgba(0,0,0,.3);border-top:1px solid var(--border-color);gap:12px}
+.post-run-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(135deg,rgba(63,185,80,.08),rgba(57,212,212,.08));border-top:1px solid rgba(63,185,80,.3)}
+.post-run-bar.hidden{display:none}
+.post-run-label{font-size:13px;font-weight:600;color:var(--accent-green);font-family:'JetBrains Mono',monospace}
+.post-run-actions{display:flex;gap:8px}
+.post-run-btn{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:none;font-family:'IBM Plex Sans',sans-serif;transition:all .2s}
+.post-run-btn.log-btn{background:rgba(88,166,255,.15);color:var(--accent-blue)}
+.post-run-btn.log-btn:hover{background:rgba(88,166,255,.3)}
+.post-run-btn.rollback-btn{background:rgba(248,81,73,.12);color:var(--accent-red)}
+.post-run-btn.rollback-btn:hover{background:rgba(248,81,73,.25)}
+.post-run-btn.run-rb-btn{background:rgba(248,81,73,.25);color:#fff;border:1px solid var(--accent-red)}
+.post-run-btn.run-rb-btn:hover{background:rgba(248,81,73,.45)}
 .terminal-prompt{color:var(--accent-cyan);font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600}
 .terminal-input{flex:1;background:transparent;border:none;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;outline:none}
 .terminal-input:disabled{opacity:.5}
@@ -1129,6 +1173,8 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .log-action-btn.download:hover{background:rgba(88,166,255,.3)}
 .log-action-btn.rollback{background:rgba(248,81,73,.12);color:var(--accent-red)}
 .log-action-btn.rollback:hover{background:rgba(248,81,73,.25)}
+.log-action-btn.run-rollback{background:rgba(248,81,73,.25);color:#fff;border:1px solid var(--accent-red)}
+.log-action-btn.run-rollback:hover{background:rgba(248,81,73,.45)}
 .log-empty{text-align:center;padding:40px;color:var(--text-muted)}
 .log-empty-icon{font-size:40px;margin-bottom:12px}
 /* CSV toggles & editor */
@@ -1155,11 +1201,11 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <body>
 <div class="app-container">
 <aside class="sidebar">
-<div class="sidebar-header"><div class="logo"><div class="logo-icon">ACI</div><div><div class="logo-text">Bulk Deploy</div><div class="logo-subtitle">Automation Console</div></div></div></div>
+<div class="sidebar-header"><div class="logo"><div class="logo-icon">ACI</div><div><div class="logo-text">Automation</div><div class="logo-subtitle">Console</div></div></div></div>
 <nav class="nav-section">
 <div class="nav-label">Deployments</div>
-<div class="nav-item vpc" onclick="selectView('vpc')"><div class="nav-icon">⚡</div><div><div class="nav-item-title">VPC Bulk</div><div class="nav-item-desc">Virtual Port Channels</div></div></div>
-<div class="nav-item individual" onclick="selectView('individual')"><div class="nav-icon">🔌</div><div><div class="nav-item-title">Port Bulk</div><div class="nav-item-desc">Individual Ports</div></div></div>
+<div class="nav-item vpc" onclick="selectView('vpc')"><div class="nav-icon">🔀</div><div><div class="nav-item-title">VPC Deploy</div><div class="nav-item-desc">Virtual Port Channels</div></div></div>
+<div class="nav-item individual" onclick="selectView('individual')"><div class="nav-icon">🔌</div><div><div class="nav-item-title">Static Port Deploy</div><div class="nav-item-desc">Access &amp; Trunk Ports</div></div></div>
 <div class="nav-item epgadd" onclick="selectView('epgadd')"><div class="nav-icon">➕</div><div><div class="nav-item-title">EPG Add</div><div class="nav-item-desc">Add EPGs to ports</div></div></div>
 <div class="nav-item epgdelete" onclick="selectView('epgdelete')"><div class="nav-icon">➖</div><div><div class="nav-item-title">EPG Delete</div><div class="nav-item-desc">Remove EPGs from ports</div></div></div>
 <div class="nav-label">Management</div>
@@ -1175,11 +1221,11 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 
 <!-- WELCOME -->
 <div class="welcome-screen" id="welcomeScreen">
-<div class="welcome-icon">🚀</div><h1 class="welcome-title">ACI Bulk Deployment</h1>
-<p class="welcome-desc">Streamline your Cisco ACI fabric deployments with automated VPC and individual port configurations.</p>
+<div class="welcome-icon">🚀</div><h1 class="welcome-title">ACI Automation Console</h1>
+<p class="welcome-desc">Streamline your Cisco ACI fabric deployments with automated VPC and static port configurations.</p>
 <div class="welcome-cards">
-<div class="welcome-card vpc" onclick="selectView('vpc')"><div class="welcome-card-icon">⚡</div><div class="welcome-card-title">VPC Bulk</div><div class="welcome-card-desc">Deploy Virtual Port Channels across switch pairs</div></div>
-<div class="welcome-card individual" onclick="selectView('individual')"><div class="welcome-card-icon">🔌</div><div class="welcome-card-title">Port Bulk</div><div class="welcome-card-desc">Deploy individual access and trunk ports</div></div>
+<div class="welcome-card vpc" onclick="selectView('vpc')"><div class="welcome-card-icon">🔀</div><div class="welcome-card-title">VPC Deploy</div><div class="welcome-card-desc">Deploy Virtual Port Channels across switch pairs</div></div>
+<div class="welcome-card individual" onclick="selectView('individual')"><div class="welcome-card-icon">🔌</div><div class="welcome-card-title">Static Port Deploy</div><div class="welcome-card-desc">Deploy static access and trunk ports</div></div>
 </div>
 <div class="time-saved-banner"><div class="ts-stat"><div class="ts-value" id="wTimeSaved">0m</div><div class="ts-label">Total Time Saved</div></div><div class="ts-divider"></div><div class="ts-stat"><div class="ts-value blue" id="wDeploys">0</div><div class="ts-label">Total Deployments</div></div><div class="ts-divider"></div><div class="ts-stat"><div class="ts-value purple" id="wRuns">0</div><div class="ts-label">Script Runs</div></div></div>
 </div>
@@ -1199,8 +1245,12 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="cred-status unset" id="credStatusBox"><span id="credStatusIcon">⚠️</span> <span id="credStatusText">No credentials stored</span></div>
 <div class="cred-row"><label class="cred-label">APIC Username</label><input type="text" class="cred-input" id="credUsername" placeholder="admin" autocomplete="off"></div>
 <div class="cred-row"><label class="cred-label">APIC Password</label><input type="password" class="cred-input" id="credPassword" placeholder="••••••••" autocomplete="off"></div>
+<div class="cred-divider" style="border-top:1px solid var(--border-color);margin:16px 0;padding-top:16px"><label class="cred-label" style="font-size:13px;color:var(--text-primary);font-weight:600;margin-bottom:10px;display:block">🌐 APIC URLs <span style="font-weight:400;color:var(--text-muted);font-size:11px">(used in rollback scripts)</span></label></div>
+<div class="cred-row"><label class="cred-label">D1 (Primary DC)</label><input type="text" class="cred-input" id="credApicD1" placeholder="https://apic-d1.example.com" autocomplete="off"></div>
+<div class="cred-row"><label class="cred-label">D2 (Secondary DC)</label><input type="text" class="cred-input" id="credApicD2" placeholder="https://apic-d2.example.com" autocomplete="off"></div>
+<div class="cred-row"><label class="cred-label">D3 (Tertiary DC)</label><input type="text" class="cred-input" id="credApicD3" placeholder="https://apic-d3.example.com" autocomplete="off"></div>
 <div class="cred-actions"><button class="cred-btn save" onclick="saveCredentials()">Save Credentials</button><button class="cred-btn clear" onclick="clearCredentials()">Clear</button></div>
-<div class="cred-hint">🛡️ Credentials are stored <strong>in memory only</strong> and are never written to disk. They clear automatically when the app restarts.<br><br>When set, credentials are auto-injected into scripts when they prompt for Username/Password — no manual typing needed.</div>
+<div class="cred-hint">🛡️ Credentials are stored <strong>in memory only</strong> and are never written to disk. They clear automatically when the app restarts.<br><br>When set, credentials are auto-injected into scripts when they prompt for Username/Password — no manual typing needed. APIC URLs are embedded into generated rollback scripts.</div>
 </div>
 </div></div>
 
@@ -1222,8 +1272,8 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="header-bar"><div class="header-title"><h2>Settings</h2><span class="header-badge settings">CONFIG</span></div><div class="header-actions"><button class="header-btn primary" onclick="saveSettings()">Save Settings</button></div></div>
 <div class="settings-panel">
 <div class="settings-section"><div class="settings-section-title">📁 Script Paths</div>
-<div class="settings-row"><label class="settings-label">VPC Deployment Script</label><input type="text" class="settings-input" id="settingsVpcScript" value="{{ config.vpc_script }}"><div class="settings-hint">Path to the VPC bulk deployment Python script</div></div>
-<div class="settings-row"><label class="settings-label">Individual Port Deployment Script</label><input type="text" class="settings-input" id="settingsIndividualScript" value="{{ config.individual_script }}"><div class="settings-hint">Path to the individual port bulk deployment Python script</div></div>
+<div class="settings-row"><label class="settings-label">VPC Deployment Script</label><input type="text" class="settings-input" id="settingsVpcScript" value="{{ config.vpc_script }}"><div class="settings-hint">Path to the VPC deployment Python script</div></div>
+<div class="settings-row"><label class="settings-label">Static Port Deployment Script</label><input type="text" class="settings-input" id="settingsIndividualScript" value="{{ config.individual_script }}"><div class="settings-hint">Path to the static port deployment Python script</div></div>
 <div class="settings-row"><label class="settings-label">EPG Add Script</label><input type="text" class="settings-input" id="settingsEpgaddScript" value="{{ config.epgadd_script }}"></div>
 <div class="settings-row"><label class="settings-label">EPG Delete Script</label><input type="text" class="settings-input" id="settingsEpgdeleteScript" value="{{ config.epgdelete_script }}"></div>
 </div>
@@ -1236,7 +1286,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="readme-panel">
 <div class="readme-tabs">
 <div class="readme-tab active" onclick="switchReadmeTab('ui')">🖥️ Using the UI</div>
-<div class="readme-tab" onclick="switchReadmeTab('vpc')">⚡ VPC</div>
+<div class="readme-tab" onclick="switchReadmeTab('vpc')">🔀 VPC</div>
 <div class="readme-tab" onclick="switchReadmeTab('individual')">🔌 Port</div>
 <div class="readme-tab" onclick="switchReadmeTab('troubleshoot')">🔧 Troubleshoot</div>
 </div>
@@ -1247,8 +1297,8 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="step"><div class="step-number">4</div><div class="step-content"><div class="step-title">Run &amp; Respond</div><div>Click <strong>Run Script</strong>. Credentials auto-inject. Type responses for prompts in the input bar.</div></div></div>
 <div class="step"><div class="step-number">5</div><div class="step-content"><div class="step-title">Review Logs &amp; Rollback</div><div>Check <strong>Deploy Log</strong> for history. Download sanitized logs for work orders. Use <strong>Rollback</strong> to generate reversal scripts.</div></div></div>
 </div></div></div>
-<div id="readmeTabVpc" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>⚡</span> VPC Bulk Deployment</div><div class="readme-content"><p>Deploy VPCs across switch pairs. CSV columns: Hostname, Switch1, Switch2, Speed, VLANS, WorkOrder.</p></div></div></div>
-<div id="readmeTabIndividual" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔌</span> Individual Port Deployment</div><div class="readme-content"><p>Deploy individual ports. ACCESS = single VLAN untagged, TRUNK = multiple VLANs tagged.</p></div></div></div>
+<div id="readmeTabVpc" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔀</span> VPC Deploy</div><div class="readme-content"><p>Deploy VPCs across switch pairs. CSV columns: Hostname, Switch1, Switch2, Speed, VLANS, WorkOrder.</p></div></div></div>
+<div id="readmeTabIndividual" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔌</span> Static Port Deploy</div><div class="readme-content"><p>Deploy static ports. ACCESS = single VLAN untagged, TRUNK = multiple VLANs tagged.</p></div></div></div>
 <div id="readmeTabTroubleshoot" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔧</span> Troubleshooting</div><div class="readme-content"><h3>Script Not Found</h3><p>Go to Settings and verify script paths.</p><h3>CSV Errors</h3><p>Check headers match exactly. Wrap VLAN ranges in quotes. Save as UTF-8.</p><h3>Credentials Not Auto-Filling</h3><p>Ensure credentials are set in the Credentials panel before running scripts.</p></div></div></div>
 </div></div>
 
@@ -1260,13 +1310,13 @@ let credSet=false;
 
 // Build deployment screens dynamically
 const screenDefs = [
-  {id:'vpc',title:'VPC Bulk Deployment',badge:'VPC',badgeCls:'vpc',console:'vpc-deployment-console',
+  {id:'vpc',title:'VPC Deploy',badge:'VPC',badgeCls:'vpc',console:'vpc-deployment-console',
    csvCols:['Hostname','Switch1','Switch2','Speed','VLANS','WorkOrder'],
    csvPh:['MEDHVIOP173_SEA_PROD','EDCLEAFACC1501','EDCLEAFACC1502','25G','32,64-67','WO123456'],
    csvRef:'<tr><th>Hostname</th><th>Switch1</th><th>Switch2</th><th>Speed</th><th>VLANS</th><th>WorkOrder</th></tr><tr><td>Device name</td><td>First VPC switch</td><td>Second VPC switch</td><td>1G, 10G, 25G</td><td>VLAN IDs</td><td>Work order #</td></tr>',
    csvEx:'MEDHVIOP173_SEA_PROD,EDCLEAFACC1501,EDCLEAFACC1502,25G,&quot;32,64-67,92-95&quot;,WO123456',
    defCsv:'{{ config.default_vpc_csv }}'},
-  {id:'individual',title:'Individual Port Deployment',badge:'PORT',badgeCls:'individual',console:'individual-port-console',
+  {id:'individual',title:'Static Port Deploy',badge:'STATIC',badgeCls:'individual',console:'static-port-console',
    csvCols:['Hostname','Switch','Type','Speed','VLANS','WorkOrder'],
    csvPh:['MEDHVIOP173_MGMT','EDCLEAFNSM2163','ACCESS','1G','2958','WO123456'],
    csvRef:'<tr><th>Hostname</th><th>Switch</th><th>Type</th><th>Speed</th><th>VLANS</th><th>WorkOrder</th></tr><tr><td>Device name</td><td>Target switch</td><td>ACCESS/TRUNK</td><td>1G, 10G, 25G</td><td>VLAN IDs</td><td>Work order #</td></tr>',
@@ -1294,7 +1344,7 @@ screenDefs.forEach(s => {
 <div id="${s.id}InlineMode" style="display:none"><div class="csv-editor-section" style="padding:0"><div class="csv-editor-header"><span class="csv-editor-title">Inline CSV Editor</span><div class="csv-editor-actions"><button class="csv-editor-btn add" onclick="addCsvRow('${s.id}')">+ Add Row</button><button class="csv-editor-btn" onclick="exportCsv('${s.id}')">Export CSV</button></div></div><table class="csv-editor-table" id="${s.id}CsvTable"><thead><tr>${thRow}</tr></thead><tbody><tr>${tdRow}</tr></tbody></table></div></div>
 </div>
 <div class="csv-reference" id="${s.id}CsvRef"><div class="csv-reference-header"><span class="csv-reference-title">📋 CSV Format Reference</span><span class="csv-reference-toggle" onclick="toggleCsvRef('${s.id}')">Hide</span></div><table class="csv-table">${s.csvRef}</table><div class="csv-example"><div class="csv-example-label"># Example:</div>${s.csvEx}</div></div>
-<div class="terminal-container"><div class="terminal-header"><div class="terminal-dots"><div class="terminal-dot red"></div><div class="terminal-dot yellow"></div><div class="terminal-dot green"></div></div><span class="terminal-title">${s.console}</span><div class="terminal-status" id="${s.id}TerminalStatus"><div class="terminal-status-dot"></div><span>Ready</span></div></div><div class="terminal-output" id="${s.id}Output"><div class="terminal-line muted">// ${s.title}</div><div class="terminal-line muted">// Select a CSV file and click "Run Script" to begin</div></div><div class="terminal-input-area"><span class="terminal-prompt">❯</span><input type="text" class="terminal-input" id="${s.id}Input" placeholder="Type response here..." onkeypress="handleInputKeypress(event,'${s.id}')" disabled><button class="terminal-submit" id="${s.id}SubmitBtn" onclick="submitInput('${s.id}')" disabled>Send</button></div></div>`;
+<div class="terminal-container"><div class="terminal-header"><div class="terminal-dots"><div class="terminal-dot red"></div><div class="terminal-dot yellow"></div><div class="terminal-dot green"></div></div><span class="terminal-title">${s.console}</span><div class="terminal-status" id="${s.id}TerminalStatus"><div class="terminal-status-dot"></div><span>Ready</span></div></div><div class="terminal-output" id="${s.id}Output"><div class="terminal-line muted">// ${s.title}</div><div class="terminal-line muted">// Select a CSV file and click "Run Script" to begin</div></div><div class="post-run-bar hidden" id="${s.id}PostRun"><div class="post-run-label">✅ Run complete</div><div class="post-run-actions"><button class="post-run-btn log-btn" id="${s.id}PostRunLog" onclick="postRunDownloadLog('${s.id}')">📥 Download Log</button><button class="post-run-btn rollback-btn" id="${s.id}PostRunRollback" onclick="postRunDownloadRollback('${s.id}')">↩️ Rollback Script</button><button class="post-run-btn run-rb-btn" id="${s.id}PostRunExec" onclick="postRunExecRollback('${s.id}')">▶ Run Rollback</button></div></div><div class="terminal-input-area"><span class="terminal-prompt">❯</span><input type="text" class="terminal-input" id="${s.id}Input" placeholder="Type response here..." onkeypress="handleInputKeypress(event,'${s.id}')" disabled><button class="terminal-submit" id="${s.id}SubmitBtn" onclick="submitInput('${s.id}')" disabled>Send</button></div></div>`;
 });
 
 function selectView(view){
@@ -1312,12 +1362,14 @@ function saveCredentials(){
   const u=document.getElementById('credUsername').value.trim();
   const p=document.getElementById('credPassword').value;
   if(!u||!p){alert('Both username and password are required');return}
-  fetch('/api/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})})
+  const apic_urls={D1:document.getElementById('credApicD1').value.trim(),D2:document.getElementById('credApicD2').value.trim(),D3:document.getElementById('credApicD3').value.trim()};
+  fetch('/api/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,apic_urls})})
   .then(r=>r.json()).then(d=>{if(d.status==='saved'){updateCredStatus(true);alert('Credentials saved (in memory only)')}});
 }
 function clearCredentials(){
   fetch('/api/credentials',{method:'DELETE'}).then(r=>r.json()).then(()=>{
     updateCredStatus(false);document.getElementById('credUsername').value='';document.getElementById('credPassword').value='';
+    document.getElementById('credApicD1').value='';document.getElementById('credApicD2').value='';document.getElementById('credApicD3').value='';
   });
 }
 function updateCredStatus(isSet){
@@ -1326,7 +1378,14 @@ function updateCredStatus(isSet){
   if(isSet){box.className='cred-status set';icon.textContent='✅';txt.textContent='Credentials stored (auto-fill active)';badge.className='cred-badge set';badge.textContent='SET'}
   else{box.className='cred-status unset';icon.textContent='⚠️';txt.textContent='No credentials stored';badge.className='cred-badge unset';badge.textContent='NOT SET'}
 }
-function checkCredentials(){fetch('/api/credentials').then(r=>r.json()).then(d=>updateCredStatus(d.set))}
+function checkCredentials(){fetch('/api/credentials').then(r=>r.json()).then(d=>{
+  updateCredStatus(d.set);
+  if(d.apic_urls){
+    document.getElementById('credApicD1').value=d.apic_urls.D1||'';
+    document.getElementById('credApicD2').value=d.apic_urls.D2||'';
+    document.getElementById('credApicD3').value=d.apic_urls.D3||'';
+  }
+})}
 
 // FILE PICKER with CSV VALIDATION
 function handleFileSelect(type,input){
@@ -1367,20 +1426,21 @@ function addLine(type,text,lineType='normal'){
   const output=document.getElementById(type+'Output'),line=document.createElement('div');
   if(lineType==='normal'){const tu=text.toUpperCase();
     if(tu.includes('[FOUND]')||tu.includes('[SUCCESS]')||tu.includes('[OK]')||tu.includes('[CREATED]')||tu.includes('[DEPLOYED]'))lineType='success';
-    else if(tu.includes('[ERROR]')||tu.includes('[FAILED]')||tu.includes('[FAILURE]'))lineType='error';
+    else if(tu.includes('[ERROR]')||tu.includes('[FAILED]')||tu.includes('[FAILURE]')||tu.includes('[EXIT]'))lineType='error';
     else if(tu.includes('[WARNING]')||tu.includes('[WARN]')||tu.includes('[SKIP]')||tu.includes('[SKIPPED]'))lineType='warning';
     else if(tu.includes('[INFO]'))lineType='info';
-    else if(tu.includes('[CREDENTIALS]'))lineType='credential';
+    else if(tu.includes('[CREDENTIALS]')||tu.includes('[AUTO]'))lineType='credential';
     else if(text.startsWith('===')||text.startsWith('---')||text.startsWith('***'))lineType='header';
   }
   line.className='terminal-line '+lineType;
   const esc=text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   if(['success','error','warning','info','credential'].includes(lineType)){
     let h=esc.replace(/\[(FOUND|SUCCESS|OK|CREATED|DEPLOYED)\]/gi,'<span style="color:var(--accent-green);font-weight:600">[$1]</span>')
-      .replace(/\[(ERROR|FAILED|FAILURE)\]/gi,'<span style="color:var(--accent-red);font-weight:600">[$1]</span>')
+      .replace(/\[(ERROR|FAILED|FAILURE|EXIT)\]/gi,'<span style="color:var(--accent-red);font-weight:600">[$1]</span>')
       .replace(/\[(WARNING|WARN|SKIP|SKIPPED)\]/gi,'<span style="color:var(--accent-orange);font-weight:600">[$1]</span>')
       .replace(/\[(INFO)\]/gi,'<span style="color:var(--accent-blue);font-weight:600">[$1]</span>')
-      .replace(/\[(CREDENTIALS)\]/gi,'<span style="color:#ffd200;font-weight:600">[$1]</span>');
+      .replace(/\[(CREDENTIALS)\]/gi,'<span style="color:#ffd200;font-weight:600">[$1]</span>')
+      .replace(/\[(AUTO)\]/gi,'<span style="color:#ffd200;font-weight:600">[$1]</span>');
     line.innerHTML=highlightBracketNums(h);
   } else { line.innerHTML=highlightBracketNums(esc); }
   output.appendChild(line); output.scrollTop=output.scrollHeight;
@@ -1393,18 +1453,68 @@ function runScript(type){
   const csvPath=document.getElementById(type+'CsvPath').value;
   if(!csvPath){addLine(type,'[ERROR] Please select a CSV file first','error');return}
   isRunning=true;setStatus(type,'Running',true);
+  const postBar=document.getElementById(type+'PostRun');if(postBar)postBar.classList.add('hidden');
   document.getElementById(type+'RunBtn').disabled=true;document.getElementById(type+'StopBtn').disabled=false;
   document.getElementById(type+'Input').disabled=false;document.getElementById(type+'SubmitBtn').disabled=false;
-  clearTerminal(type);addLine(type,'[INFO] Starting script...','info');addLine(type,'[INFO] CSV: '+csvPath,'info');
+  clearTerminal(type);addLine(type,'[INFO] Starting script...','info');addLine(type,'[INFO] CSV: '+csvPath,'info');addLine(type,'[AUTO] CSV path will auto-inject when script prompts for filename','credential');
   if(credSet) addLine(type,'[CREDENTIALS] Auto-fill active — credentials will be injected','credential');
   fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:type,csv_path:csvPath})})
   .then(r=>r.json()).then(d=>{if(d.status==='started')startPolling(type);else{addLine(type,'[ERROR] '+d.message,'error');scriptEnded(type)}})
   .catch(e=>{addLine(type,'[ERROR] '+e,'error');scriptEnded(type)});
 }
 
-function startPolling(type){pollInterval=setInterval(()=>{fetch('/api/output').then(r=>r.json()).then(d=>{d.lines.forEach(item=>{if(item.type==='output'){let lt='normal';if(item.text.includes('===')||item.text.includes('---'))lt='header';else if(item.text.includes('[SUCCESS]')||item.text.includes(' OK'))lt='success';else if(item.text.includes('[ERROR]')||item.text.includes('[FAILED]'))lt='error';else if(item.text.includes('[WARNING]'))lt='warning';else if(item.text.includes('[INFO]'))lt='info';else if(item.text.includes('[CREDENTIALS]'))lt='credential';else if(item.text.includes('Select')||item.text.endsWith(':')||item.text.endsWith('?'))lt='prompt';addLine(type,item.text,lt)}else if(item.type==='exit'){addLine(type,'[EXIT] Code: '+item.code,item.code===0?'success':'error');scriptEnded(type)}else if(item.type==='error'){addLine(type,'[ERROR] '+item.text,'error');scriptEnded(type)}})})},100)}
+function startPolling(type){pollInterval=setInterval(()=>{fetch('/api/output').then(r=>r.json()).then(d=>{d.lines.forEach(item=>{if(item.type==='output'){let lt='normal';if(item.text.includes('===')||item.text.includes('---'))lt='header';else if(item.text.includes('[SUCCESS]')||item.text.includes(' OK'))lt='success';else if(item.text.includes('[ERROR]')||item.text.includes('[FAILED]'))lt='error';else if(item.text.includes('[WARNING]'))lt='warning';else if(item.text.includes('[INFO]'))lt='info';else if(item.text.includes('[CREDENTIALS]')||item.text.includes('[AUTO]'))lt='credential';else if(item.text.includes('Select')||item.text.endsWith(':')||item.text.endsWith('?'))lt='prompt';addLine(type,item.text,lt)}else if(item.type==='exit'){addLine(type,'[EXIT] Code: '+item.code,'error');scriptEnded(type)}else if(item.type==='error'){addLine(type,'[ERROR] '+item.text,'error');scriptEnded(type)}})})},100)}
 
-function scriptEnded(type){isRunning=false;if(pollInterval){clearInterval(pollInterval);pollInterval=null}setStatus(type,'Ready',false);document.getElementById(type+'RunBtn').disabled=false;document.getElementById(type+'StopBtn').disabled=true;document.getElementById(type+'Input').disabled=true;document.getElementById(type+'SubmitBtn').disabled=true}
+function scriptEnded(type){isRunning=false;if(pollInterval){clearInterval(pollInterval);pollInterval=null}setStatus(type,'Ready',false);document.getElementById(type+'RunBtn').disabled=false;document.getElementById(type+'StopBtn').disabled=true;document.getElementById(type+'Input').disabled=true;document.getElementById(type+'SubmitBtn').disabled=true;showPostRunBar(type)}
+function showPostRunBar(type){
+  const bar=document.getElementById(type+'PostRun');if(!bar)return;
+  // Fetch latest log to get filenames
+  fetch('/api/logs').then(r=>r.json()).then(log=>{
+    const entries=log.entries||[];if(!entries.length){bar.classList.add('hidden');return}
+    const latest=entries[entries.length-1];
+    const logBtn=document.getElementById(type+'PostRunLog');
+    const rbBtn=document.getElementById(type+'PostRunRollback');
+    const label=bar.querySelector('.post-run-label');
+    if(latest.status==='success'){label.textContent='✅ Run complete';label.style.color='var(--accent-green)'}
+    else if(latest.status==='failed'){label.textContent='❌ Run failed';label.style.color='var(--accent-red)'}
+    else if(latest.status==='stopped'){label.textContent='⚠️ Run stopped';label.style.color='var(--accent-orange)'}
+    if(latest.saved_log_file){logBtn.style.display='';logBtn.dataset.file=latest.saved_log_file}else{logBtn.style.display='none'}
+    if(latest.rollback_file){rbBtn.style.display='';rbBtn.dataset.file=latest.rollback_file;
+      const execBtn=document.getElementById(type+'PostRunExec');if(execBtn){execBtn.style.display='';execBtn.dataset.file=latest.rollback_file}
+    }else{rbBtn.style.display='none';const execBtn=document.getElementById(type+'PostRunExec');if(execBtn)execBtn.style.display='none'}
+    bar.classList.remove('hidden');
+  }).catch(()=>{});
+}
+function postRunDownloadLog(type){const btn=document.getElementById(type+'PostRunLog');if(btn&&btn.dataset.file)window.open('/api/saved-logs/'+encodeURIComponent(btn.dataset.file),'_blank')}
+function postRunDownloadRollback(type){const btn=document.getElementById(type+'PostRunRollback');if(btn&&btn.dataset.file)window.open('/api/rollback/'+encodeURIComponent(btn.dataset.file),'_blank')}
+function postRunExecRollback(type){
+  const btn=document.getElementById(type+'PostRunExec');
+  if(!btn||!btn.dataset.file)return;
+  if(!confirm('⚠️ This will REVERSE the deployment. Continue?'))return;
+  executeRollbackScript(btn.dataset.file,type);
+}
+function runRollbackFromLog(filename,deployType){
+  if(!confirm('⚠️ This will REVERSE the deployment. Continue?'))return;
+  // Switch to the deploy type's tab to show terminal output
+  const type=deployType||'vpc';
+  selectView(type);
+  setTimeout(()=>executeRollbackScript(filename,type),200);
+}
+function executeRollbackScript(filename,type){
+  if(isRunning){alert('A script is already running');return}
+  isRunning=true;setStatus(type,'Running',true);
+  const postBar=document.getElementById(type+'PostRun');if(postBar)postBar.classList.add('hidden');
+  document.getElementById(type+'RunBtn').disabled=true;document.getElementById(type+'StopBtn').disabled=false;
+  document.getElementById(type+'Input').disabled=false;document.getElementById(type+'SubmitBtn').disabled=false;
+  clearTerminal(type);
+  addLine(type,'[INFO] 🔄 Executing rollback script: '+filename,'info');
+  addLine(type,'[WARNING] This will REVERSE the previous deployment','warning');
+  if(credSet) addLine(type,'[CREDENTIALS] Auto-fill active — credentials will be injected','credential');
+  addLine(type,'[AUTO] Confirmation will be auto-injected','credential');
+  fetch('/api/run-rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:filename})})
+  .then(r=>r.json()).then(d=>{if(d.status==='started')startPolling(type);else{addLine(type,'[ERROR] '+d.message,'error');scriptEnded(type)}})
+  .catch(e=>{addLine(type,'[ERROR] '+e,'error');scriptEnded(type)});
+}
 function stopScript(){fetch('/api/stop',{method:'POST'}).then(()=>{addLine(currentView,'[STOPPED] Terminated by user','warning');scriptEnded(currentView)})}
 function submitInput(type){const input=document.getElementById(type+'Input');if(!input.value&&input.value!=='')return;addLine(type,'> '+input.value,'info');fetch('/api/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:input.value})});input.value=''}
 function handleInputKeypress(e,type){if(e.key==='Enter')submitInput(type)}
@@ -1419,11 +1529,12 @@ function refreshLog(){fetch('/api/logs').then(r=>r.json()).then(log=>{
   u('wTimeSaved').textContent=fmtMin(ts);u('wDeploys').textContent=td;u('wRuns').textContent=runs;
   if(u('logTimeSaved')){u('logTimeSaved').textContent=fmtMin(ts);u('logDeploys').textContent=td;u('logRuns').textContent=runs;u('logSuccessRate').textContent=rate}
   const c=u('logEntriesContainer');if(!e.length){c.innerHTML='<div class="log-empty"><div class="log-empty-icon">📭</div>No deployments yet.</div>';return}
-  const labels={vpc:'VPC',individual:'PORT',epgadd:'EPG ADD',epgdelete:'EPG DEL'};let h='';
+  const labels={vpc:'VPC',individual:'STATIC',epgadd:'EPG ADD',epgdelete:'EPG DEL'};let h='';
   for(let i=e.length-1;i>=0;i--){const x=e[i];
     let actionBtns='<div class="log-entry-actions">';
     if(x.saved_log_file) actionBtns+='<button class="log-action-btn download" onclick="downloadLog(\''+x.saved_log_file+'\')">📥 Log</button>';
     if(x.rollback_file) actionBtns+='<button class="log-action-btn rollback" onclick="downloadRollback(\''+x.rollback_file+'\')">↩ Rollback</button>';
+    if(x.rollback_file) actionBtns+='<button class="log-action-btn run-rollback" onclick="runRollbackFromLog(\''+x.rollback_file+'\',\''+x.type+'\')">▶ Run</button>';
     actionBtns+='</div>';
     h+='<div class="log-entry"><div class="log-entry-dot '+x.status+'"></div><div class="log-entry-info"><div class="log-entry-title">'+(x.csv_file||'inline')+'</div><div class="log-entry-meta">'+x.timestamp+' · '+x.deployment_count+' items · '+x.duration_seconds+'s</div></div><span class="log-entry-type '+x.type+'">'+(labels[x.type]||x.type)+'</span><div class="log-entry-saved">-'+fmtMin(x.time_saved_minutes)+'</div>'+actionBtns+'</div>'}
   c.innerHTML=h}).catch(()=>{})}
@@ -1468,6 +1579,7 @@ def api_run():
     current_run["csv_path"] = data.get('csv_path', '')
     current_run["start_time"] = None
     current_run["output_lines"] = []
+    current_run["is_rollback"] = False
     thread = threading.Thread(target=run_script_thread, args=(script_path, data.get('csv_path')))
     thread.daemon = True
     thread.start()
@@ -1493,6 +1605,31 @@ def api_input():
 def api_stop():
     stop_process()
     return jsonify({'status': 'stopped'})
+
+@app.route('/api/run-rollback', methods=['POST'])
+def api_run_rollback():
+    global running_process, output_queue, current_run
+    if running_process is not None:
+        return jsonify({'status': 'error', 'message': 'Script already running'})
+    data = request.json
+    filename = data.get('filename', '')
+    if not filename or '..' in filename or '/' in filename:
+        return jsonify({'status': 'error', 'message': 'Invalid rollback filename'})
+    script_path = os.path.join(ROLLBACK_FOLDER, filename)
+    if not os.path.exists(script_path):
+        return jsonify({'status': 'error', 'message': f'Rollback script not found: {filename}'})
+    while not output_queue.empty():
+        try: output_queue.get_nowait()
+        except: break
+    current_run["type"] = "rollback"
+    current_run["csv_path"] = ""
+    current_run["start_time"] = None
+    current_run["output_lines"] = []
+    current_run["is_rollback"] = True
+    thread = threading.Thread(target=run_script_thread, args=(script_path, None))
+    thread.daemon = True
+    thread.start()
+    return jsonify({'status': 'started'})
 
 @app.route('/api/settings', methods=['GET', 'POST'])
 def api_settings():
@@ -1521,15 +1658,21 @@ def api_upload():
 def api_credentials():
     global stored_credentials
     if request.method == 'GET':
-        return jsonify({'set': stored_credentials.get('set', False), 'username': stored_credentials.get('username', '')})
+        return jsonify({
+            'set': stored_credentials.get('set', False),
+            'username': stored_credentials.get('username', ''),
+            'apic_urls': stored_credentials.get('apic_urls', {"D1": "", "D2": "", "D3": ""})
+        })
     elif request.method == 'POST':
         data = request.json
         stored_credentials['username'] = data.get('username', '')
         stored_credentials['password'] = data.get('password', '')
+        if 'apic_urls' in data:
+            stored_credentials['apic_urls'] = data['apic_urls']
         stored_credentials['set'] = bool(stored_credentials['username'] and stored_credentials['password'])
         return jsonify({'status': 'saved', 'set': stored_credentials['set']})
     elif request.method == 'DELETE':
-        stored_credentials = {"username": None, "password": None, "set": False}
+        stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
         return jsonify({'status': 'cleared'})
 
 @app.route('/api/validate-csv', methods=['POST'])
@@ -1578,7 +1721,7 @@ if __name__ == '__main__':
     for folder in [UPLOAD_FOLDER, SAVED_LOGS_FOLDER, ROLLBACK_FOLDER]:
         os.makedirs(folder, exist_ok=True)
     print("\n" + "=" * 60)
-    print(" ACI BULK DEPLOYMENT WEB APPLICATION v1.3.0")
+    print(" ACI AUTOMATION CONSOLE v1.3.0")
     print("=" * 60)
     print("\n  Server running on http://localhost:5000")
     print("  Press Ctrl+C to stop")
