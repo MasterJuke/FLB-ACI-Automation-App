@@ -843,10 +843,13 @@ def generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_line
 # PROCESS MANAGEMENT
 # =============================================================================
 
-def find_port_in_output(desired_port, output_lines):
+def find_port_in_output(desired_port, output_lines, start_idx=0):
     """
     Scan terminal output for a numbered port menu and return the menu number
     that corresponds to the desired port (e.g. '1/93' → '73').
+
+    start_idx: only look at output_lines[start_idx:] so we never match a port
+               menu from a previous deployment within the same run.
 
     Handles output formats such as:
         73. eth1/93
@@ -859,8 +862,9 @@ def find_port_in_output(desired_port, output_lines):
         return None
     desired_slot, desired_num = m.group(1), m.group(2)
 
-    # Scan the last 200 lines (port lists can be long on busy switches)
-    for line in reversed(output_lines[-200:]):
+    # Scan forward from start_idx — the current deployment's menu always
+    # appears after start_idx, so we can never accidentally match a stale list.
+    for line in reversed(output_lines[start_idx:]):
         lm = re.match(r'^\s*(\d+)[.:)\s]+(?:eth)?(\d+)/(\d+)', line.strip())
         if lm:
             menu_num, slot, port_num = lm.group(1), lm.group(2), lm.group(3)
@@ -900,6 +904,7 @@ def run_script_thread(script_path, csv_path):
     current_run["last_prompt_type"] = None
     current_run["port_prompt_index"] = 0   # counts how many port prompts have been seen
     current_run["deployed_ports"] = []     # tracks actual port per CSV row
+    current_run["last_port_prompt_output_idx"] = 0  # output line index when last port prompt was answered
 
     try:
         env = os.environ.copy()
@@ -1024,10 +1029,13 @@ def run_script_thread(script_path, csv_path):
                             port_selections = current_run.get("port_selections", [])
                             port_idx = current_run.get("port_prompt_index", 0)
                             desired_iface = port_selections[port_idx] if port_idx < len(port_selections) else ''
+                            # Only search output lines printed after the previous port prompt
+                            # was answered — prevents matching a stale menu from an earlier row
+                            search_from = current_run.get("last_port_prompt_output_idx", 0)
 
                             if desired_iface:
                                 # Find the menu number that matches the desired interface
-                                menu_num = find_port_in_output(desired_iface, current_run["output_lines"])
+                                menu_num = find_port_in_output(desired_iface, current_run["output_lines"], search_from)
                                 if menu_num:
                                     time.sleep(0.1)
                                     try:
@@ -1053,6 +1061,9 @@ def run_script_thread(script_path, csv_path):
                                 except:
                                     current_run["deployed_ports"].append('')
 
+                            # Advance the search window so the next prompt never
+                            # looks back into this deployment's port list
+                            current_run["last_port_prompt_output_idx"] = len(current_run["output_lines"])
                             current_run["port_prompt_index"] = port_idx + 1
 
                         # AUTO-ROLLBACK CONFIRMATION
