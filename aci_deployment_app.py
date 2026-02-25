@@ -426,6 +426,7 @@ Actions to perform:
 
 import os
 import sys
+import time
 import requests
 import urllib3
 import re
@@ -460,9 +461,57 @@ def login_to_apic(session, apic_url, username, password):
         r = session.post(f"{{apic_url}}/api/aaaLogin.json",
             json={{"aaaUser": {{"attributes": {{"name": username, "pwd": password}}}}}},
             verify=False, timeout=30)
-        return r.status_code == 200
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                attrs = data['imdata'][0]['aaaLogin']['attributes']
+                lifetime = int(attrs.get('refreshTimeoutSeconds', 300))
+                return {{"ok": True, "lifetime": lifetime, "login_time": time.time()}}
+            except:
+                return {{"ok": True, "lifetime": 300, "login_time": time.time()}}
+        return {{"ok": False}}
     except:
-        return False
+        return {{"ok": False}}
+
+def refresh_token(session, apic_url):
+    try:
+        r = session.get(f"{{apic_url}}/api/aaaRefresh.json", verify=False, timeout=30)
+        if r.status_code == 200:
+            return time.time()
+    except:
+        pass
+    return None
+
+def ensure_fresh(session, apic_url, username, password, auth_state):
+    elapsed = time.time() - auth_state.get("login_time", 0)
+    remaining = auth_state.get("lifetime", 300) - elapsed
+    if remaining < 60:
+        print(f"  [INFO] Token aging ({{remaining:.0f}}s left), refreshing...")
+        new_time = refresh_token(session, apic_url)
+        if new_time:
+            auth_state["login_time"] = new_time
+            print(f"  [INFO] Token refreshed successfully")
+        else:
+            print(f"  [WARNING] Refresh failed, re-authenticating...")
+            result = login_to_apic(session, apic_url, username, password)
+            if result["ok"]:
+                auth_state.update(result)
+                print(f"  [INFO] Re-authenticated successfully")
+            else:
+                print(f"  [ERROR] Re-authentication failed!")
+
+def safe_request(method, session, url, apic_url, username, password, auth_state, **kwargs):
+    ensure_fresh(session, apic_url, username, password, auth_state)
+    kwargs.setdefault('verify', False)
+    kwargs.setdefault('timeout', 30)
+    r = getattr(session, method)(url, **kwargs)
+    if r.status_code in [401, 403] or 'token was invalid' in r.text.lower():
+        print(f"  [WARNING] Token invalid, re-authenticating...")
+        result = login_to_apic(session, apic_url, username, password)
+        if result["ok"]:
+            auth_state.update(result)
+            r = getattr(session, method)(url, **kwargs)
+    return r
 
 
 def main():
@@ -516,9 +565,10 @@ def main():
             continue
         print(f"\\n[INFO] Authenticating to {env}...")
         session = requests.Session()
-        if login_to_apic(session, APIC_URLS[env], username, password):
-            sessions[env] = session
-            print(f"       [SUCCESS]")
+        result = login_to_apic(session, APIC_URLS[env], username, password)
+        if result["ok"]:
+            sessions[env] = {{"session": session, "auth": result}}
+            print(f"       [SUCCESS] (token lifetime: {{result['lifetime']}}s)")
         else:
             print(f"       [FAILED]")
 
@@ -528,7 +578,8 @@ def main():
 
     # Use first available session
     env = list(sessions.keys())[0]
-    session = sessions[env]
+    session = sessions[env]["session"]
+    auth_state = sessions[env]["auth"]
     apic_url = APIC_URLS[env]
 
     print("\\n" + "=" * 60)
@@ -564,7 +615,7 @@ def main():
     try:
         path = "topology/pod-{POD_ID}/protpaths-{node1}-{node2}/pathep-[{pg}]"
         dn = f"uni/tn-{tenant}/ap-{ap}/epg-{epg}/rspathAtt-[{{path}}]"
-        r = session.delete(f"{{apic_url}}/api/mo/{{dn}}.json", verify=False, timeout=30)
+        r = safe_request('delete', session, f"{{apic_url}}/api/mo/{{dn}}.json", apic_url, username, password, auth_state)
         print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
     except Exception as e:
         print(f"      [ERROR] {{e}}")
@@ -578,7 +629,7 @@ def main():
     try:
         path = "topology/pod-{POD_ID}/paths-{node_id}/pathep-[eth{interface}]"
         dn = f"uni/tn-{tenant}/ap-{ap}/epg-{epg}/rspathAtt-[{{path}}]"
-        r = session.delete(f"{{apic_url}}/api/mo/{{dn}}.json", verify=False, timeout=30)
+        r = safe_request('delete', session, f"{{apic_url}}/api/mo/{{dn}}.json", apic_url, username, password, auth_state)
         print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
     except Exception as e:
         print(f"      [ERROR] {{e}}")
@@ -594,9 +645,9 @@ def main():
     # Action {action_num}: Delete Port Selector
     print(f"  [{action_num}] Deleting port selector: {name}...")
     try:
-        r = session.delete(
+        r = safe_request('delete', session,
             f"{{apic_url}}/api/mo/uni/infra/accportprof-{int_profile}/hports-{name}-typ-range.json",
-            verify=False, timeout=30)
+            apic_url, username, password, auth_state)
         print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
     except Exception as e:
         print(f"      [ERROR] {{e}}")
@@ -617,7 +668,7 @@ def main():
     # Action {action_num}: Delete {label}
     print(f"  [{action_num}] Deleting {label}: {name}...")
     try:
-        r = session.delete(f"{{apic_url}}/api/mo/{path}.json", verify=False, timeout=30)
+        r = safe_request('delete', session, f"{{apic_url}}/api/mo/{path}.json", apic_url, username, password, auth_state)
         print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
     except Exception as e:
         print(f"      [ERROR] {{e}}")
@@ -634,8 +685,9 @@ def main():
     print(f"  [{action_num}] Clearing description on node {node_id} eth{interface}...")
     try:
         dn = f"topology/pod-{POD_ID}/node-{node_id}/sys/phys-[eth{interface}]"
-        r = session.post(f"{{apic_url}}/api/node/mo/{{dn}}.json",
-            json={{"l1PhysIf": {{"attributes": {{"descr": ""}}}}}}, verify=False, timeout=30)
+        r = safe_request('post', session, f"{{apic_url}}/api/node/mo/{{dn}}.json",
+            apic_url, username, password, auth_state,
+            json={{"l1PhysIf": {{"attributes": {{"descr": ""}}}}}})
         print(f"      {{'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}}")
     except Exception as e:
         print(f"      [ERROR] {{e}}")
@@ -768,11 +820,13 @@ def run_script_thread(script_path, csv_path):
     global running_process, current_run
     current_run["start_time"] = time.time()
     current_run["output_lines"] = []
+    current_run["token_failures"] = 0
 
     try:
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
         env['ACI_WEB_UI'] = '1'
+        env['ACI_SESSION_TIMEOUT'] = '600'  # Request 10-min token from APIC
 
         running_process = subprocess.Popen(
             [sys.executable, '-u', script_path],
@@ -817,6 +871,16 @@ def run_script_thread(script_path, csv_path):
                     if line:
                         output_queue.put(('output', line))
                         current_run["output_lines"].append(line)
+                        # TOKEN FAILURE DETECTION
+                        ll = line.lower()
+                        if 'token was invalid' in ll or 'token timeout' in ll or (
+                                'not authenticated' in ll and 'error' in ll):
+                            current_run["token_failures"] = current_run.get("token_failures", 0) + 1
+                            if current_run["token_failures"] == 1:
+                                output_queue.put(('output',
+                                    '[WARNING] APIC token expired! Use aci_session_manager.py for auto-refresh.'))
+                                current_run["output_lines"].append(
+                                    '[WARNING] APIC token expired — deploy scripts need session manager')
 
                 buffer.clear()
                 if text: buffer.extend([bytes([b]) for b in text.encode('utf-8')])
