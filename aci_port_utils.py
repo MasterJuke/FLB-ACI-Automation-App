@@ -7,6 +7,7 @@ used across all ACI deployment scripts.
 
 Features:
 - Shared helpers: detect_environment, extract_node_id, parse_vlans, etc.
+- Multi-port CSV expansion: parse_ports("1/67, 1/68, 1/69") -> 3 entries
 - Full port inventory query (ALL ports, not just available)
 - Color-coded port display: green [AVAIL] / red [IN-USE]
 - ANSI colors for CLI + bracket tags for web UI parsing
@@ -15,10 +16,12 @@ Features:
 - VPC common port matching across switch pairs
 - Asymmetric VPC port selection (different port per switch)
 - Existing policy group query & reuse (query by link level + AEP)
+- Port binding query & overwrite (query/delete all fvRsPathAtt on a port)
 
 CCIE Automation Exam Relevance:
 - ACI REST API queries (l1PhysIf, infraPortBlk, fvRsPathAtt)
 - Subtree queries with rsp-subtree=children for policy group introspection
+- Class-level reverse lookups (fvRsPathAtt filtered by tDn)
 - Modular code design / reusable libraries
 - Parallel API calls with ThreadPoolExecutor
 - Infrastructure state validation before deployment
@@ -26,16 +29,18 @@ CCIE Automation Exam Relevance:
 Usage:
     from aci_port_utils import (
         detect_environment, extract_node_id, parse_vlans, parse_port,
-        prompt_input, get_all_ports_with_status, display_port_selection,
+        parse_ports, prompt_input,
+        get_all_ports_with_status, display_port_selection,
         find_common_ports_with_status, display_vpc_port_selection,
         display_vpc_independent_port_selection,
         cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
         query_existing_access_policy_groups, query_existing_vpc_policy_groups,
-        display_policy_group_selection
+        display_policy_group_selection,
+        query_all_bindings_on_port, delete_all_bindings_on_port
     )
 
 Author: Network Automation
-Version: 1.2.0 — Added PG reuse query/selection + full port cleanup + asymmetric VPC
+Version: 1.3.0 — Added PG reuse, port binding query/delete, multi-port parse
 """
 
 import os
@@ -134,6 +139,31 @@ def parse_port(port_string):
     if "/" in port_string:
         return port_string
     return f"1/{port_string}"
+
+
+def parse_ports(port_string):
+    """
+    Parse a comma-separated port string into a list of individual ports.
+
+    Handles multi-port CSV entries like "1/67, 1/68, 1/69" or "eth1/67,eth1/68".
+    Each port is normalized through parse_port().
+
+    CCIE Automation Note:
+    This is a CSV pre-processing pattern. In ACI, each fvRsPathAtt is a
+    separate relationship object on a unique path DN — there's no concept
+    of a multi-port binding. So "1/67, 1/68" in a CSV must expand to
+    separate API calls, each targeting a different pathep DN.
+
+    Returns:
+        List of normalized port strings, e.g. ['1/67', '1/68', '1/69']
+    """
+    if not port_string or not str(port_string).strip():
+        return []
+
+    raw = str(port_string).strip()
+    # Split on commas, normalize each piece
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return [parse_port(p) for p in parts]
 
 
 def parse_interface(port_string):
@@ -1282,6 +1312,123 @@ def display_policy_group_selection(policy_groups, pg_type="access", link_level=N
         except ValueError:
             pass
         print("  [ERROR] Invalid selection")
+
+
+# =============================================================================
+# EPG BINDING QUERY & OVERWRITE FUNCTIONS
+# =============================================================================
+# Used by EPG Add (overwrite mode) to wipe all existing bindings on a port
+# before deploying new ones. Also reusable by any script that needs to
+# discover what's currently bound to a physical port.
+#
+# CCIE Automation Note:
+# fvRsPathAtt is queried at the CLASS level with a tDn filter — this is
+# a "reverse lookup" pattern. Instead of querying each EPG individually to
+# check if it has a binding to our port (O(N) calls where N = number of EPGs),
+# we query the fvRsPathAtt class globally filtered by the port's path DN.
+# This returns ALL bindings on that port in a SINGLE API call regardless of
+# which tenant/AP/EPG they belong to. The exam tests this pattern heavily.
+
+def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
+    """
+    Query ALL fvRsPathAtt bindings on a specific port across all tenants/EPGs.
+
+    Uses class-level query with tDn filter — single API call returns every
+    EPG binding on the port.
+
+    Args:
+        session: requests.Session with APIC auth
+        apic_url: APIC base URL
+        node_id: Leaf node ID (e.g., '1301')
+        port: Port string (e.g., '1/68')
+        pod_id: Pod ID (default '1')
+
+    Returns:
+        List of dicts: [{"dn": "...", "tDn": "...", "encap": "vlan-32",
+                         "mode": "regular", "tenant": "...",
+                         "app_profile": "...", "epg": "...", "vlan": 32}, ...]
+    """
+    eth_port = f"eth{port}" if not port.startswith("eth") else port
+    path_dn = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{eth_port}]"
+
+    try:
+        url = (f"{apic_url}/api/class/fvRsPathAtt.json"
+               f"?query-target-filter=eq(fvRsPathAtt.tDn,\"{path_dn}\")")
+        resp = session.get(url, verify=False, timeout=30)
+        if resp.status_code != 200:
+            return []
+
+        bindings = []
+        for item in resp.json().get("imdata", []):
+            attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+            dn = attrs.get("dn", "")
+            encap = attrs.get("encap", "")
+
+            # Extract tenant, app_profile, epg from DN
+            # DN format: uni/tn-{TENANT}/ap-{AP}/epg-{EPG}/rspathAtt-[...]
+            tn_match = re.search(r'/tn-([^/]+)/', dn)
+            ap_match = re.search(r'/ap-([^/]+)/', dn)
+            epg_match = re.search(r'/epg-([^/]+)/', dn)
+            vlan_match = re.search(r'vlan-(\d+)', encap)
+
+            bindings.append({
+                "dn": dn,
+                "tDn": attrs.get("tDn", ""),
+                "encap": encap,
+                "mode": attrs.get("mode", ""),
+                "tenant": tn_match.group(1) if tn_match else "",
+                "app_profile": ap_match.group(1) if ap_match else "",
+                "epg": epg_match.group(1) if epg_match else "",
+                "vlan": int(vlan_match.group(1)) if vlan_match else 0
+            })
+
+        bindings.sort(key=lambda x: x.get("vlan", 0))
+        return bindings
+    except Exception as e:
+        print(f"    [WARNING] Error querying bindings on port: {e}")
+        return []
+
+
+def delete_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
+    """
+    Delete ALL fvRsPathAtt bindings on a specific port.
+
+    Queries all bindings first, then deletes each one.
+    Returns (deleted_count, failed_count, binding_details).
+
+    binding_details is a list of {"vlan", "epg", "success"} for logging.
+    """
+    bindings = query_all_bindings_on_port(session, apic_url, node_id, port, pod_id)
+
+    if not bindings:
+        return 0, 0, []
+
+    deleted = 0
+    failed = 0
+    details = []
+
+    for b in bindings:
+        try:
+            resp = session.delete(
+                f"{apic_url}/api/mo/{b['dn']}.json",
+                verify=False, timeout=30
+            )
+            ok = resp.status_code == 200
+        except Exception:
+            ok = False
+
+        details.append({
+            "vlan": b["vlan"],
+            "epg": b["epg"],
+            "tenant": b["tenant"],
+            "success": ok
+        })
+        if ok:
+            deleted += 1
+        else:
+            failed += 1
+
+    return deleted, failed, details
 
 
 # =============================================================================
