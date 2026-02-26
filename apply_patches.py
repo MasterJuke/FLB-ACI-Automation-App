@@ -219,6 +219,52 @@ EPGADD_FUNCS_TO_REMOVE = COMMON_FUNCS_TO_REMOVE + [
 def patch_vpc_port_display(content):
     """Replace VPC port query/display with asymmetric VPC support + cleanup."""
 
+    # --- PATCH 0: Update import block if already patched with old imports ---
+    # Match any previous version of the VPC import and upgrade to current
+    import_patterns = [
+        # v1.0 — no cleanup, no independent, no PG reuse
+        """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, find_common_ports_with_status,
+    display_vpc_port_selection, get_validated_available_ports,
+    find_common_validated_ports
+)""",
+        # v1.1 — cleanup but no independent/PG reuse
+        """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, find_common_ports_with_status,
+    display_vpc_port_selection, get_validated_available_ports,
+    find_common_validated_ports,
+    cleanup_vpc_port_for_redeployment
+)""",
+        # v1.1b — cleanup + independent but no PG reuse
+        """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, find_common_ports_with_status,
+    display_vpc_port_selection, display_vpc_independent_port_selection,
+    get_validated_available_ports, find_common_validated_ports,
+    cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment
+)""",
+    ]
+
+    current_vpc_import = """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, find_common_ports_with_status,
+    display_vpc_port_selection, display_vpc_independent_port_selection,
+    get_validated_available_ports, find_common_validated_ports,
+    cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
+    query_existing_vpc_policy_groups, display_policy_group_selection
+)"""
+
+    for old_imp in import_patterns:
+        if old_imp in content:
+            content, _ = find_and_replace(content, old_imp, current_vpc_import, "VPC: update imports")
+            break
+
     # --- PATCH A: Validation header text ---
     old_header = '''        print(f"  Querying and validating ports (checking 4 criteria)...")
         print(f"    1. Usage = \'discovery\'")
@@ -560,6 +606,39 @@ def patch_vpc_port_display(content):
 def patch_individual_port_display(content):
     """Replace individual port query and display logic with new all-ports version."""
 
+    # --- PATCH 0: Update import block if already patched with old imports ---
+    import_patterns = [
+        # v1.0 — no cleanup, no PG reuse
+        """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, display_port_selection,
+    get_validated_available_ports
+)""",
+        # v1.1 — cleanup but no PG reuse
+        """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, display_port_selection,
+    get_validated_available_ports,
+    cleanup_port_for_redeployment
+)""",
+    ]
+
+    current_ind_import = """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, display_port_selection,
+    get_validated_available_ports,
+    cleanup_port_for_redeployment,
+    query_existing_access_policy_groups, display_policy_group_selection
+)"""
+
+    for old_imp in import_patterns:
+        if old_imp in content:
+            content, _ = find_and_replace(content, old_imp, current_ind_import, "Individual: update imports")
+            break
+
     # --- Patch the validation header text ---
     old_header = '''        print(f"  Querying and validating ports (checking 4 criteria)...")
         print(f"    1. Usage = \'discovery\'")
@@ -757,6 +836,21 @@ def patch_individual_port_display(content):
 
 def patch_epg_add(content):
     """Patch EPG Add script: multi-port CSV expansion + overwrite mode."""
+
+    # --- PATCH 0: Update import block if already patched with old imports ---
+    old_epg_import = """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_port,
+    prompt_input
+)"""
+
+    new_epg_import = """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_port,
+    parse_ports, prompt_input,
+    query_all_bindings_on_port, delete_all_bindings_on_port
+)"""
+
+    if old_epg_import in content:
+        content, _ = find_and_replace(content, old_epg_import, new_epg_import, "EPG Add: update imports")
 
     # --- PATCH A: Multi-port CSV loader ---
     # Replace load_epg_add_csv to expand "1/67, 1/68, 1/69" in PORT column
