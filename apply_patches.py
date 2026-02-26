@@ -678,6 +678,15 @@ def patch_individual_port_display(content):
 
     content, _ = find_and_replace(content, old_query, new_query, "Individual port query/display")
 
+    # --- Fix variable rename: ports -> all_ports in preview call ---
+    if "display_deployment_preview(config, all_profiles, all_link_levels, all_aeps, ports)" in content:
+        content, _ = find_and_replace(
+            content,
+            "display_deployment_preview(config, all_profiles, all_link_levels, all_aeps, ports)",
+            "display_deployment_preview(config, all_profiles, all_link_levels, all_aeps, all_ports)",
+            "Individual: fix ports -> all_ports variable rename"
+        )
+
     # --- Inject cleanup before deploy_individual_port() call ---
     old_indiv_deploy_call = '''            elif confirm in ['Y', 'YES']:
                 # Deploy
