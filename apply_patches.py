@@ -143,7 +143,8 @@ EPGADD_IMPORT = """
 # Shared utilities (consolidated from duplicated helpers)
 from aci_port_utils import (
     detect_environment, extract_node_id, parse_vlans, parse_port,
-    prompt_input
+    parse_ports, prompt_input,
+    query_all_bindings_on_port, delete_all_bindings_on_port
 )
 """
 
@@ -751,6 +752,227 @@ def patch_individual_port_display(content):
 
 
 # =============================================================================
+# EPG ADD PATCHES
+# =============================================================================
+
+def patch_epg_add(content):
+    """Patch EPG Add script: multi-port CSV expansion + overwrite mode."""
+
+    # --- PATCH A: Multi-port CSV loader ---
+    # Replace load_epg_add_csv to expand "1/67, 1/68, 1/69" in PORT column
+    old_csv_loader = '''def load_epg_add_csv(filename):
+    """Load EPG add deployment CSV file."""
+    try:
+        with open(filename, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            deployments = []
+            for row in reader:
+                normalized = {k.strip().upper(): v.strip() if v else "" for k, v in row.items() if k}
+                deployments.append({
+                    "switch": normalized.get("SWITCH", ""),
+                    "port": parse_port(normalized.get("PORT", "")),
+                    "vlans": normalized.get("VLANS", "")
+                })
+            return deployments
+    except FileNotFoundError:
+        print(f"[ERROR] File not found: {filename}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] Failed to load CSV: {e}")
+        return None'''
+
+    new_csv_loader = '''def load_epg_add_csv(filename):
+    """Load EPG add deployment CSV file.
+    
+    Supports multi-port entries: PORT column can contain comma-separated
+    ports like "1/67, 1/68, 1/69" which expand to separate deployments.
+    """
+    try:
+        with open(filename, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            deployments = []
+            for row in reader:
+                normalized = {k.strip().upper(): v.strip() if v else "" for k, v in row.items() if k}
+                switch = normalized.get("SWITCH", "")
+                vlans = normalized.get("VLANS", "")
+                raw_port = normalized.get("PORT", "")
+                
+                # Expand multi-port entries ("1/67, 1/68, 1/69" -> 3 rows)
+                ports = parse_ports(raw_port)
+                if not ports:
+                    ports = [parse_port(raw_port)]
+                
+                for port in ports:
+                    deployments.append({
+                        "switch": switch,
+                        "port": port,
+                        "vlans": vlans
+                    })
+            
+            return deployments
+    except FileNotFoundError:
+        print(f"[ERROR] File not found: {filename}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] Failed to load CSV: {e}")
+        return None'''
+
+    content, _ = find_and_replace(content, old_csv_loader, new_csv_loader, "EPG Add: multi-port CSV loader")
+
+    # --- PATCH B: Info line after loading showing expansion ---
+    old_loaded = '''    print(f"[INFO] Loaded {len(deployments)} deployment(s)")
+    
+    # Select run mode'''
+
+    new_loaded = '''    print(f"[INFO] Loaded {len(deployments)} deployment(s)")
+    
+    # Show unique switch+port combos vs total rows (multi-port expansion)
+    unique_ports = set((d['switch'], d['port']) for d in deployments)
+    if len(unique_ports) != len(deployments):
+        ports_per = len(deployments) / max(len(unique_ports), 1)
+        print(f"       ({len(unique_ports)} unique switch+port combos, avg {ports_per:.0f} VLANs each)")
+    
+    # Select run mode'''
+
+    content, _ = find_and_replace(content, old_loaded, new_loaded, "EPG Add: expansion info")
+
+    # --- PATCH C: EPG Mode toggle after binding mode ---
+    old_post_binding = '''    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    sys.stdout.write("\\nUsername: ")
+    sys.stdout.flush()
+    username = input().strip()'''
+
+    new_post_binding = '''    # EPG Mode: Add or Overwrite
+    print("\\n" + "-" * 70)
+    print(" EPG MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Add new EPG bindings (keep existing)")
+    print("  [2] Overwrite - Delete ALL existing bindings first, then add new")
+    print("                  (clean replacement of port EPGs)")
+    
+    while True:
+        sys.stdout.write("\\nSelect mode (1/2) [default=1]: ")
+        sys.stdout.flush()
+        epg_mode_choice = input().strip()
+        if epg_mode_choice in ["", "1", "2"]:
+            break
+    overwrite_mode = (epg_mode_choice == '2')
+    
+    if overwrite_mode:
+        print("\\n  [WARNING] Overwrite mode: ALL existing EPG bindings on each port")
+        print("            will be DELETED before adding the new ones.")
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    sys.stdout.write("\\nUsername: ")
+    sys.stdout.flush()
+    username = input().strip()'''
+
+    content, _ = find_and_replace(content, old_post_binding, new_post_binding, "EPG Add: overwrite mode toggle")
+
+    # --- PATCH D: Inject overwrite deletion before Phase 4 deployment ---
+    old_phase4_deploy = '''    # Deploy
+    print("\\n[INFO] Deploying bindings...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for b in new_bindings:'''
+
+    new_phase4_deploy = '''    # Overwrite mode: delete existing bindings first
+    overwrite_deleted = 0
+    if overwrite_mode:
+        print("\\n[INFO] Overwrite mode — removing existing EPG bindings first...")
+        
+        # Build unique set of switch+port combinations
+        ports_to_clean = set()
+        for b in all_bindings:
+            ports_to_clean.add((b['switch'], b['port'], b['node_id'], b['env']))
+        
+        for switch, port, node_id, env in sorted(ports_to_clean):
+            if env not in sessions:
+                continue
+            session = sessions[env]
+            apic_url = APIC_URLS[env]
+            
+            # Query all existing bindings on this port
+            existing = query_all_bindings_on_port(session, apic_url, node_id, port, POD_ID)
+            if existing:
+                print(f"  {switch} port {port}: {len(existing)} existing binding(s)")
+                del_ok, del_fail, del_details = delete_all_bindings_on_port(
+                    session, apic_url, node_id, port, POD_ID
+                )
+                for d in del_details:
+                    status = "[DELETED]" if d['success'] else "[FAIL]"
+                    print(f"    {status} VLAN {d['vlan']} ({d['epg']})")
+                overwrite_deleted += del_ok
+            else:
+                print(f"  {switch} port {port}: no existing bindings")
+        
+        print(f"\\n[INFO] Overwrite cleanup done: {overwrite_deleted} binding(s) removed")
+    
+    # Deploy new bindings
+    print("\\n[INFO] Deploying bindings...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    # In overwrite mode, deploy ALL bindings (not just "new" ones since we just wiped the port)
+    deploy_list = all_bindings if overwrite_mode else new_bindings
+    
+    for b in deploy_list:'''
+
+    content, _ = find_and_replace(content, old_phase4_deploy, new_phase4_deploy, "EPG Add: overwrite deletion + deploy list")
+
+    # --- PATCH E: Update Phase 3 preview to show overwrite info ---
+    old_preview_summary = '''    print(f"\\n  Total bindings: {len(all_bindings)}")
+    print(f"  New bindings:   {len(new_bindings)}")
+    print(f"  Already exist:  {len(existing_bindings)} (will be skipped)")'''
+
+    new_preview_summary = '''    print(f"\\n  Total bindings: {len(all_bindings)}")
+    print(f"  New bindings:   {len(new_bindings)}")
+    print(f"  Already exist:  {len(existing_bindings)}" + 
+          (" (will be RE-DEPLOYED after wipe)" if overwrite_mode else " (will be skipped)"))
+    if overwrite_mode:
+        unique_ports = set((b['switch'], b['port']) for b in all_bindings)
+        print(f"  [OVERWRITE] {len(unique_ports)} port(s) will have ALL existing bindings wiped first")'''
+
+    content, _ = find_and_replace(content, old_preview_summary, new_preview_summary, "EPG Add: preview overwrite info")
+
+    # --- PATCH F: Update final summary for overwrite ---
+    old_summary = '''    print(f"\\n  Success: {success_count}")
+    print(f"  Failed:  {fail_count}")
+    print(f"  Skipped: {len(existing_bindings)} (already existed)")'''
+
+    new_summary = '''    print(f"\\n  Success: {success_count}")
+    print(f"  Failed:  {fail_count}")
+    if overwrite_mode:
+        print(f"  Wiped:   {overwrite_deleted} (existing bindings removed)")
+    else:
+        print(f"  Skipped: {len(existing_bindings)} (already existed)")'''
+
+    content, _ = find_and_replace(content, old_summary, new_summary, "EPG Add: final summary with overwrite count")
+
+    # --- PATCH G: Fix deploy confirmation to show correct count ---
+    old_confirm = '''    print(f"\\nReady to deploy {len(new_bindings)} binding(s)")'''
+
+    new_confirm = '''    deploy_count = len(all_bindings) if overwrite_mode else len(new_bindings)
+    if overwrite_mode:
+        print(f"\\nReady to OVERWRITE: wipe existing + deploy {deploy_count} binding(s)")
+    else:
+        print(f"\\nReady to deploy {len(new_bindings)} binding(s)")'''
+
+    content, _ = find_and_replace(content, old_confirm, new_confirm, "EPG Add: confirm count for overwrite")
+
+    return content
+
+
+# =============================================================================
 # WEB APP PATCH
 # =============================================================================
 
@@ -909,6 +1131,7 @@ def main():
         os.path.join(BASE_DIR, "aci_bulk_epg_add.py"),
         EPGADD_IMPORT,
         EPGADD_FUNCS_TO_REMOVE,
+        port_patcher=patch_epg_add,
         label="EPG Add"
     )
 
