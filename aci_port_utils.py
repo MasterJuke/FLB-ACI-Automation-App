@@ -1315,6 +1315,99 @@ def display_policy_group_selection(policy_groups, pg_type="access", link_level=N
 
 
 # =============================================================================
+# APIC TOKEN REFRESH
+# =============================================================================
+# APIC tokens expire after refreshTimeoutSeconds (default 300s / 5 minutes).
+# In batch deployments with interactive port selection, the token can easily
+# expire between deployments. These helpers keep the session alive.
+#
+# CCIE Automation Note:
+# The APIC uses cookie-based auth (APIC-cookie). On login (aaaLogin), you get
+# a token with a refreshTimeoutSeconds. Before it expires, call aaaRefresh to
+# get a new token. If it already expired, you must re-authenticate via aaaLogin.
+# The exam tests this lifecycle — particularly in scripts that run >5 minutes.
+# Strategy: proactive refresh (check age before each operation) + reactive
+# retry (catch 403 and re-auth). This is the same pattern used in production
+# SDKs like cobra/acitoolkit.
+
+import time as _time
+
+def refresh_apic_token(session, apic_url):
+    """
+    Refresh APIC token via /api/aaaRefresh.json.
+    
+    Returns new token lifetime (seconds) on success, None on failure.
+    """
+    try:
+        resp = session.get(f"{apic_url}/api/aaaRefresh.json", verify=False, timeout=30)
+        if resp.status_code == 200:
+            try:
+                attrs = resp.json()['imdata'][0]['aaaLogin']['attributes']
+                return int(attrs.get('refreshTimeoutSeconds', 300))
+            except (KeyError, IndexError, ValueError):
+                return 300
+    except Exception:
+        pass
+    return None
+
+
+def ensure_token_fresh(session, apic_url, token_state):
+    """
+    Check token age and refresh proactively if needed.
+    
+    token_state is a mutable dict: {"login_time": float, "lifetime": int}
+    Call this before each deployment iteration to prevent 403 errors.
+    
+    Returns True if token is fresh, False if refresh failed (caller should re-auth).
+    """
+    if not token_state:
+        return True  # No state tracked, skip
+    
+    elapsed = _time.time() - token_state.get('login_time', _time.time())
+    remaining = token_state.get('lifetime', 300) - elapsed
+    
+    # Refresh when <60 seconds remain
+    if remaining < 60:
+        new_lifetime = refresh_apic_token(session, apic_url)
+        if new_lifetime:
+            token_state['login_time'] = _time.time()
+            token_state['lifetime'] = new_lifetime
+            print(f"  [TOKEN] Refreshed (was {remaining:.0f}s remaining, new lifetime: {new_lifetime}s)")
+            return True
+        else:
+            print(f"  [TOKEN] Refresh failed — token may have expired")
+            return False
+    
+    return True
+
+
+def reauth_apic(session, apic_url, username, password, token_state=None):
+    """
+    Full re-authentication to APIC (when refresh fails / token already expired).
+    
+    Updates token_state in-place if provided.
+    Returns True on success, False on failure.
+    """
+    payload = {"aaaUser": {"attributes": {"name": username, "pwd": password}}}
+    try:
+        resp = session.post(f"{apic_url}/api/aaaLogin.json", json=payload, verify=False, timeout=30)
+        if resp.status_code == 200:
+            if token_state is not None:
+                token_state['login_time'] = _time.time()
+                try:
+                    attrs = resp.json()['imdata'][0]['aaaLogin']['attributes']
+                    token_state['lifetime'] = int(attrs.get('refreshTimeoutSeconds', 300))
+                except (KeyError, IndexError, ValueError):
+                    token_state['lifetime'] = 300
+            print(f"  [TOKEN] Re-authenticated successfully")
+            return True
+    except Exception:
+        pass
+    print(f"  [TOKEN] Re-authentication FAILED")
+    return False
+
+
+# =============================================================================
 # EPG BINDING QUERY & OVERWRITE FUNCTIONS
 # =============================================================================
 # Used by EPG Add (overwrite mode) to wipe all existing bindings on a port
