@@ -1960,19 +1960,16 @@ def main():
         content = read_file(app_path)
         original = content
 
-        if ".port-avail" in content:
-            print(f"  [SKIP] Already patched (CSS found)")
-        else:
-            content = patch_deployment_app(content)
+        content = patch_deployment_app(content)
 
-            if content != original:
-                if not DRY_RUN:
-                    if BACKUP:
-                        backup_file(app_path)
-                    write_file(app_path, content)
-                print(f"\n  [DONE] Web UI patched")
-            else:
-                print(f"\n  [NO CHANGES]")
+        if content != original:
+            if not DRY_RUN:
+                if BACKUP:
+                    backup_file(app_path)
+                write_file(app_path, content)
+            print(f"\n  [DONE] Web UI patched")
+        else:
+            print(f"\n  [NO CHANGES] Web UI already up to date")
     else:
         print(f"\n  [NOT FOUND] aci_deployment_app.py")
 
