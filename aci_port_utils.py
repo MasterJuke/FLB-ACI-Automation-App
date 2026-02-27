@@ -815,6 +815,212 @@ def display_vpc_independent_port_selection(ports1, ports2, node1, node2):
 # (bindings → selector → PG). Understanding this ordering is critical
 # for the ACI programmability exam — deleting a selector before its
 # bindings would leave orphaned fvRsPathAtt objects in the fabric.
+#
+# The multi-tier rollback extends this: before deleting the old state,
+# we capture it as structured [ROLLBACK:STATE] markers in stdout. The
+# web UI parses these markers to build a rollback script that can both
+# DELETE new objects AND RESTORE the previous configuration. This is
+# analogous to ACI's config snapshot/rollback (configSnapshot +
+# configImportP) but at the individual port level.
+
+import json as _json
+
+def emit_rollback_state(state_dict):
+    """
+    Print a structured state marker that the rollback generator can parse.
+    
+    Format: [ROLLBACK:STATE] {"type":"binding","vlan":"32",...}
+    
+    The web UI collects these markers from terminal output and uses them
+    to generate restore actions in the rollback script.
+    """
+    print(f"[ROLLBACK:STATE] {_json.dumps(state_dict, separators=(',', ':'))}")
+
+
+def capture_port_description(session, apic_url, node_id, port, pod_id="1"):
+    """
+    Query the current port description from l1PhysIf.
+    Returns the description string, or empty string if none/error.
+    """
+    eth = f"eth{port}" if not port.startswith("eth") else port
+    url = (f"{apic_url}/api/mo/topology/pod-{pod_id}/node-{node_id}"
+           f"/sys/phys-[{eth}].json")
+    try:
+        r = session.get(url, verify=False, timeout=15)
+        if r.status_code == 200:
+            data = r.json().get("imdata", [])
+            if data:
+                return data[0].get("l1PhysIf", {}).get("attributes", {}).get("descr", "")
+    except Exception:
+        pass
+    return ""
+
+
+def capture_selector_policy_group(session, apic_url, interface_profile, selector_name):
+    """
+    Query the policy group DN that a port selector points to.
+    Returns (pg_name, pg_type) where pg_type is 'vpc' or 'access', or (None, None).
+    """
+    url = (f"{apic_url}/api/mo/uni/infra/accportprof-{interface_profile}"
+           f"/hports-{selector_name}-typ-range.json"
+           f"?query-target=children&target-subtree-class=infraRsAccBaseGrp")
+    try:
+        r = session.get(url, verify=False, timeout=15)
+        if r.status_code == 200:
+            for child in r.json().get("imdata", []):
+                tdn = child.get("infraRsAccBaseGrp", {}).get("attributes", {}).get("tDn", "")
+                pg_match = re.search(r'accbundle-(.+)$', tdn)
+                if pg_match:
+                    return pg_match.group(1), "vpc"
+                pg_match = re.search(r'accportgrp-(.+)$', tdn)
+                if pg_match:
+                    return pg_match.group(1), "access"
+    except Exception:
+        pass
+    return None, None
+
+
+def capture_and_emit_port_state(session, apic_url, node_id, interface,
+                                 interface_profile, pod_id="1", node2=None):
+    """
+    Capture the full state of a port BEFORE cleanup/overwrite and emit
+    [ROLLBACK:STATE] markers for each component.
+    
+    Captures: description, EPG bindings, selector name, policy group name.
+    For VPC (node2 provided): captures both node descriptions and VPC bindings.
+    
+    Returns the captured state dict for optional local use.
+    """
+    state = {"bindings": [], "description": "", "description2": "",
+             "selector": None, "policy_group": None, "pg_type": None}
+    
+    eth_iface = f"eth{interface}" if not interface.startswith("eth") else interface
+    port_num = interface.split('/')[-1]
+    
+    # --- Capture description(s) ---
+    desc = capture_port_description(session, apic_url, node_id, interface, pod_id)
+    state["description"] = desc
+    if desc:
+        emit_rollback_state({
+            "type": "description", "node": str(node_id),
+            "port": interface, "value": desc
+        })
+    
+    if node2:
+        desc2 = capture_port_description(session, apic_url, node2, interface, pod_id)
+        state["description2"] = desc2
+        if desc2:
+            emit_rollback_state({
+                "type": "description", "node": str(node2),
+                "port": interface, "value": desc2
+            })
+    
+    # --- Capture EPG bindings (individual path) ---
+    bindings = query_all_bindings_on_port(session, apic_url, node_id, interface, pod_id)
+    for b in bindings:
+        state["bindings"].append(b)
+        emit_rollback_state({
+            "type": "binding", "node": str(node_id), "port": interface,
+            "vlan": str(b["vlan"]), "tenant": b["tenant"],
+            "ap": b["app_profile"], "epg": b["epg"],
+            "mode": b.get("mode", "regular"),
+            "path_type": "individual"
+        })
+    
+    # --- Capture VPC bindings (protpaths) if VPC ---
+    if node2:
+        n1, n2 = (str(node_id), str(node2)) if int(node_id) < int(node2) else (str(node2), str(node_id))
+        # Find old VPC PG first to query protpath bindings
+        try:
+            url = (f"{apic_url}/api/class/infraPortBlk.json"
+                   f"?query-target-filter=and("
+                   f"eq(infraPortBlk.fromPort,\"{port_num}\"),"
+                   f"eq(infraPortBlk.toPort,\"{port_num}\"))")
+            resp = session.get(url, verify=False, timeout=30)
+            if resp.status_code == 200:
+                for item in resp.json().get("imdata", []):
+                    dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
+                    if interface_profile in dn:
+                        sel_match = re.search(r'hports-(.+?)-typ-range', dn)
+                        if sel_match:
+                            selector_name = sel_match.group(1)
+                            state["selector"] = selector_name
+                            pg_name, pg_type = capture_selector_policy_group(
+                                session, apic_url, interface_profile, selector_name)
+                            if pg_name:
+                                state["policy_group"] = pg_name
+                                state["pg_type"] = pg_type
+                                emit_rollback_state({
+                                    "type": "selector", "name": selector_name,
+                                    "profile": interface_profile, "port": interface,
+                                    "policy_group": pg_name, "pg_type": pg_type or "vpc"
+                                })
+                                # Query VPC protpath bindings
+                                vpc_path = f"topology/pod-{pod_id}/protpaths-{n1}-{n2}/pathep-[{pg_name}]"
+                                vpc_url = (f"{apic_url}/api/class/fvRsPathAtt.json"
+                                           f"?query-target-filter=eq(fvRsPathAtt.tDn,\"{vpc_path}\")")
+                                vpc_resp = session.get(vpc_url, verify=False, timeout=30)
+                                if vpc_resp.status_code == 200:
+                                    for vitem in vpc_resp.json().get("imdata", []):
+                                        attrs = vitem.get("fvRsPathAtt", {}).get("attributes", {})
+                                        vdn = attrs.get("dn", "")
+                                        encap = attrs.get("encap", "")
+                                        mode = attrs.get("mode", "regular")
+                                        tn_m = re.search(r'/tn-([^/]+)/', vdn)
+                                        ap_m = re.search(r'/ap-([^/]+)/', vdn)
+                                        epg_m = re.search(r'/epg-([^/]+)/', vdn)
+                                        vlan_m = re.search(r'vlan-(\d+)', encap)
+                                        if tn_m and ap_m and epg_m and vlan_m:
+                                            emit_rollback_state({
+                                                "type": "binding",
+                                                "node": n1, "node2": n2,
+                                                "port": interface,
+                                                "vlan": vlan_m.group(1),
+                                                "tenant": tn_m.group(1),
+                                                "ap": ap_m.group(1),
+                                                "epg": epg_m.group(1),
+                                                "mode": mode,
+                                                "path_type": "vpc",
+                                                "vpc_pg": pg_name
+                                            })
+        except Exception:
+            pass
+    else:
+        # Individual port — find selector and PG
+        try:
+            url = (f"{apic_url}/api/class/infraPortBlk.json"
+                   f"?query-target-filter=and("
+                   f"eq(infraPortBlk.fromPort,\"{port_num}\"),"
+                   f"eq(infraPortBlk.toPort,\"{port_num}\"))")
+            resp = session.get(url, verify=False, timeout=30)
+            if resp.status_code == 200:
+                for item in resp.json().get("imdata", []):
+                    dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
+                    if interface_profile in dn:
+                        sel_match = re.search(r'hports-(.+?)-typ-range', dn)
+                        if sel_match:
+                            selector_name = sel_match.group(1)
+                            state["selector"] = selector_name
+                            pg_name, pg_type = capture_selector_policy_group(
+                                session, apic_url, interface_profile, selector_name)
+                            if pg_name:
+                                state["policy_group"] = pg_name
+                                state["pg_type"] = pg_type
+                            emit_rollback_state({
+                                "type": "selector", "name": selector_name,
+                                "profile": interface_profile, "port": interface,
+                                "policy_group": pg_name or "", "pg_type": pg_type or "access"
+                            })
+        except Exception:
+            pass
+    
+    binding_count = len(state["bindings"])
+    if state.get("selector") or binding_count > 0 or state.get("description"):
+        print(f"    [STATE] Captured before-state: {binding_count} binding(s), "
+              f"selector={state.get('selector', 'none')}, "
+              f"desc={'yes' if state.get('description') else 'none'}")
+    
+    return state
 
 def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
                                    interface_profile, pod_id="1"):
@@ -838,6 +1044,11 @@ def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
         "description_cleared": False,
         "old_selector": None
     }
+
+    # --- Capture before-state for multi-tier rollback ---
+    print(f"    [CAPTURE] Saving port state before cleanup...")
+    capture_and_emit_port_state(session, apic_url, node_id, interface,
+                                 interface_profile, pod_id)
 
     eth_iface = f"eth{interface}" if not interface.startswith("eth") else interface
     port_num = interface.split('/')[-1]
@@ -934,6 +1145,11 @@ def cleanup_vpc_port_for_redeployment(session, apic_url, node1, node2, interface
         "old_selector": None,
         "old_vpc_pg": None
     }
+
+    # --- Capture before-state for multi-tier rollback ---
+    print(f"    [CAPTURE] Saving VPC port state before cleanup...")
+    capture_and_emit_port_state(session, apic_url, node1, interface,
+                                 interface_profile, pod_id, node2=node2)
 
     eth_iface = f"eth{interface}" if not interface.startswith("eth") else interface
     port_num = interface.split('/')[-1]
@@ -1486,7 +1702,8 @@ def delete_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
     """
     Delete ALL fvRsPathAtt bindings on a specific port.
 
-    Queries all bindings first, then deletes each one.
+    Queries all bindings first, emits [ROLLBACK:STATE] for each one,
+    then deletes each one.
     Returns (deleted_count, failed_count, binding_details).
 
     binding_details is a list of {"vlan", "epg", "success"} for logging.
@@ -1495,6 +1712,17 @@ def delete_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
 
     if not bindings:
         return 0, 0, []
+
+    # Emit state markers BEFORE deleting — rollback generator uses these
+    # to restore old bindings if needed
+    for b in bindings:
+        emit_rollback_state({
+            "type": "binding", "node": str(node_id), "port": port,
+            "vlan": str(b["vlan"]), "tenant": b["tenant"],
+            "ap": b["app_profile"], "epg": b["epg"],
+            "mode": b.get("mode", "regular"),
+            "path_type": "individual"
+        })
 
     deleted = 0
     failed = 0
