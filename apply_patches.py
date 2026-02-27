@@ -1824,6 +1824,242 @@ def extract_deployment_statuses(output_lines):
     content, _ = find_and_replace(content, old_results_call, new_results_call,
                                   "Always generate results CSV")
 
+    # --- PATCH ROLLBACK-A: Inject parse_rollback_states + inject_restore_phase helpers ---
+    # Insert before generate_rollback_script
+    old_rollback_anchor = '''# =============================================================================
+# ROLLBACK SCRIPT GENERATION
+# =============================================================================
+
+def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):'''
+
+    new_rollback_anchor = '''# =============================================================================
+# ROLLBACK STATE PARSING & RESTORE INJECTION
+# =============================================================================
+
+def parse_rollback_states(output_lines):
+    """
+    Extract [ROLLBACK:STATE] markers from deployment output.
+    
+    These markers are emitted by aci_port_utils cleanup functions BEFORE
+    deleting old configuration. They capture the prior state so the
+    rollback script can restore it.
+    
+    Returns list of state dicts.
+    """
+    import json as _json
+    states = []
+    for line in output_lines:
+        if '[ROLLBACK:STATE]' in line:
+            try:
+                json_str = line.split('[ROLLBACK:STATE]', 1)[1].strip()
+                states.append(_json.loads(json_str))
+            except Exception:
+                pass
+    return states
+
+
+def inject_restore_phase(script, prior_states, deploy_type):
+    """
+    Inject Phase 2 (restore prior state) code into a rollback script.
+    
+    Modifies the script string to add:
+    1. import json to imports
+    2. PRIOR_STATE constant with captured state data
+    3. Phase 2 restore logic before ROLLBACK COMPLETE
+    """
+    import json as _json
+    
+    if not prior_states:
+        return script
+    
+    # 1. Add import json
+    script = script.replace(
+        'import re\\n\\nurllib3',
+        'import re\\nimport json\\n\\nurllib3'
+    )
+    
+    # 2. Add PRIOR_STATE constant after POD_ID
+    state_json = _json.dumps(prior_states, indent=2)
+    tq = "'" + "'" + "'"
+    script = script.replace(
+        'POD_ID = "1"\\n\\nWEB_UI',
+        'POD_ID = "1"\\n\\nPRIOR_STATE = ' + tq + '\\n' + state_json + '\\n' + tq + '\\n\\nWEB_UI'
+    )
+    
+    # 3. Insert Phase 2 before ROLLBACK COMPLETE
+    restore_code = """
+    # ==========================================================================
+    # PHASE 2: RESTORE PRIOR STATE
+    # ==========================================================================
+    
+    prior = json.loads(PRIOR_STATE)
+    if prior:
+        print()
+        print("=" * 60)
+        print(" PHASE 2: RESTORING PRIOR STATE")
+        print("=" * 60)
+        print()
+        
+        restore_num = 0
+        
+        # Restore descriptions first (least impactful)
+        for s in prior:
+            if s.get("type") != "description":
+                continue
+            restore_num += 1
+            node = s["node"]
+            port = s["port"]
+            value = s["value"]
+            eth = f"eth{port}" if not port.startswith("eth") else port
+            dn = f"topology/pod-{POD_ID}/node-{node}/sys/phys-[{eth}]"
+            print(f"  [R{restore_num}] Restoring description on node {node} eth{port}: {value}")
+            try:
+                r = safe_request('post', session, f"{apic_url}/api/node/mo/{dn}.json",
+                    apic_url, username, password, auth_state,
+                    json={"l1PhysIf": {"attributes": {"descr": value}}})
+                print(f"      {'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}")
+            except Exception as e:
+                print(f"      [ERROR] {e}")
+        
+        # Restore port selectors (re-links port to old policy group)
+        for s in prior:
+            if s.get("type") != "selector":
+                continue
+            restore_num += 1
+            sel_name = s["name"]
+            profile = s["profile"]
+            pg_name = s.get("policy_group", "")
+            port = s["port"]
+            pg_type = s.get("pg_type", "access")
+            
+            port_parts = port.split("/")
+            from_card = port_parts[0] if len(port_parts) > 1 else "1"
+            from_port = port_parts[-1]
+            
+            if pg_type == "vpc":
+                pg_dn = f"uni/infra/funcprof/accbundle-{pg_name}"
+            else:
+                pg_dn = f"uni/infra/funcprof/accportgrp-{pg_name}"
+            
+            if not pg_name:
+                print(f"  [R{restore_num}] [SKIP] No policy group to restore for selector {sel_name}")
+                continue
+            
+            print(f"  [R{restore_num}] Restoring port selector: {sel_name} -> {pg_name}")
+            try:
+                payload = {
+                    "infraHPortS": {
+                        "attributes": {"name": sel_name, "type": "range"},
+                        "children": [
+                            {"infraPortBlk": {"attributes": {
+                                "name": "block2",
+                                "fromCard": from_card, "toCard": from_card,
+                                "fromPort": from_port, "toPort": from_port
+                            }}},
+                            {"infraRsAccBaseGrp": {"attributes": {"tDn": pg_dn}}}
+                        ]
+                    }
+                }
+                r = safe_request('post', session,
+                    f"{apic_url}/api/node/mo/uni/infra/accportprof-{profile}/hports-{sel_name}-typ-range.json",
+                    apic_url, username, password, auth_state, json=payload)
+                print(f"      {'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}")
+            except Exception as e:
+                print(f"      [ERROR] {e}")
+        
+        # Restore EPG bindings last (depends on selector being in place)
+        for s in prior:
+            if s.get("type") != "binding":
+                continue
+            restore_num += 1
+            tenant = s["tenant"]
+            ap = s["ap"]
+            epg = s["epg"]
+            vlan = s["vlan"]
+            mode = s.get("mode", "regular")
+            path_type = s.get("path_type", "individual")
+            
+            if path_type == "vpc":
+                node1 = s.get("node", "")
+                node2 = s.get("node2", "")
+                vpc_pg = s.get("vpc_pg", "")
+                path = f"topology/pod-{POD_ID}/protpaths-{node1}-{node2}/pathep-[{vpc_pg}]"
+                label = f"VPC {node1}-{node2}"
+            else:
+                node = s.get("node", "")
+                port = s.get("port", "")
+                eth = f"eth{port}" if not port.startswith("eth") else port
+                path = f"topology/pod-{POD_ID}/paths-{node}/pathep-[{eth}]"
+                label = f"node {node} eth{port}"
+            
+            print(f"  [R{restore_num}] Restoring VLAN {vlan} on {label} -> {epg}")
+            try:
+                payload = {
+                    "fvRsPathAtt": {
+                        "attributes": {
+                            "tDn": path,
+                            "encap": f"vlan-{vlan}",
+                            "mode": mode,
+                            "instrImedcy": "immediate"
+                        }
+                    }
+                }
+                r = safe_request('post', session,
+                    f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{ap}/epg-{epg}.json",
+                    apic_url, username, password, auth_state, json=payload)
+                print(f"      {'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}")
+            except Exception as e:
+                print(f"      [ERROR] {e}")
+        
+        print(f"\\n  Phase 2 complete: {restore_num} restore action(s)")
+
+"""
+    
+    old_complete = '    print()\\n    print("=" * 60)\\n    print(" ROLLBACK COMPLETE")'
+    new_complete = restore_code + '    print()\\n    print("=" * 60)\\n    print(" ROLLBACK COMPLETE")'
+    script = script.replace(old_complete, new_complete, 1)
+    
+    return script
+
+
+# =============================================================================
+# ROLLBACK SCRIPT GENERATION
+# =============================================================================
+
+def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):'''
+
+    content, _ = find_and_replace(content, old_rollback_anchor, new_rollback_anchor,
+                                  "Rollback: inject parse_rollback_states + inject_restore_phase")
+
+    # --- PATCH ROLLBACK-B: Modify generate_rollback_script to extract states and inject Phase 2 ---
+    old_gen_call = '''        rollback_actions = parse_deployment_output(deploy_type, output_lines)
+
+        if not rollback_actions:
+            return None
+
+        script = build_rollback_script(deploy_type, entry_id, timestamp, rollback_actions)
+
+        with open(filepath, 'w') as f:
+            f.write(script)'''
+
+    new_gen_call = '''        rollback_actions = parse_deployment_output(deploy_type, output_lines)
+
+        if not rollback_actions:
+            return None
+
+        script = build_rollback_script(deploy_type, entry_id, timestamp, rollback_actions)
+
+        # Multi-tier rollback: extract [ROLLBACK:STATE] markers and inject Phase 2
+        prior_states = parse_rollback_states(output_lines)
+        if prior_states:
+            script = inject_restore_phase(script, prior_states, deploy_type)
+
+        with open(filepath, 'w') as f:
+            f.write(script)'''
+
+    content, _ = find_and_replace(content, old_gen_call, new_gen_call,
+                                  "Rollback: inject Phase 2 restore from captured state")
+
     return content
 
 
