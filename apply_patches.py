@@ -124,6 +124,7 @@ from aci_port_utils import (
     get_validated_available_ports, find_common_validated_ports,
     cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
     query_existing_vpc_policy_groups, display_policy_group_selection,
+    query_all_bindings_on_port,
     ensure_token_fresh, reauth_apic
 )
 """
@@ -137,6 +138,7 @@ from aci_port_utils import (
     get_validated_available_ports,
     cleanup_port_for_redeployment,
     query_existing_access_policy_groups, display_policy_group_selection,
+    query_all_bindings_on_port,
     ensure_token_fresh, reauth_apic
 )
 """
@@ -261,6 +263,17 @@ def patch_vpc_port_display(content):
     cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
     query_existing_vpc_policy_groups, display_policy_group_selection
 )""",
+        # v1.3 — token refresh but no overwrite
+        """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, find_common_ports_with_status,
+    display_vpc_port_selection, display_vpc_independent_port_selection,
+    get_validated_available_ports, find_common_validated_ports,
+    cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
+    query_existing_vpc_policy_groups, display_policy_group_selection,
+    ensure_token_fresh, reauth_apic
+)""",
     ]
 
     current_vpc_import = """from aci_port_utils import (
@@ -271,6 +284,7 @@ def patch_vpc_port_display(content):
     get_validated_available_ports, find_common_validated_ports,
     cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
     query_existing_vpc_policy_groups, display_policy_group_selection,
+    query_all_bindings_on_port,
     ensure_token_fresh, reauth_apic
 )"""
 
@@ -712,6 +726,158 @@ def patch_vpc_port_display(content):
     content, _ = find_and_replace(content, old_vpc_use_existing, new_vpc_use_existing,
                                   "VPC: auto-answer PG exists prompt")
 
+    # =========================================================================
+    # FEATURE 4: EPG Binding Mode — overwrite or keep existing (VPC)
+    # =========================================================================
+
+    # --- PATCH N-vpc: EPG Binding Mode prompt before auth ---
+    old_vpc_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")'''
+
+    new_vpc_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # EPG Binding Mode
+    print("\\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Remove ALL existing EPG bindings first, then deploy new")
+    epg_mode_choice = prompt_input("\\nSelect (1/2) [default=1]: ").strip()
+    overwrite_mode = (epg_mode_choice == '2')
+    if overwrite_mode:
+        print("\\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")'''
+
+    content, _ = find_and_replace(content, old_vpc_pre_auth, new_vpc_pre_auth,
+                                  "VPC: EPG Binding Mode prompt")
+
+    # --- PATCH O-vpc: Inject overwrite deletion before deploy_vpc call ---
+    old_vpc_deploy_call = '''            elif confirm in ['Y', 'YES']:
+                # Deploy
+                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
+                results = deploy_vpc(session, apic_url, config, aep, dry_run)'''
+
+    new_vpc_deploy_call = '''            elif confirm in ['Y', 'YES']:
+                # Deploy
+                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
+                
+                # Overwrite: delete ALL existing EPG bindings before Step 4
+                if overwrite_mode and not dry_run:
+                    import time as _time
+                    vpc_ow_path = f"topology/pod-{POD_ID}/protpaths-{config['node1']}-{config['node2']}/pathep-[{config['policy_group']}]"
+                    print(f"\\n  [OVERWRITE] Removing existing EPG bindings on VPC path...")
+                    print(f"  Path: {vpc_ow_path}")
+                    ow_existing = []
+                    ow_seen_dns = set()
+                    
+                    # Strategy 1: Class-level query
+                    try:
+                        ow_url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\\"{vpc_ow_path}\\")"
+                        ow_resp = session.get(ow_url, verify=False, timeout=30)
+                        if ow_resp.status_code == 200:
+                            for item in ow_resp.json().get("imdata", []):
+                                attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                                dn = attrs.get("dn", "")
+                                if dn and dn not in ow_seen_dns:
+                                    ow_seen_dns.add(dn)
+                                    encap = attrs.get("encap", "")
+                                    _tn = re.search(r'/tn-([^/]+)/', dn)
+                                    _ap = re.search(r'/ap-([^/]+)/', dn)
+                                    _epg = re.search(r'/epg-([^/]+)/', dn)
+                                    _vlan = re.search(r'vlan-(\\d+)', encap)
+                                    ow_existing.append({
+                                        "dn": dn, "encap": encap,
+                                        "tenant": _tn.group(1) if _tn else "",
+                                        "epg": _epg.group(1) if _epg else "",
+                                        "vlan": int(_vlan.group(1)) if _vlan else 0
+                                    })
+                    except Exception as e:
+                        print(f"    [WARNING] Class query error: {e}")
+                    
+                    print(f"  [QUERY] Strategy 1 (class-level): {len(ow_existing)} binding(s)")
+                    
+                    # Strategy 2: Per-tenant EPG fallback (same as EPG Delete approach)
+                    if not ow_existing:
+                        print(f"  [QUERY] Trying per-tenant EPG fallback...")
+                        for ow_tenant in TENANTS.get(env, []):
+                            try:
+                                ap_url = f"{apic_url}/api/mo/uni/tn-{ow_tenant}.json?query-target=children&target-subtree-class=fvAp"
+                                ap_resp = session.get(ap_url, verify=False, timeout=15)
+                                if ap_resp.status_code != 200:
+                                    continue
+                                for ap_item in ap_resp.json().get("imdata", []):
+                                    ap_name = ap_item.get("fvAp", {}).get("attributes", {}).get("name", "")
+                                    if not ap_name:
+                                        continue
+                                    epg_url = f"{apic_url}/api/mo/uni/tn-{ow_tenant}/ap-{ap_name}.json?query-target=subtree&target-subtree-class=fvRsPathAtt"
+                                    epg_resp = session.get(epg_url, verify=False, timeout=20)
+                                    if epg_resp.status_code != 200:
+                                        continue
+                                    for item in epg_resp.json().get("imdata", []):
+                                        attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                                        tdn = attrs.get("tDn", "")
+                                        dn = attrs.get("dn", "")
+                                        if vpc_ow_path in tdn and dn not in ow_seen_dns:
+                                            ow_seen_dns.add(dn)
+                                            encap = attrs.get("encap", "")
+                                            _tn = re.search(r'/tn-([^/]+)/', dn)
+                                            _epg = re.search(r'/epg-([^/]+)/', dn)
+                                            _vlan = re.search(r'vlan-(\\d+)', encap)
+                                            ow_existing.append({
+                                                "dn": dn, "encap": encap,
+                                                "tenant": _tn.group(1) if _tn else "",
+                                                "epg": _epg.group(1) if _epg else "",
+                                                "vlan": int(_vlan.group(1)) if _vlan else 0
+                                            })
+                            except Exception as e:
+                                print(f"    [WARNING] Fallback error for tenant {ow_tenant}: {e}")
+                        
+                        print(f"  [QUERY] Strategy 2 (per-tenant fallback): {len(ow_existing)} binding(s)")
+                    
+                    # Delete each binding individually by DN
+                    ow_deleted = 0
+                    if ow_existing:
+                        print(f"  [DELETE] Removing {len(ow_existing)} binding(s)...")
+                        for ob in ow_existing:
+                            try:
+                                del_resp = session.delete(
+                                    f"{apic_url}/api/mo/{ob['dn']}.json",
+                                    verify=False, timeout=30)
+                                ok = del_resp.status_code == 200
+                            except Exception:
+                                ok = False
+                            status = "[DELETED]" if ok else "[FAIL]"
+                            print(f"    {status} VLAN {ob.get('vlan', '?')} — {ob.get('epg', '?')} ({ob.get('tenant', '?')})")
+                            if ok:
+                                ow_deleted += 1
+                        
+                        # Verify deletion
+                        _time.sleep(1)
+                        verify_url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\\"{vpc_ow_path}\\")"
+                        try:
+                            v_resp = session.get(verify_url, verify=False, timeout=30)
+                            v_count = len(v_resp.json().get("imdata", [])) if v_resp.status_code == 200 else -1
+                            if v_count == 0:
+                                print(f"  [VERIFIED] VPC path is clean — 0 bindings remain")
+                            elif v_count > 0:
+                                print(f"  [WARNING] {v_count} binding(s) still remain after deletion!")
+                        except:
+                            pass
+                        print(f"  [OVERWRITE] Cleanup complete — {ow_deleted} removed")
+                    else:
+                        print(f"  [OVERWRITE] No existing bindings found (clean VPC path)")
+                
+                results = deploy_vpc(session, apic_url, config, aep, dry_run)'''
+
+    content, _ = find_and_replace(content, old_vpc_deploy_call, new_vpc_deploy_call,
+                                  "VPC: overwrite deletion before deploy")
+
     return content
 
 
@@ -744,6 +910,16 @@ def patch_individual_port_display(content):
     cleanup_port_for_redeployment,
     query_existing_access_policy_groups, display_policy_group_selection
 )""",
+        # v1.3 — token refresh but no overwrite
+        """from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, display_port_selection,
+    get_validated_available_ports,
+    cleanup_port_for_redeployment,
+    query_existing_access_policy_groups, display_policy_group_selection,
+    ensure_token_fresh, reauth_apic
+)""",
     ]
 
     current_ind_import = """from aci_port_utils import (
@@ -753,6 +929,7 @@ def patch_individual_port_display(content):
     get_validated_available_ports,
     cleanup_port_for_redeployment,
     query_existing_access_policy_groups, display_policy_group_selection,
+    query_all_bindings_on_port,
     ensure_token_fresh, reauth_apic
 )"""
 
@@ -1065,6 +1242,151 @@ def patch_individual_port_display(content):
 
     content, _ = find_and_replace(content, old_ind_use_existing, new_ind_use_existing,
                                   "Individual: auto-answer PG exists prompt")
+
+    # =========================================================================
+    # FEATURE 4: EPG Binding Mode — overwrite or keep existing (Individual)
+    # =========================================================================
+
+    # --- PATCH N-ind: EPG Binding Mode prompt before auth ---
+    old_ind_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    username = prompt_input("\\nUsername: ").strip()'''
+
+    new_ind_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # EPG Binding Mode
+    print("\\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Remove ALL existing EPG bindings first, then deploy new")
+    epg_mode_choice = prompt_input("\\nSelect (1/2) [default=1]: ").strip()
+    overwrite_mode = (epg_mode_choice == '2')
+    if overwrite_mode:
+        print("\\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    username = prompt_input("\\nUsername: ").strip()'''
+
+    content, _ = find_and_replace(content, old_ind_pre_auth, new_ind_pre_auth,
+                                  "Individual: EPG Binding Mode prompt")
+
+    # --- PATCH O-ind: Inject overwrite deletion before deploy_individual_port call ---
+    old_ind_deploy_call = '''            elif confirm in ['Y', 'YES']:
+                # Deploy
+                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
+                results = deploy_individual_port(session, apic_url, config, dry_run)'''
+
+    new_ind_deploy_call = '''            elif confirm in ['Y', 'YES']:
+                # Deploy
+                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
+                
+                # Overwrite: delete ALL existing EPG bindings before Step 4
+                if overwrite_mode and not dry_run:
+                    import time as _time
+                    eth_port = f"eth{config['interface']}" if not config['interface'].startswith("eth") else config['interface']
+                    indiv_path = f"topology/pod-{POD_ID}/paths-{config['node_id']}/pathep-[{eth_port}]"
+                    print(f"\\n  [OVERWRITE] Removing existing EPG bindings on port {config['interface']}...")
+                    print(f"  Path: {indiv_path}")
+                    ow_existing = []
+                    ow_seen_dns = set()
+                    
+                    # Strategy 1: Class-level query
+                    try:
+                        ow_existing = query_all_bindings_on_port(
+                            session, apic_url, config['node_id'], config['interface'], POD_ID)
+                        for b in ow_existing:
+                            ow_seen_dns.add(b.get("dn", ""))
+                    except Exception as e:
+                        print(f"    [WARNING] Class query error: {e}")
+                    
+                    print(f"  [QUERY] Strategy 1 (class-level): {len(ow_existing)} binding(s)")
+                    
+                    # Strategy 2: Per-tenant EPG fallback (same as EPG Delete approach)
+                    if not ow_existing:
+                        print(f"  [QUERY] Trying per-tenant EPG fallback...")
+                        for ow_tenant in TENANTS.get(env, []):
+                            try:
+                                ap_url = f"{apic_url}/api/mo/uni/tn-{ow_tenant}.json?query-target=children&target-subtree-class=fvAp"
+                                ap_resp = session.get(ap_url, verify=False, timeout=15)
+                                if ap_resp.status_code != 200:
+                                    continue
+                                for ap_item in ap_resp.json().get("imdata", []):
+                                    ap_name = ap_item.get("fvAp", {}).get("attributes", {}).get("name", "")
+                                    if not ap_name:
+                                        continue
+                                    epg_url = f"{apic_url}/api/mo/uni/tn-{ow_tenant}/ap-{ap_name}.json?query-target=subtree&target-subtree-class=fvRsPathAtt"
+                                    epg_resp = session.get(epg_url, verify=False, timeout=20)
+                                    if epg_resp.status_code != 200:
+                                        continue
+                                    for item in epg_resp.json().get("imdata", []):
+                                        attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                                        tdn = attrs.get("tDn", "")
+                                        dn = attrs.get("dn", "")
+                                        if indiv_path in tdn and dn not in ow_seen_dns:
+                                            ow_seen_dns.add(dn)
+                                            encap = attrs.get("encap", "")
+                                            _tn = re.search(r'/tn-([^/]+)/', dn)
+                                            _epg = re.search(r'/epg-([^/]+)/', dn)
+                                            _vlan = re.search(r'vlan-(\\d+)', encap)
+                                            ow_existing.append({
+                                                "dn": dn, "tDn": tdn, "encap": encap,
+                                                "mode": attrs.get("mode", ""),
+                                                "tenant": _tn.group(1) if _tn else "",
+                                                "app_profile": "",
+                                                "epg": _epg.group(1) if _epg else "",
+                                                "vlan": int(_vlan.group(1)) if _vlan else 0
+                                            })
+                            except Exception as e:
+                                print(f"    [WARNING] Fallback error for tenant {ow_tenant}: {e}")
+                        
+                        print(f"  [QUERY] Strategy 2 (per-tenant fallback): {len(ow_existing)} binding(s)")
+                    
+                    # Delete each binding individually by DN
+                    ow_deleted = 0
+                    if ow_existing:
+                        print(f"  [DELETE] Removing {len(ow_existing)} binding(s)...")
+                        for ob in ow_existing:
+                            try:
+                                del_resp = session.delete(
+                                    f"{apic_url}/api/mo/{ob['dn']}.json",
+                                    verify=False, timeout=30)
+                                ok = del_resp.status_code == 200
+                            except Exception:
+                                ok = False
+                            status = "[DELETED]" if ok else "[FAIL]"
+                            print(f"    {status} VLAN {ob.get('vlan', '?')} — {ob.get('epg', '?')} ({ob.get('tenant', '?')})")
+                            if ok:
+                                ow_deleted += 1
+                        
+                        # Verify deletion
+                        _time.sleep(1)
+                        try:
+                            verify = query_all_bindings_on_port(
+                                session, apic_url, config['node_id'], config['interface'], POD_ID)
+                            if not verify:
+                                print(f"  [VERIFIED] Port is clean — 0 bindings remain")
+                            else:
+                                print(f"  [WARNING] {len(verify)} binding(s) still remain after deletion!")
+                                for v in verify:
+                                    print(f"    Still bound: VLAN {v.get('vlan', '?')} — {v.get('epg', '?')}")
+                        except:
+                            pass
+                        print(f"  [OVERWRITE] Cleanup complete — {ow_deleted} removed")
+                    else:
+                        print(f"  [OVERWRITE] No existing bindings found (clean port)")
+                
+                results = deploy_individual_port(session, apic_url, config, dry_run)'''
+
+    content, _ = find_and_replace(content, old_ind_deploy_call, new_ind_deploy_call,
+                                  "Individual: overwrite deletion before deploy")
 
     return content
 
@@ -1759,6 +2081,87 @@ def find_first_avail_port(output_lines, start_idx=0):
     <div class="toggle-desc">When the script prompts <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:10px">Select port number:</code>, automatically pick the first <span class="port-avail">[AVAIL]</span> port — skipping the manual prompt entirely.</div>"""
 
     content, _ = find_and_replace(content, old_toggle_desc, new_toggle_desc, "Settings: update auto-select description")
+
+    # =========================================================================
+    # FEATURE 4-UI: EPG Overwrite Default setting + auto-inject
+    # =========================================================================
+
+    # --- PATCH 9b: Add epg_overwrite_default to DEFAULT_CONFIG ---
+    old_default_config_end = '''    "auto_select_port": True,
+    "version": "1.3.0"
+}'''
+
+    new_default_config_end = '''    "auto_select_port": True,
+    "epg_overwrite_default": False,
+    "version": "1.3.0"
+}'''
+
+    content, _ = find_and_replace(content, old_default_config_end, new_default_config_end,
+                                  "Settings: add epg_overwrite_default to DEFAULT_CONFIG")
+
+    # --- PATCH 9c: Add EPG Overwrite toggle after auto-select port toggle ---
+    old_settings_end = '''</div>
+</div>
+<div class="settings-section"><div class="settings-section-title">ℹ️ Application Info</div>'''
+
+    new_settings_end = '''</div>
+<div class="settings-row">
+<label class="toggle-row" for="settingsEpgOverwrite">
+  <div class="toggle-switch">
+    <input type="checkbox" id="settingsEpgOverwrite" {% if config.epg_overwrite_default %}checked{% endif %} onchange="updateToggleBadge(this)">
+    <span class="toggle-slider"></span>
+  </div>
+  <div class="toggle-info">
+    <div class="toggle-title">Default EPG Overwrite Mode</div>
+    <div class="toggle-desc">When enabled, all scripts default to <strong>Overwrite</strong> (wipe existing EPG bindings before deploying new). When disabled, scripts default to <strong>Add</strong> (keep existing). Applies to VPC, Static Port, and EPG Add.</div>
+  </div>
+  <span class="toggle-badge {% if config.epg_overwrite_default %}on{% else %}off{% endif %}" id="epgOverwriteBadge">{% if config.epg_overwrite_default %}ON{% else %}OFF{% endif %}</span>
+</label>
+</div>
+</div>
+<div class="settings-section"><div class="settings-section-title">ℹ️ Application Info</div>'''
+
+    content, _ = find_and_replace(content, old_settings_end, new_settings_end,
+                                  "Settings: EPG Overwrite toggle")
+
+    # --- PATCH 9d: Add epg_overwrite_default to saveSettings JS ---
+    old_save_settings = '''    auto_select_port:document.getElementById('settingsAutoSelectPort').checked,
+    version:document.getElementById('settingsVersion').value'''
+
+    new_save_settings = '''    auto_select_port:document.getElementById('settingsAutoSelectPort').checked,
+    epg_overwrite_default:document.getElementById('settingsEpgOverwrite').checked,
+    version:document.getElementById('settingsVersion').value'''
+
+    content, _ = find_and_replace(content, old_save_settings, new_save_settings,
+                                  "Settings: save epg_overwrite_default in JS")
+
+    # --- PATCH 9e: Auto-inject EPG MODE prompt response ---
+    # Detect "EPG BINDING MODE" or "EPG MODE" in recent output lines,
+    # then auto-respond to the (1/2) prompt based on the setting.
+    old_tenant_autostart = '''                        # AUTO-TENANT SELECTION'''
+
+    new_epg_mode_inject = '''                        # AUTO-EPG MODE SELECTION
+                        # Detects "EPG BINDING MODE" or "EPG MODE" in recent output and
+                        # auto-injects "2" (overwrite) or "1" (add) based on settings.
+                        recent_5 = [r.lower() for r in current_run["output_lines"][-5:]]
+                        is_epg_mode = any('epg binding mode' in r or 'epg mode' in r for r in recent_5)
+                        if is_epg_mode and ('(1/2)' in tl or 'select mode' in tl) and tl.endswith(':'):
+                            cfg = load_config()
+                            epg_ow = '2' if cfg.get('epg_overwrite_default', False) else '1'
+                            epg_label = 'Overwrite' if epg_ow == '2' else 'Add'
+                            time.sleep(0.1)
+                            try:
+                                running_process.stdin.write((epg_ow + '\\n').encode('utf-8'))
+                                running_process.stdin.flush()
+                                output_queue.put(('output', f'[AUTO] EPG mode: {epg_label} (from settings)'))
+                                current_run["output_lines"].append(f'[AUTO] EPG mode: {epg_label}')
+                            except:
+                                pass
+
+                        # AUTO-TENANT SELECTION'''
+
+    content, _ = find_and_replace(content, old_tenant_autostart, new_epg_mode_inject,
+                                  "Auto-inject: EPG MODE from settings")
 
     # --- PATCH README-A: Replace readme tab bar with 7 tabs ---
     old_readme_tabs = """<div class="readme-tabs">
