@@ -35,6 +35,20 @@ import urllib3
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Shared utilities (consolidated from duplicated helpers)
+from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, find_common_ports_with_status,
+    display_vpc_port_selection, display_vpc_independent_port_selection,
+    get_validated_available_ports, find_common_validated_ports,
+    cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
+    query_existing_vpc_policy_groups, display_policy_group_selection,
+    query_all_bindings_on_port,
+    ensure_token_fresh, reauth_apic
+)
+
+
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -44,15 +58,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # =============================================================================
 
 APIC_URLS = {
-    "D1": "",  # <-- UPDATE THIS (ACC switches)
-    "D2": "",  # <-- UPDATE THIS (SDC switches)
-    "D3": ""   # <-- UPDATE THIS (NSM switches)
+    "D1": "https://edcapic01.gwnsm.guidewell.net/",  # <-- UPDATE THIS (BLU Tenant - ACC switches)
+    "D2": "https://sdcapic01.gwnsm.guidewell.net/",  # <-- UPDATE THIS (BLU Tenant - SDC switches)
+    "D3": "https://edcnsmapic01.gwnsm.guidewell.net/"   # <-- UPDATE THIS (NSM_BLU Tenant - NSM switches)
 }
 
 # Multiple tenants per datacenter
 TENANTS = {
     "D1": ["BLU", "GWC", "GWS"],
-    "D2": ["BLU", "GWC", "GWS"],
+    "D2": ["BLU", "GWC", "GWS", "SDCFLB", "SDCGWS"],
     "D3": ["NSM_BLU", "NSM_BRN", "NSM_GLD", "NSM_GRN"]
 }
 
@@ -99,68 +113,15 @@ SPEED_MAPPING = {
 # HELPER FUNCTIONS
 # =============================================================================
 
-def prompt_input(prompt_text):
-    """Print prompt and get input - ensures prompt is visible in web UI."""
-    sys.stdout.write(prompt_text)
-    sys.stdout.flush()
-    return input()
+# prompt_input() — moved to aci_port_utils.py
 
+# detect_environment() — moved to aci_port_utils.py
 
-def detect_environment(switch_name):
-    """Detect data center from switch name. D3=NSM, D2=SDC, D1=everything else."""
-    switch_upper = switch_name.upper()
-    if "NSM" in switch_upper:
-        return "D3"
-    elif "SDC" in switch_upper:
-        return "D2"
-    else:
-        # Default to D1 for all other switches (including ACC and any without prefix)
-        return "D1"
+# extract_node_id() — moved to aci_port_utils.py
 
+# parse_vlans() — moved to aci_port_utils.py
 
-def extract_node_id(switch_name):
-    """Extract node ID from switch name (last digits)."""
-    match = re.search(r'(\d+)$', switch_name)
-    return match.group(1) if match else None
-
-
-def parse_vlans(vlan_string):
-    """Parse VLAN string into list of integers."""
-    vlans = []
-    vlan_string = str(vlan_string).replace(" ", "")
-    for part in vlan_string.split(","):
-        if "-" in part:
-            try:
-                start, end = part.split("-")
-                vlans.extend(range(int(start), int(end) + 1))
-            except ValueError:
-                pass
-        else:
-            try:
-                vlans.append(int(part))
-            except ValueError:
-                pass
-    return sorted(list(set(vlans)))
-
-
-def parse_interface(interface_string):
-    """Parse interface string to standard format."""
-    if not interface_string:
-        return None
-    cleaned = interface_string.strip().lower().replace("ethernet", "").replace("eth", "").replace("e", "").strip()
-    if "/" not in cleaned:
-        try:
-            return f"1/{int(cleaned)}"
-        except ValueError:
-            return None
-    parts = cleaned.split("/")
-    if len(parts) != 2:
-        return None
-    try:
-        return f"{int(parts[0])}/{int(parts[1])}"
-    except ValueError:
-        return None
-
+# parse_interface() — moved to aci_port_utils.py
 
 # =============================================================================
 # API FUNCTIONS
@@ -262,133 +223,9 @@ def check_epg_exists(session, apic_url, tenant, app_profile, epg_name):
         return False
 
 
-def validate_single_port(session, apic_url, node_id, port):
-    """
-    Validate a single port for policy group and EPG bindings.
-    Used by ThreadPoolExecutor for parallel validation.
-    """
-    port_num = port['interface'].split('/')[-1]
-    
-    # Check for policy group (port selector) on this port
-    try:
-        url = f"{apic_url}/api/class/infraPortBlk.json?query-target-filter=and(eq(infraPortBlk.fromPort,\"{port_num}\"),eq(infraPortBlk.toPort,\"{port_num}\"))"
-        response = session.get(url, verify=False, timeout=15)
-        if response.status_code == 200:
-            data = response.json().get("imdata", [])
-            for item in data:
-                dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
-                if node_id in dn:
-                    port["valid"] = False
-                    port["issues"].append("Policy group assigned")
-                    return port
-    except:
-        pass
-    
-    # Check for EPG bindings
-    try:
-        path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{port['port']}]"
-        url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\"{path_dn}\")"
-        response = session.get(url, verify=False, timeout=15)
-        if response.status_code == 200:
-            data = response.json().get("imdata", [])
-            if data:
-                port["valid"] = False
-                port["issues"].append("EPG deployed")
-                return port
-    except:
-        pass
-    
-    return port
+# validate_single_port() — moved to aci_port_utils.py
 
-
-def get_validated_available_ports(session, apic_url, node_id):
-    """
-    Get available ports with full validation using parallel queries.
-    Returns list of ports that pass all 4 checks:
-    1. Usage = 'discovery'
-    2. No description
-    3. No policy group assigned
-    4. No EPG deployed
-    
-    Uses ThreadPoolExecutor for faster validation (~5-10x speedup).
-    """
-    # First get all physical interfaces
-    url = f"{apic_url}/api/class/topology/pod-{POD_ID}/node-{node_id}/l1PhysIf.json"
-    
-    try:
-        response = session.get(url, verify=False, timeout=60)
-        if response.status_code != 200:
-            return []
-        
-        ports = []
-        for item in response.json().get("imdata", []):
-            attrs = item.get("l1PhysIf", {}).get("attributes", {})
-            
-            usage = attrs.get("usage", "").lower()
-            description = attrs.get("descr", "").strip()
-            admin_state = attrs.get("adminSt", "")
-            
-            # Extract port from DN
-            dn = attrs.get("dn", "")
-            port_match = re.search(r'phys-\[(.+?)\]', dn)
-            if not port_match:
-                continue
-            
-            port = port_match.group(1)
-            interface = parse_interface(port)
-            if not interface:
-                continue
-            
-            # Initial filter: discovery usage, no description, admin up
-            if usage == "discovery" and not description and admin_state == "up":
-                ports.append({
-                    "port": port,
-                    "interface": interface,
-                    "speed": attrs.get("speed", "inherit"),
-                    "usage": usage,
-                    "description": description,
-                    "valid": True,
-                    "issues": []
-                })
-        
-        # Sort ports
-        ports.sort(key=lambda x: (
-            int(re.search(r'eth(\d+)/', x['port']).group(1)) if re.search(r'eth(\d+)/', x['port']) else 0,
-            int(re.search(r'/(\d+)$', x['port']).group(1)) if re.search(r'/(\d+)$', x['port']) else 0
-        ))
-        
-        # Validate ports in parallel using ThreadPoolExecutor
-        # Max 10 workers to avoid overwhelming the APIC
-        validated_ports = []
-        
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            # Submit all validation tasks
-            future_to_port = {
-                executor.submit(validate_single_port, session, apic_url, node_id, port.copy()): port 
-                for port in ports
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_port):
-                try:
-                    result = future.result()
-                    if result["valid"]:
-                        validated_ports.append(result)
-                except Exception as e:
-                    pass
-        
-        # Re-sort after parallel processing
-        validated_ports.sort(key=lambda x: (
-            int(re.search(r'eth(\d+)/', x['port']).group(1)) if re.search(r'eth(\d+)/', x['port']) else 0,
-            int(re.search(r'/(\d+)$', x['port']).group(1)) if re.search(r'/(\d+)$', x['port']) else 0
-        ))
-        
-        return validated_ports
-    
-    except Exception as e:
-        print(f"    [ERROR] Failed to query ports: {e}")
-        return []
-
+# get_validated_available_ports() — moved to aci_port_utils.py
 
 def get_epg_app_profile(session, apic_url, tenant, vlan_id):
     """Find which Application Profile(s) contain the EPG for a given VLAN in a single tenant."""
@@ -759,39 +596,7 @@ def run_preflight_checks(sessions, deployments):
 # DISPLAY FUNCTIONS
 # =============================================================================
 
-def display_validated_ports(ports, node_label):
-    """Display validated available ports for VPC."""
-    if not ports:
-        print(f"\n  [WARNING] No validated available ports on {node_label}")
-        return None
-    
-    print(f"\n  Validated available ports on {node_label}:")
-    print("  " + "-" * 60)
-    print(f"  {'#':>3}  {'Port':<15} {'Speed':<10} Status")
-    print("  " + "-" * 60)
-    
-    for i, port in enumerate(ports, 1):
-        status = "OK" if port['valid'] else f"INVALID: {', '.join(port['issues'])}"
-        print(f"  [{i:>2}] {port['port']:<15} {port['speed']:<10} {status}")
-    
-    print("  " + "-" * 60)
-    print("  [S] Skip this deployment")
-    print("  [Q] Quit script")
-    
-    while True:
-        choice = prompt_input("\n  Select port number: ").strip().upper()
-        if choice == 'S':
-            return "SKIP"
-        elif choice == 'Q':
-            return "QUIT"
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(ports):
-                return ports[idx]
-        except ValueError:
-            pass
-        print("  [ERROR] Invalid selection")
-
+# display_validated_ports() — moved to aci_port_utils.py
 
 def display_app_profile_choice(options, vlan_id):
     """Display Application Profile options and let user select. Options include tenant."""
@@ -820,28 +625,7 @@ def display_app_profile_choice(options, vlan_id):
         print("  [ERROR] Invalid selection")
 
 
-def find_common_validated_ports(ports1, ports2):
-    """Find ports that are validated and available on both switches."""
-    # Create dict by interface for easy lookup
-    ports1_dict = {p['interface']: p for p in ports1 if p.get('valid', True)}
-    ports2_dict = {p['interface']: p for p in ports2 if p.get('valid', True)}
-    
-    common_interfaces = set(ports1_dict.keys()) & set(ports2_dict.keys())
-    
-    # Return ports from ports1 that are in common (they have same interface on both)
-    common_ports = []
-    for interface in common_interfaces:
-        port = ports1_dict[interface].copy()
-        common_ports.append(port)
-    
-    # Sort by port number
-    common_ports.sort(key=lambda x: (
-        int(re.search(r'eth(\d+)/', x['port']).group(1)) if re.search(r'eth(\d+)/', x['port']) else 0,
-        int(re.search(r'/(\d+)$', x['port']).group(1)) if re.search(r'/(\d+)$', x['port']) else 0
-    ))
-    
-    return common_ports
-
+# find_common_validated_ports() — moved to aci_port_utils.py
 
 def display_deployment_preview(config, aep):
     """Display VPC deployment configuration preview."""
@@ -884,7 +668,12 @@ def display_deployment_preview(config, aep):
     print(f"\n  === ACCESS PORT SELECTOR (under Interface Profile) ===")
     print(f"  Interface Profile:      {config['interface_profile']}")
     print(f"  Name:                   {config['policy_group']}")
-    print(f"  Interface IDs:          {config['interface']}")
+    iface2 = config.get('interface2', config['interface'])
+    if config.get('asymmetric_vpc'):
+        print(f"  Interface (node {config['node1']}):  eth{config['interface']}")
+        print(f"  Interface (node {config['node2']}):  eth{iface2}")
+    else:
+        print(f"  Interface IDs:          {config['interface']}")
     print(f"  Interface Policy Group: {config['policy_group']}")
     
     print(f"\n  === STATIC EPG BINDING ===")
@@ -1132,9 +921,15 @@ def deploy_vpc(session, apic_url, config, aep, dry_run=False):
         print(f"       - MCP: {MCP_POLICY}")
         print(f"       - Storm Control: {STORM_CONTROL_POLICY}")
         print(f"       - Flow Control: {config['flow_control']}")
-        print(f"    3. Create Access Port Selector on: {config['interface_profile']}")
-        print(f"       - Name: {config['policy_group']}")
-        print(f"       - Interface IDs: {config['interface']}")
+        iface2 = config.get('interface2', config['interface'])
+        if config.get('asymmetric_vpc'):
+            print(f"    3. Create Port Selectors (asymmetric VPC) on: {config['interface_profile']}")
+            print(f"       - Port 1: {config['interface']} (node {config['node1']})")
+            print(f"       - Port 2: {iface2} (node {config['node2']})")
+        else:
+            print(f"    3. Create Access Port Selector on: {config['interface_profile']}")
+            print(f"       - Name: {config['policy_group']}")
+            print(f"       - Interface IDs: {config['interface']}")
         print(f"       - Interface Policy Group: {config['policy_group']}")
         print(f"    4. Deploy {len(config['epg_bindings'])} static bindings")
         results["description"] = True
@@ -1144,52 +939,85 @@ def deploy_vpc(session, apic_url, config, aep, dry_run=False):
             results["bindings"].append({"vlan": binding['vlan'], "success": True})
         return results
     
-    # 1. Set Port Description on both nodes
+    # 1. Set Port Description on both nodes (supports asymmetric VPC ports)
+    iface1 = config['interface']
+    iface2 = config.get('interface2', config['interface'])
     print(f"\n  [1/4] Setting port description on both nodes: {port_description}")
-    interface_eth = f"eth{config['interface']}"
     
-    success1, _ = set_port_description(session, apic_url, config['node1'], config['interface'], port_description)
-    print(f"        Node {config['node1']} {interface_eth}: {'[SUCCESS]' if success1 else '[WARNING]'}")
+    success1, _ = set_port_description(session, apic_url, config['node1'], iface1, port_description)
+    print(f"        Node {config['node1']} eth{iface1}: {'[SUCCESS]' if success1 else '[WARNING]'}")
     
-    success2, _ = set_port_description(session, apic_url, config['node2'], config['interface'], port_description)
-    print(f"        Node {config['node2']} {interface_eth}: {'[SUCCESS]' if success2 else '[WARNING]'}")
+    success2, _ = set_port_description(session, apic_url, config['node2'], iface2, port_description)
+    print(f"        Node {config['node2']} eth{iface2}: {'[SUCCESS]' if success2 else '[WARNING]'}")
     
     results["description"] = success1 and success2
     
-    # 2. Create VPC Policy Group
-    print(f"  [2/4] Creating VPC Interface Policy Group: {config['policy_group']}")
-    print(f"        AEP: {aep}")
-    print(f"        CDP: {CDP_POLICY}")
-    print(f"        Link Level: {config['link_level']}")
-    print(f"        LLDP: {LLDP_POLICY}")
-    print(f"        Port Channel: {PORT_CHANNEL_POLICY}")
-    print(f"        MCP: {MCP_POLICY}")
-    print(f"        Storm Control: {STORM_CONTROL_POLICY}")
-    print(f"        Flow Control: {config['flow_control']}")
-    
-    success, response = create_vpc_policy_group(session, apic_url, config['policy_group'], 
-                                                 config['link_level'], config['flow_control'], aep)
-    if success:
-        print(f"        [SUCCESS]")
+    # 2. Create or reuse VPC Policy Group
+    if config.get('reuse_policy_group'):
+        print(f"  [2/4] Using EXISTING VPC Policy Group: {config['policy_group']}")
+        print(f"        [REUSE] Skipping creation")
         results["policy_group"] = True
     else:
-        print(f"        [FAILED] {response[:100]}")
-        return results
+        print(f"  [2/4] Creating VPC Interface Policy Group: {config['policy_group']}")
+        print(f"        AEP: {aep}")
+        print(f"        CDP: {CDP_POLICY}")
+        print(f"        Link Level: {config['link_level']}")
+        print(f"        LLDP: {LLDP_POLICY}")
+        print(f"        Port Channel: {PORT_CHANNEL_POLICY}")
+        print(f"        MCP: {MCP_POLICY}")
+        print(f"        Storm Control: {STORM_CONTROL_POLICY}")
+        print(f"        Flow Control: {config['flow_control']}")
+        
+        success, response = create_vpc_policy_group(session, apic_url, config['policy_group'], 
+                                                     config['link_level'], config['flow_control'], aep)
+        if success:
+            print(f"        [SUCCESS]")
+            results["policy_group"] = True
+        else:
+            print(f"        [FAILED] {response[:100]}")
+            return results
     
-    # 3. Create Access Port Selector
-    print(f"  [3/4] Creating Access Port Selector: {config['policy_group']}")
-    print(f"        Interface Profile: {config['interface_profile']}")
-    print(f"        Interface IDs: {config['interface']}")
-    print(f"        Interface Policy Group: {config['policy_group']}")
+    # 3. Create Access Port Selector(s) — supports asymmetric VPC ports
+    iface1 = config['interface']
+    iface2 = config.get('interface2', config['interface'])
+    is_asymmetric = config.get('asymmetric_vpc', False)
     
-    success, response = create_port_selector(session, apic_url, config['interface_profile'], 
-                                             config['policy_group'], config['interface'], config['policy_group'])
-    if success:
-        print(f"        [SUCCESS]")
-        results["port_selector"] = True
+    if is_asymmetric:
+        sel1 = f"{config['hostname']}_e{iface1.split('/')[-1]}"
+        sel2 = f"{config['hostname']}_e{iface2.split('/')[-1]}"
+        print(f"  [3/4] Creating Port Selectors (asymmetric VPC):")
+        print(f"        Interface Profile: {config['interface_profile']}")
+        print(f"        Selector 1: {sel1} -> port {iface1} (node {config['node1']})")
+        print(f"        Selector 2: {sel2} -> port {iface2} (node {config['node2']})")
+        print(f"        Policy Group: {config['policy_group']}")
+        
+        ok1, r1 = create_port_selector(session, apic_url, config['interface_profile'],
+                                        sel1, iface1, config['policy_group'])
+        print(f"        Selector 1 (e{iface1.split('/')[-1]}): {'[SUCCESS]' if ok1 else '[FAILED] ' + r1[:80]}")
+        
+        ok2, r2 = create_port_selector(session, apic_url, config['interface_profile'],
+                                        sel2, iface2, config['policy_group'])
+        print(f"        Selector 2 (e{iface2.split('/')[-1]}): {'[SUCCESS]' if ok2 else '[FAILED] ' + r2[:80]}")
+        
+        if ok1 and ok2:
+            results["port_selector"] = True
+        else:
+            print(f"        [FAILED] One or both selectors failed")
+            return results
     else:
-        print(f"        [FAILED] {response[:100]}")
-        return results
+        print(f"  [3/4] Creating Access Port Selector: {config['policy_group']}")
+        print(f"        Interface Profile: {config['interface_profile']}")
+        print(f"        Interface IDs: {config['interface']}")
+        print(f"        Interface Policy Group: {config['policy_group']}")
+        
+        success, response = create_port_selector(session, apic_url, config['interface_profile'], 
+                                                 config['policy_group'], config['interface'], config['policy_group'])
+        if success:
+            print(f"        [SUCCESS]")
+            results["port_selector"] = True
+        else:
+            print(f"        [FAILED] {response[:100]}")
+            return results
     
     # 4. Deploy Static Bindings
     print(f"  [4/4] Deploying Static Bindings ({len(config['epg_bindings'])} VLANs, mode: regular (trunk))")
@@ -1269,6 +1097,62 @@ def main():
             flow_control = "FLOW-CONTROL-ON"
             break
     
+    # Policy Group Mode
+    print("\n" + "-" * 70)
+    print(" POLICY GROUP MODE")
+    print("-" * 70)
+    print("\n  [1] Create NEW policy group per deployment (default)")
+    print("  [2] Reuse EXISTING policy group (query by link level)")
+    
+    while True:
+        pg_mode_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
+        if pg_mode_choice in ["", "1", "2"]:
+            break
+    reuse_pg_mode = (pg_mode_choice == '2')
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # When PG already exists with same name
+    pg_exists_always_use = True
+    if not reuse_pg_mode:
+        print("\n" + "-" * 70)
+        print(" WHEN POLICY GROUP NAME ALREADY EXISTS")
+        print("-" * 70)
+        print("\n  [1] Always use existing policy group (default)")
+        print("  [2] Ask each time")
+        pg_exists_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
+        pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # EPG Binding Mode
+    print("\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
+    print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
+    epg_mode_choice = prompt_input("\nSelect (1/2/3) [default=1]: ").strip()
+    overwrite_mode = epg_mode_choice in ['2', '3']
+    overwrite_interactive = (epg_mode_choice == '2')
+    overwrite_auto = (epg_mode_choice == '3')
+    if overwrite_mode:
+        print("\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
     # Get credentials
     print("\n" + "-" * 70)
     print(" AUTHENTICATION")
@@ -1305,6 +1189,13 @@ def main():
         print("\n[ERROR] No successful authentications.")
         sys.exit(1)
     
+    # Token state tracking for auto-refresh during batch deployments
+    import time as _token_time
+    token_states = {}
+    _credentials = {"username": username, "password": password}
+    for _env in sessions:
+        token_states[_env] = {"login_time": _token_time.time(), "lifetime": 300}
+    
     # Run pre-flight checks
     global_settings = run_preflight_checks(sessions, deployments)
     if not global_settings:
@@ -1333,6 +1224,12 @@ def main():
         session = sessions[env]
         apic_url = APIC_URLS[env]
         aep = global_settings["aep"].get(env)
+        
+        # Refresh APIC token if aging (prevents 403 on long batch runs)
+        if env in token_states:
+            if not ensure_token_fresh(session, apic_url, token_states[env]):
+                reauth_apic(session, apic_url, _credentials["username"],
+                           _credentials["password"], token_states[env])
         
         # Extract node IDs
         node1 = extract_node_id(dep['switch1'])
@@ -1371,29 +1268,50 @@ def main():
         
         # Get validated available ports on both switches
         print(f"\n  === PORT VALIDATION ===")
-        print(f"  Querying and validating ports (checking 4 criteria)...")
-        print(f"    1. Usage = 'discovery'")
-        print(f"    2. No description")
-        print(f"    3. No policy group assigned")
-        print(f"    4. No EPG deployed")
+        print(f"  Querying all ports and checking status...")
+        print(f"    Criteria: discovery usage, no description, no policy group, no EPG")
+        print(f"    [AVAIL] = passes all checks  |  [IN-USE] = has existing config")
         
-        ports1 = get_validated_available_ports(session, apic_url, node1)
-        ports2 = get_validated_available_ports(session, apic_url, node2)
+        ports1 = get_all_ports_with_status(session, apic_url, node1, POD_ID)
+        ports2 = get_all_ports_with_status(session, apic_url, node2, POD_ID)
         
-        print(f"\n    Node {node1}: {len(ports1)} validated available")
-        print(f"    Node {node2}: {len(ports2)} validated available")
+        avail1 = sum(1 for p in ports1 if p['valid'])
+        avail2 = sum(1 for p in ports2 if p['valid'])
+        print(f"\n    Node {node1}: {len(ports1)} total ({avail1} available)")
+        print(f"    Node {node2}: {len(ports2)} total ({avail2} available)")
         
-        # Find common validated ports
-        common_ports = find_common_validated_ports(ports1, ports2)
-        print(f"    Common: {len(common_ports)} validated available on both")
+        # Find common ports (both available and in-use)
+        common_ports = find_common_ports_with_status(ports1, ports2)
+        avail_common = sum(1 for p in common_ports if p['valid'])
+        print(f"    Common: {len(common_ports)} total ({avail_common} available on both)")
         
-        if not common_ports:
-            print(f"  [SKIP] No validated matching ports on both switches")
-            skipped += 1
-            continue
+        # Port selection mode
+        print(f"\n  Port Selection Mode:")
+        print(f"    [1] Same port on both switches (common ports)")
+        print(f"    [2] Different port on each switch (independent)")
+        port_mode = prompt_input("\n  Select (1/2) [default=1]: ").strip()
         
-        # Select port
-        selected_port = display_validated_ports(common_ports, f"nodes {node1} & {node2}")
+        asymmetric_vpc = False
+        selected_port2 = None
+        
+        if port_mode == '2':
+            # Independent selection — different port per switch
+            selected_port, selected_port2 = display_vpc_independent_port_selection(
+                ports1, ports2, node1, node2
+            )
+            if selected_port is None or selected_port2 is None:
+                print(f"  [SKIPPED by user]")
+                skipped += 1
+                continue
+            asymmetric_vpc = (selected_port['interface'] != selected_port2['interface'])
+        else:
+            # Same port mode — use common ports
+            if not common_ports:
+                print(f"  [SKIP] No common ports found on both switches")
+                print(f"  [TIP] Try mode 2 for independent port selection")
+                skipped += 1
+                continue
+            selected_port = display_vpc_port_selection(common_ports, node1, node2)
         if selected_port == "SKIP":
             skipped += 1
             continue
@@ -1470,6 +1388,26 @@ def main():
             "node1": node1, 
             "node2": node2, 
             "interface": interface,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
+            "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
+            "asymmetric_vpc": asymmetric_vpc,
             "policy_group": policy_group_name,
             "link_level": link_level,
             "flow_control": flow_control, 
@@ -1521,6 +1459,112 @@ def main():
             elif confirm in ['Y', 'YES']:
                 # Deploy
                 print("\n  Deploying..." if not dry_run else "\n  Dry-run...")
+                
+                # Full cleanup if overriding in-use port(s)
+                need_clean1 = not selected_port.get('valid', True) if selected_port else False
+                need_clean2 = not selected_port2.get('valid', True) if selected_port2 else False
+                
+                if not dry_run and (need_clean1 or need_clean2):
+                    print("\n  [CLEANUP] Wiping existing port configuration...")
+                    c_iface1 = config['interface']
+                    c_iface2 = config.get('interface2', c_iface1)
+                    
+                    if need_clean1:
+                        print(f"    Cleaning node {config['node1']} port {c_iface1}...")
+                        cleanup_port_for_redeployment(
+                            session, apic_url, config['node1'], c_iface1,
+                            config['interface_profile'], POD_ID
+                        )
+                    if need_clean2:
+                        print(f"    Cleaning node {config['node2']} port {c_iface2}...")
+                        cleanup_port_for_redeployment(
+                            session, apic_url, config['node2'], c_iface2,
+                            config['interface_profile'], POD_ID
+                        )
+                    # Also clean VPC protpaths bindings
+                    cleanup_vpc_port_for_redeployment(
+                        session, apic_url, config['node1'], config['node2'],
+                        c_iface1, config['interface_profile'], POD_ID
+                    )
+                    print(f"  [CLEANUP] Done\n")
+                
+
+                
+                # Overwrite: delete ALL existing EPG bindings before Step 4
+                # Overwrite: delete existing EPG bindings before deploying
+                if overwrite_mode and not dry_run:
+                    import time as _time
+                    vpc_ow_path = f"topology/pod-{POD_ID}/protpaths-{config['node1']}-{config['node2']}/pathep-[{config['policy_group']}]"
+                    print(f"\n  [OVERWRITE] Querying existing EPG bindings on VPC path...")
+                    print(f"  Path: {vpc_ow_path}")
+                    
+                    # Use merged dual-strategy query from port_utils
+                    ow_existing = query_all_bindings_on_port(
+                        session, apic_url, config['node1'], config['interface'],
+                        POD_ID, tenants=TENANTS.get(env, []),
+                        path_type="vpc", node2=config['node2'],
+                        pg_name=config['policy_group']
+                    )
+                    
+                    ow_deleted = 0
+                    if ow_existing:
+                        if overwrite_interactive:
+                            # Interactive: show list, let user choose
+                            print(f"\n  Existing EPG bindings ({len(ow_existing)}):\n")
+                            for oi, ob in enumerate(ow_existing, 1):
+                                print(f"    [{oi}] VLAN {ob.get('vlan','?')} — {ob.get('epg','?')} ({ob.get('tenant','?')})")
+                            sel = prompt_input(f"\n  Delete which? (numbers, 'all', 'none') [default=all]: ").strip().lower()
+                            if sel in ['', 'all', 'a']:
+                                to_del = ow_existing[:]
+                            elif sel in ['none', 'n', '0']:
+                                to_del = []
+                            else:
+                                sel_idx = set()
+                                for part in sel.split(','):
+                                    part = part.strip()
+                                    if '-' in part:
+                                        rp = part.split('-')
+                                        for ri in range(int(rp[0]), int(rp[1]) + 1):
+                                            if 1 <= ri <= len(ow_existing): sel_idx.add(ri)
+                                    elif part.isdigit():
+                                        ri = int(part)
+                                        if 1 <= ri <= len(ow_existing): sel_idx.add(ri)
+                                to_del = [ow_existing[i-1] for i in sorted(sel_idx)]
+                            print(f"  -> Deleting {len(to_del)} of {len(ow_existing)} binding(s)")
+                        else:
+                            # Auto mode or simple overwrite
+                            to_del = ow_existing[:]
+                            print(f"  [AUTO] Deleting all {len(to_del)} existing binding(s)")
+                        
+                        for ob in to_del:
+                            try:
+                                del_resp = session.delete(
+                                    f"{apic_url}/api/mo/{ob['dn']}.json",
+                                    verify=False, timeout=30)
+                                ok = del_resp.status_code == 200
+                            except Exception:
+                                ok = False
+                            status = '[DELETED]' if ok else '[FAIL]'
+                            print(f"    {status} VLAN {ob.get('vlan','?')} — {ob.get('epg','?')} ({ob.get('tenant','?')})")
+                            if ok:
+                                ow_deleted += 1
+                        
+                        # Verify
+                        _time.sleep(1)
+                        v_bindings = query_all_bindings_on_port(
+                            session, apic_url, config['node1'], config['interface'],
+                            POD_ID, tenants=TENANTS.get(env, []),
+                            path_type="vpc", node2=config['node2'],
+                            pg_name=config['policy_group'], verbose=False
+                        )
+                        if not v_bindings:
+                            print(f"  [VERIFIED] VPC path is clean — 0 bindings remain")
+                        else:
+                            print(f"  [WARNING] {len(v_bindings)} binding(s) still remain")
+                        print(f"  [OVERWRITE] Cleanup complete — {ow_deleted} removed")
+                    else:
+                        print(f"  [OVERWRITE] No existing bindings found (clean VPC path)")
+                
                 results = deploy_vpc(session, apic_url, config, aep, dry_run)
                 
                 ok_bindings = sum(1 for b in results['bindings'] if b['success'])
