@@ -179,117 +179,6 @@ def deploy_static_binding(session, apic_url, tenant, app_profile, epg_name, vlan
 # MERGED DUAL-STRATEGY PORT QUERY
 # =============================================================================
 
-def query_all_port_bindings_merged(session, apic_url, node_id, port, tenants_list):
-    """Query ALL EPG bindings on a port using both strategies merged.
-    
-    Unlike the fallback approach, this ALWAYS runs both strategies and
-    merges results. This catches partial results from Strategy 1 on D1
-    where bracket encoding causes the class-level query to miss bindings.
-    
-    Returns list of binding dicts with: dn, encap, tenant, app_profile, epg, vlan
-    """
-    eth_port = f"eth{port}" if not port.startswith("eth") else port
-    path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_port}]"
-    
-    existing = []
-    seen_dns = set()
-    
-    # ------------------------------------------------------------------
-    # Strategy 1: Class-level query with eq() filter (fast)
-    # ------------------------------------------------------------------
-    s1_count = 0
-    try:
-        cls_url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\"{path_dn}\")"
-        cls_resp = session.get(cls_url, verify=False, timeout=30)
-        if cls_resp.status_code == 200:
-            for item in cls_resp.json().get("imdata", []):
-                attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
-                dn = attrs.get("dn", "")
-                if dn and dn not in seen_dns:
-                    seen_dns.add(dn)
-                    encap = attrs.get("encap", "")
-                    _tn = re.search(r'/tn-([^/]+)/', dn)
-                    _ap = re.search(r'/ap-([^/]+)/', dn)
-                    _epg = re.search(r'/epg-([^/]+)/', dn)
-                    _vlan = re.search(r'vlan-(\d+)', encap)
-                    existing.append({
-                        "dn": dn,
-                        "encap": encap,
-                        "tenant": _tn.group(1) if _tn else "",
-                        "app_profile": _ap.group(1) if _ap else "",
-                        "epg": _epg.group(1) if _epg else "",
-                        "vlan": int(_vlan.group(1)) if _vlan else 0
-                    })
-                    s1_count += 1
-    except Exception as e:
-        print(f"    [WARNING] Strategy 1 error: {e}")
-    
-    print(f"  [QUERY] Strategy 1 (class-level): {s1_count} binding(s)")
-    
-    # ------------------------------------------------------------------
-    # Strategy 2: Per-tenant EPG subtree walk (ALWAYS runs, merges new)
-    # Uses Python substring match on tDn — catches bindings that the
-    # class-level eq() filter misses due to URL encoding on D1.
-    # ------------------------------------------------------------------
-    s2_new = 0
-    print(f"  [QUERY] Strategy 2 (per-tenant EPG walk): scanning {len(tenants_list)} tenant(s)...")
-    
-    for tenant in tenants_list:
-        try:
-            # Get all app profiles in this tenant
-            ap_url = f"{apic_url}/api/mo/uni/tn-{tenant}.json?query-target=children&target-subtree-class=fvAp"
-            ap_resp = session.get(ap_url, verify=False, timeout=15)
-            if ap_resp.status_code != 200:
-                continue
-            
-            for ap_item in ap_resp.json().get("imdata", []):
-                ap_name = ap_item.get("fvAp", {}).get("attributes", {}).get("name", "")
-                if not ap_name:
-                    continue
-                
-                # Get all fvRsPathAtt under this app profile
-                epg_url = f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{ap_name}.json?query-target=subtree&target-subtree-class=fvRsPathAtt"
-                epg_resp = session.get(epg_url, verify=False, timeout=20)
-                if epg_resp.status_code != 200:
-                    continue
-                
-                for item in epg_resp.json().get("imdata", []):
-                    attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
-                    tdn = attrs.get("tDn", "")
-                    dn = attrs.get("dn", "")
-                    
-                    # Python substring match — immune to URL encoding issues
-                    if path_dn in tdn and dn not in seen_dns:
-                        seen_dns.add(dn)
-                        encap = attrs.get("encap", "")
-                        _tn = re.search(r'/tn-([^/]+)/', dn)
-                        _ap = re.search(r'/ap-([^/]+)/', dn)
-                        _epg = re.search(r'/epg-([^/]+)/', dn)
-                        _vlan = re.search(r'vlan-(\d+)', encap)
-                        existing.append({
-                            "dn": dn,
-                            "encap": encap,
-                            "tenant": _tn.group(1) if _tn else "",
-                            "app_profile": _ap.group(1) if _ap else "",
-                            "epg": _epg.group(1) if _epg else "",
-                            "vlan": int(_vlan.group(1)) if _vlan else 0
-                        })
-                        s2_new += 1
-        except Exception as e:
-            print(f"    [WARNING] Strategy 2 error for {tenant}: {e}")
-    
-    if s2_new > 0:
-        print(f"  [QUERY] Strategy 2 found {s2_new} additional binding(s) missed by Strategy 1")
-    else:
-        print(f"  [QUERY] Strategy 2 found 0 additional (Strategy 1 was complete)")
-    
-    print(f"  [TOTAL] {len(existing)} unique binding(s) on this port")
-    
-    # Sort by VLAN for clean display
-    existing.sort(key=lambda x: x.get('vlan', 0))
-    return existing
-
-
 # =============================================================================
 # CSV FUNCTIONS
 # =============================================================================
@@ -789,10 +678,11 @@ def main():
             tenants_list = TENANTS.get(env, [])
             
             # =============================================================
-            # MERGED DUAL-STRATEGY QUERY — always runs both, merges results
+            # 3-STRATEGY QUERY — individual + per-tenant + VPC protpaths
             # =============================================================
-            existing = query_all_port_bindings_merged(
-                session, apic_url, node_id, port, tenants_list
+            existing = query_all_bindings_on_port(
+                session, apic_url, node_id, port, POD_ID,
+                tenants=tenants_list
             )
             
             # No bindings found
@@ -882,8 +772,9 @@ def main():
                 
                 # Verify port is clean after deletion
                 time.sleep(1)
-                verify_bindings = query_all_port_bindings_merged(
-                    session, apic_url, node_id, port, tenants_list
+                verify_bindings = query_all_bindings_on_port(
+                    session, apic_url, node_id, port, POD_ID,
+                    tenants=tenants_list, verbose=False
                 )
                 if not verify_bindings:
                     print(f"  [VERIFIED] Port is clean — 0 bindings remain")
