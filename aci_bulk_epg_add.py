@@ -682,7 +682,9 @@ def main():
             # =============================================================
             existing = query_all_bindings_on_port(
                 session, apic_url, node_id, port, POD_ID,
-                tenants=tenants_list
+                tenants=tenants_list,
+                token_state=token_states.get(env),
+                credentials=_credentials
             )
             
             # No bindings found
@@ -774,7 +776,9 @@ def main():
                 time.sleep(1)
                 verify_bindings = query_all_bindings_on_port(
                     session, apic_url, node_id, port, POD_ID,
-                    tenants=tenants_list, verbose=False
+                    tenants=tenants_list, verbose=False,
+                    token_state=token_states.get(env),
+                    credentials=_credentials
                 )
                 if not verify_bindings:
                     print(f"  [VERIFIED] Port is clean — 0 bindings remain")
