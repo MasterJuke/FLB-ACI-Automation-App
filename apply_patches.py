@@ -758,14 +758,11 @@ def patch_vpc_port_display(content):
                                   "VPC: EPG Binding Mode prompt")
 
     # --- PATCH O-vpc: Inject overwrite deletion before deploy_vpc call ---
-    old_vpc_deploy_call = '''            elif confirm in ['Y', 'YES']:
-                # Deploy
-                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
-                results = deploy_vpc(session, apic_url, config, aep, dry_run)'''
+    # NOTE: Target just the deploy_vpc() call line — works whether the
+    #       cleanup patch has already modified the enclosing elif block or not.
+    old_vpc_deploy_call = '''                results = deploy_vpc(session, apic_url, config, aep, dry_run)'''
 
-    new_vpc_deploy_call = '''            elif confirm in ['Y', 'YES']:
-                # Deploy
-                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
+    new_vpc_deploy_call = '''
                 
                 # Overwrite: delete ALL existing EPG bindings before Step 4
                 if overwrite_mode and not dry_run:
@@ -1279,14 +1276,11 @@ def patch_individual_port_display(content):
                                   "Individual: EPG Binding Mode prompt")
 
     # --- PATCH O-ind: Inject overwrite deletion before deploy_individual_port call ---
-    old_ind_deploy_call = '''            elif confirm in ['Y', 'YES']:
-                # Deploy
-                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
-                results = deploy_individual_port(session, apic_url, config, dry_run)'''
+    # NOTE: Target just the deploy_individual_port() call line — works whether
+    #       the cleanup patch has already modified the enclosing elif block or not.
+    old_ind_deploy_call = '''                results = deploy_individual_port(session, apic_url, config, dry_run)'''
 
-    new_ind_deploy_call = '''            elif confirm in ['Y', 'YES']:
-                # Deploy
-                print("\\n  Deploying..." if not dry_run else "\\n  Dry-run...")
+    new_ind_deploy_call = '''
                 
                 # Overwrite: delete ALL existing EPG bindings before Step 4
                 if overwrite_mode and not dry_run:
