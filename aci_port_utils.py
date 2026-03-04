@@ -40,7 +40,7 @@ Usage:
     )
 
 Author: Network Automation
-Version: 1.4.0 — Merged dual-strategy query (always runs both, deduplicates)
+Version: 1.5.0 — 3-strategy query: individual + per-tenant + VPC protpaths discovery
 """
 
 import os
@@ -1638,22 +1638,196 @@ def reauth_apic(session, apic_url, username, password, token_state=None):
 # This returns ALL bindings on that port in a SINGLE API call regardless of
 # which tenant/AP/EPG they belong to. The exam tests this pattern heavily.
 
+def _parse_binding_attrs(attrs, seen_dns):
+    """
+    Parse fvRsPathAtt attributes into a binding dict.
+    Returns (binding_dict, is_new) or (None, False) if already seen.
+    Internal helper for query_all_bindings_on_port().
+    """
+    dn = attrs.get("dn", "")
+    if not dn or dn in seen_dns:
+        return None, False
+    seen_dns.add(dn)
+    encap = attrs.get("encap", "")
+    tn_match = re.search(r'/tn-([^/]+)/', dn)
+    ap_match = re.search(r'/ap-([^/]+)/', dn)
+    epg_match = re.search(r'/epg-([^/]+)/', dn)
+    vlan_match = re.search(r'vlan-(\d+)', encap)
+    return {
+        "dn": dn,
+        "tDn": attrs.get("tDn", ""),
+        "encap": encap,
+        "mode": attrs.get("mode", ""),
+        "tenant": tn_match.group(1) if tn_match else "",
+        "app_profile": ap_match.group(1) if ap_match else "",
+        "epg": epg_match.group(1) if epg_match else "",
+        "vlan": int(vlan_match.group(1)) if vlan_match else 0
+    }, True
+
+
+def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
+                                  verbose=True):
+    """
+    Discover VPC protpaths DN(s) for a physical port.
+
+    A physical port may have bindings deployed via VPC policy groups
+    (protpaths) rather than individual paths. This function:
+      1. Finds the port selector → policy group name for this port
+      2. Checks if it's a VPC bundle (accbundle with lagT="node")
+      3. Finds the VPC peer node via fabricExplicitGEp
+      4. Returns the protpaths DN string(s) to query
+
+    Returns list of protpath DN strings (may be empty if port is individual).
+
+    CCIE Automation Note:
+    In ACI, VPC static path bindings use protpaths-{node1}-{node2} in the
+    tDn, not paths-{node}. The policy group name (e.g. EDCAVIO-ACC-R16_e8.VPC)
+    appears in pathep-[...] rather than the physical eth interface.
+    """
+    port_num = port.split('/')[-1] if '/' in port else port
+    protpath_dns = []
+
+    # ------------------------------------------------------------------
+    # Step 1: Find port selector(s) referencing this port on this node
+    # Query infraPortBlk for matching fromPort/toPort, filter by node_id
+    # ------------------------------------------------------------------
+    pg_names = []
+    try:
+        url = (f"{apic_url}/api/class/infraPortBlk.json"
+               f"?query-target-filter=and(eq(infraPortBlk.fromPort,\"{port_num}\"),"
+               f"eq(infraPortBlk.toPort,\"{port_num}\"))")
+        resp = session.get(url, verify=False, timeout=15)
+        if resp.status_code == 200:
+            for item in resp.json().get("imdata", []):
+                blk_dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
+                if node_id not in blk_dn:
+                    continue
+
+                # Walk up from infraPortBlk to parent infraHPortS to find
+                # the associated policy group via infraRsAccBaseGrp
+                # DN format: uni/infra/accportprof-{profile}/hports-{selector}-typ-range/portblk-{block}
+                selector_match = re.search(r'(uni/infra/accportprof-[^/]+/hports-[^/]+-typ-range)', blk_dn)
+                if not selector_match:
+                    continue
+
+                selector_dn = selector_match.group(1)
+                pg_url = (f"{apic_url}/api/mo/{selector_dn}.json"
+                          f"?query-target=children&target-subtree-class=infraRsAccBaseGrp")
+                pg_resp = session.get(pg_url, verify=False, timeout=15)
+                if pg_resp.status_code == 200:
+                    for pg_item in pg_resp.json().get("imdata", []):
+                        tdn = pg_item.get("infraRsAccBaseGrp", {}).get("attributes", {}).get("tDn", "")
+                        # tDn = uni/infra/funcprof/accbundle-{name} for VPC/PC
+                        # tDn = uni/infra/funcprof/accportgrp-{name} for individual
+                        bundle_match = re.search(r'accbundle-(.+)$', tdn)
+                        if bundle_match:
+                            pg_names.append(bundle_match.group(1))
+    except Exception as e:
+        if verbose:
+            print(f"    [WARNING] Strategy 3 port selector query error: {e}")
+
+    if not pg_names:
+        return []
+
+    if verbose:
+        print(f"  [QUERY] Strategy 3: found {len(pg_names)} VPC/PC policy group(s) on port: {', '.join(pg_names)}")
+
+    # ------------------------------------------------------------------
+    # Step 2: Verify each is a VPC bundle (lagT="node")
+    # ------------------------------------------------------------------
+    vpc_pg_names = []
+    for pg in pg_names:
+        try:
+            pg_url = f"{apic_url}/api/mo/uni/infra/funcprof/accbundle-{pg}.json"
+            pg_resp = session.get(pg_url, verify=False, timeout=15)
+            if pg_resp.status_code == 200:
+                pg_data = pg_resp.json().get("imdata", [])
+                if pg_data:
+                    lag_t = pg_data[0].get("infraAccBndlGrp", {}).get("attributes", {}).get("lagT", "")
+                    if lag_t == "node":
+                        vpc_pg_names.append(pg)
+                        if verbose:
+                            print(f"    [VPC] {pg} (lagT=node)")
+                    elif verbose:
+                        print(f"    [PC]  {pg} (lagT={lag_t}, not VPC — skipping)")
+        except Exception as e:
+            if verbose:
+                print(f"    [WARNING] Strategy 3 PG check error for {pg}: {e}")
+
+    if not vpc_pg_names:
+        return []
+
+    # ------------------------------------------------------------------
+    # Step 3: Find VPC peer node via fabricExplicitGEp
+    # ------------------------------------------------------------------
+    peer_node = None
+    try:
+        vpc_url = f"{apic_url}/api/class/fabricExplicitGEp.json?rsp-subtree=children"
+        vpc_resp = session.get(vpc_url, verify=False, timeout=15)
+        if vpc_resp.status_code == 200:
+            for gep in vpc_resp.json().get("imdata", []):
+                children = gep.get("fabricExplicitGEp", {}).get("children", [])
+                node_ids = []
+                for child in children:
+                    nid = child.get("fabricNodePEp", {}).get("attributes", {}).get("id", "")
+                    if nid:
+                        node_ids.append(nid)
+
+                if str(node_id) in node_ids:
+                    # Found our node's VPC pair
+                    for nid in node_ids:
+                        if nid != str(node_id):
+                            peer_node = nid
+                            break
+                    if peer_node:
+                        break
+    except Exception as e:
+        if verbose:
+            print(f"    [WARNING] Strategy 3 VPC peer discovery error: {e}")
+
+    if not peer_node:
+        if verbose:
+            print(f"    [WARNING] Strategy 3: could not find VPC peer for node {node_id}")
+        return []
+
+    if verbose:
+        print(f"  [QUERY] Strategy 3: VPC pair = {node_id}-{peer_node}")
+
+    # ------------------------------------------------------------------
+    # Step 4: Build protpaths DN(s)
+    # Ensure consistent ordering (lower node first)
+    # ------------------------------------------------------------------
+    n1, n2 = sorted([str(node_id), str(peer_node)], key=int)
+
+    for pg in vpc_pg_names:
+        protpath = f"topology/pod-{pod_id}/protpaths-{n1}-{n2}/pathep-[{pg}]"
+        protpath_dns.append(protpath)
+        if verbose:
+            print(f"  [QUERY] Strategy 3: will query protpath: ...protpaths-{n1}-{n2}/pathep-[{pg}]")
+
+    return protpath_dns
+
+
 def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                                tenants=None, path_type="individual",
                                node2=None, pg_name=None, verbose=True):
     """
-    Query ALL fvRsPathAtt bindings on a port using merged dual-strategy.
+    Query ALL fvRsPathAtt bindings on a port using THREE merged strategies.
 
-    ALWAYS runs both strategies and merges results with deduplication.
-    This catches partial results from Strategy 1 on D1 where bracket
-    encoding in the eq() filter causes the class-level query to miss
-    some bindings.
+    ALWAYS runs all applicable strategies and merges results with deduplication.
+
+    Strategy 1: Class-level eq() filter on individual path DN (fast)
+    Strategy 2: Per-tenant EPG subtree walk with Python substring match
+    Strategy 3: VPC protpaths discovery — finds VPC policy groups assigned
+                to the port, discovers the VPC peer node, and queries bindings
+                on the protpaths DN. Catches bindings deployed via VPC that
+                use a completely different tDn format.
 
     Args:
         session: requests.Session with APIC auth
         apic_url: APIC base URL
-        node_id: Leaf node ID (e.g., '1301')
-        port: Port string (e.g., '1/68')
+        node_id: Leaf node ID (e.g., '1602')
+        port: Port string (e.g., '1/48')
         pod_id: Pod ID (default '1')
         tenants: List of tenant names for Strategy 2. If None, auto-discovers.
         path_type: "individual" for single ports, "vpc" for protpaths
@@ -1687,35 +1861,20 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
         if resp.status_code == 200:
             for item in resp.json().get("imdata", []):
                 attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
-                dn = attrs.get("dn", "")
-                if dn and dn not in seen_dns:
-                    seen_dns.add(dn)
-                    encap = attrs.get("encap", "")
-                    tn_match = re.search(r'/tn-([^/]+)/', dn)
-                    ap_match = re.search(r'/ap-([^/]+)/', dn)
-                    epg_match = re.search(r'/epg-([^/]+)/', dn)
-                    vlan_match = re.search(r'vlan-(\d+)', encap)
-                    bindings.append({
-                        "dn": dn,
-                        "tDn": attrs.get("tDn", ""),
-                        "encap": encap,
-                        "mode": attrs.get("mode", ""),
-                        "tenant": tn_match.group(1) if tn_match else "",
-                        "app_profile": ap_match.group(1) if ap_match else "",
-                        "epg": epg_match.group(1) if epg_match else "",
-                        "vlan": int(vlan_match.group(1)) if vlan_match else 0
-                    })
+                binding, is_new = _parse_binding_attrs(attrs, seen_dns)
+                if is_new:
+                    bindings.append(binding)
                     s1_count += 1
     except Exception as e:
         if verbose:
             print(f"    [WARNING] Strategy 1 error: {e}")
 
     if verbose:
-        print(f"  [QUERY] Strategy 1 (class-level): {s1_count} binding(s)")
+        print(f"  [QUERY] Strategy 1 (class-level individual): {s1_count} binding(s)")
 
     # ------------------------------------------------------------------
     # Strategy 2: Per-tenant EPG subtree walk (ALWAYS runs, merges new)
-    # Uses Python substring match — immune to URL encoding issues on D1.
+    # Uses Python substring match — immune to URL encoding issues.
     # ------------------------------------------------------------------
     # Auto-discover tenants if not provided
     if tenants is None:
@@ -1762,36 +1921,67 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                 for item in epg_resp.json().get("imdata", []):
                     attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
                     tdn = attrs.get("tDn", "")
-                    dn = attrs.get("dn", "")
 
                     # Python substring match — catches what eq() misses
-                    if path_dn in tdn and dn not in seen_dns:
-                        seen_dns.add(dn)
-                        encap = attrs.get("encap", "")
-                        tn_match = re.search(r'/tn-([^/]+)/', dn)
-                        ap_match = re.search(r'/ap-([^/]+)/', dn)
-                        epg_match = re.search(r'/epg-([^/]+)/', dn)
-                        vlan_match = re.search(r'vlan-(\d+)', encap)
-                        bindings.append({
-                            "dn": dn,
-                            "tDn": tdn,
-                            "encap": encap,
-                            "mode": attrs.get("mode", ""),
-                            "tenant": tn_match.group(1) if tn_match else "",
-                            "app_profile": ap_match.group(1) if ap_match else "",
-                            "epg": epg_match.group(1) if epg_match else "",
-                            "vlan": int(vlan_match.group(1)) if vlan_match else 0
-                        })
-                        s2_new += 1
+                    if path_dn in tdn:
+                        binding, is_new = _parse_binding_attrs(attrs, seen_dns)
+                        if is_new:
+                            bindings.append(binding)
+                            s2_new += 1
         except Exception as e:
             if verbose:
                 print(f"    [WARNING] Strategy 2 error for {tenant}: {e}")
 
     if verbose:
         if s2_new > 0:
-            print(f"  [QUERY] Strategy 2 found {s2_new} additional binding(s) missed by Strategy 1")
+            print(f"  [QUERY] Strategy 2 found {s2_new} additional binding(s)")
         else:
             print(f"  [QUERY] Strategy 2: confirmed (0 additional)")
+
+    # ------------------------------------------------------------------
+    # Strategy 3: VPC protpaths discovery
+    # The port may have bindings deployed via VPC policy groups that use
+    # protpaths-{node1}-{node2}/pathep-[{pg_name}] — a completely different
+    # tDn than the individual paths-{node}/pathep-[eth{port}] we searched.
+    #
+    # Only runs for individual path queries (if caller already specified
+    # path_type="vpc", they've already built the correct protpath DN).
+    # ------------------------------------------------------------------
+    s3_count = 0
+    if path_type != "vpc":
+        if verbose:
+            print(f"  [QUERY] Strategy 3 (VPC protpaths discovery)...")
+
+        vpc_protpaths = _discover_vpc_paths_for_port(
+            session, apic_url, node_id, port, pod_id, verbose
+        )
+
+        for vpc_path in vpc_protpaths:
+            # Class-level query on the VPC protpath DN
+            try:
+                vpc_url = (f"{apic_url}/api/class/fvRsPathAtt.json"
+                           f"?query-target-filter=eq(fvRsPathAtt.tDn,\"{vpc_path}\")")
+                vpc_resp = session.get(vpc_url, verify=False, timeout=30)
+                if vpc_resp.status_code == 200:
+                    for item in vpc_resp.json().get("imdata", []):
+                        attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                        binding, is_new = _parse_binding_attrs(attrs, seen_dns)
+                        if is_new:
+                            bindings.append(binding)
+                            s3_count += 1
+            except Exception as e:
+                if verbose:
+                    print(f"    [WARNING] Strategy 3 protpath query error: {e}")
+
+        if verbose:
+            if s3_count > 0:
+                print(f"  [QUERY] Strategy 3 found {s3_count} VPC binding(s)")
+            elif vpc_protpaths:
+                print(f"  [QUERY] Strategy 3: 0 additional VPC bindings")
+            else:
+                print(f"  [QUERY] Strategy 3: no VPC policy group on this port")
+
+    if verbose:
         print(f"  [TOTAL] {len(bindings)} unique binding(s)")
 
     bindings.sort(key=lambda x: x.get("vlan", 0))
