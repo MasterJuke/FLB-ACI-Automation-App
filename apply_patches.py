@@ -369,11 +369,14 @@ def patch_vpc_port_display(content):
     content, _ = find_and_replace(content, old_query, new_query, "VPC port query + mode selection")
 
     # --- PATCH C: Store interface2 + asymmetric flag in config ---
-    old_cfg = '''            "interface": interface,'''
-    new_cfg = '''            "interface": interface,
+    if '"asymmetric_vpc": asymmetric_vpc' not in content:
+        old_cfg = '''            "interface": interface,'''
+        new_cfg = '''            "interface": interface,
             "interface2": selected_port2['interface'] if asymmetric_vpc else interface,
             "asymmetric_vpc": asymmetric_vpc,'''
-    content, _ = find_and_replace(content, old_cfg, new_cfg, "Config: interface2 + asymmetric flag")
+        content, _ = find_and_replace(content, old_cfg, new_cfg, "Config: interface2 + asymmetric flag")
+    else:
+        print(f"    [SKIP] Config: interface2 + asymmetric flag — already present")
 
     # --- PATCH D: deploy_vpc step 1 — per-node interfaces ---
     old_s1 = '''    # 1. Set Port Description on both nodes
@@ -521,21 +524,25 @@ def patch_vpc_port_display(content):
     content, _ = find_and_replace(content, old_deploy, new_deploy, "VPC cleanup + deploy call")
 
     # --- PATCH H: Preview — show per-node interfaces ---
-    old_pv = '''    print(f"  Interface IDs:          {config['interface']}")'''
-    new_pv = '''    iface2 = config.get('interface2', config['interface'])
+    if "Interface (node {config['node1']})" not in content:
+        old_pv = '''    print(f"  Interface IDs:          {config['interface']}")'''
+        new_pv = '''    iface2 = config.get('interface2', config['interface'])
     if config.get('asymmetric_vpc'):
         print(f"  Interface (node {config['node1']}):  eth{config['interface']}")
         print(f"  Interface (node {config['node2']}):  eth{iface2}")
     else:
         print(f"  Interface IDs:          {config['interface']}")'''
-    content, _ = find_and_replace(content, old_pv, new_pv, "VPC preview: per-node interfaces")
+        content, _ = find_and_replace(content, old_pv, new_pv, "VPC preview: per-node interfaces")
+    else:
+        print(f"    [SKIP] VPC preview: per-node interfaces — already present")
 
     # --- PATCH I: PG Mode toggle after Flow Control selection ---
-    old_fc_end = '''    # Get credentials
+    if "POLICY GROUP MODE" not in content:
+        old_fc_end = '''    # Get credentials
     print("\\n" + "-" * 70)
     print(" AUTHENTICATION")'''
 
-    new_fc_end = '''    # Policy Group Mode
+        new_fc_end = '''    # Policy Group Mode
     print("\\n" + "-" * 70)
     print(" POLICY GROUP MODE")
     print("-" * 70)
@@ -552,7 +559,9 @@ def patch_vpc_port_display(content):
     print("\\n" + "-" * 70)
     print(" AUTHENTICATION")'''
 
-    content, _ = find_and_replace(content, old_fc_end, new_fc_end, "PG mode toggle prompt")
+        content, _ = find_and_replace(content, old_fc_end, new_fc_end, "PG mode toggle prompt")
+    else:
+        print(f"    [SKIP] PG mode toggle prompt — already present")
 
     # --- PATCH J: PG reuse query during config building ---
     # After config dict is built with 'policy_group', inject the reuse query
@@ -663,11 +672,12 @@ def patch_vpc_port_display(content):
     content, _ = find_and_replace(content, old_vpc_auth, new_vpc_auth, "VPC: token state tracking")
 
     # --- Token Refresh: inject refresh call at start of deploy loop ---
-    old_vpc_loop_env = '''        session = sessions[env]
+    if "ensure_token_fresh" not in content:
+        old_vpc_loop_env = '''        session = sessions[env]
         apic_url = APIC_URLS[env]
         aep = global_settings["aep"].get(env)'''
 
-    new_vpc_loop_env = '''        session = sessions[env]
+        new_vpc_loop_env = '''        session = sessions[env]
         apic_url = APIC_URLS[env]
         aep = global_settings["aep"].get(env)
         
@@ -677,7 +687,9 @@ def patch_vpc_port_display(content):
                 reauth_apic(session, apic_url, _credentials["username"],
                            _credentials["password"], token_states[env])'''
 
-    content, _ = find_and_replace(content, old_vpc_loop_env, new_vpc_loop_env, "VPC: token refresh in deploy loop")
+        content, _ = find_and_replace(content, old_vpc_loop_env, new_vpc_loop_env, "VPC: token refresh in deploy loop")
+    else:
+        print(f"    [SKIP] VPC: token refresh in deploy loop — already present")
 
     # =========================================================================
     # FEATURE 3: Select-once — PG exists handling (VPC)
@@ -760,9 +772,11 @@ def patch_vpc_port_display(content):
     # --- PATCH O-vpc: Inject overwrite deletion before deploy_vpc call ---
     # NOTE: Target just the deploy_vpc() call line — works whether the
     #       cleanup patch has already modified the enclosing elif block or not.
-    old_vpc_deploy_call = '''                results = deploy_vpc(session, apic_url, config, aep, dry_run)'''
+    # Guard: skip if already injected (prevents stacking overwrite blocks on re-run)
+    if "[OVERWRITE] Removing existing EPG bindings on VPC" not in content:
+        old_vpc_deploy_call = '''                results = deploy_vpc(session, apic_url, config, aep, dry_run)'''
 
-    new_vpc_deploy_call = '''
+        new_vpc_deploy_call = '''
                 
                 # Overwrite: delete ALL existing EPG bindings before Step 4
                 if overwrite_mode and not dry_run:
@@ -872,8 +886,10 @@ def patch_vpc_port_display(content):
                 
                 results = deploy_vpc(session, apic_url, config, aep, dry_run)'''
 
-    content, _ = find_and_replace(content, old_vpc_deploy_call, new_vpc_deploy_call,
-                                  "VPC: overwrite deletion before deploy")
+        content, _ = find_and_replace(content, old_vpc_deploy_call, new_vpc_deploy_call,
+                                      "VPC: overwrite deletion before deploy")
+    else:
+        print(f"    [SKIP] VPC: overwrite deletion before deploy — already present")
 
     return content
 
@@ -1014,13 +1030,14 @@ def patch_individual_port_display(content):
     content, _ = find_and_replace(content, old_indiv_deploy_call, new_indiv_deploy_call, "Individual cleanup injection")
 
     # --- PATCH I-ind: PG Mode toggle after Run Mode selection ---
-    old_ind_auth = '''    # Get credentials
+    if "POLICY GROUP MODE" not in content:
+        old_ind_auth = '''    # Get credentials
     print("\\n" + "-" * 70)
     print(" AUTHENTICATION")
     print("-" * 70)
     username = prompt_input("\\nUsername: ").strip()'''
 
-    new_ind_auth = '''    # Policy Group Mode
+        new_ind_auth = '''    # Policy Group Mode
     print("\\n" + "-" * 70)
     print(" POLICY GROUP MODE")
     print("-" * 70)
@@ -1039,7 +1056,9 @@ def patch_individual_port_display(content):
     print("-" * 70)
     username = prompt_input("\\nUsername: ").strip()'''
 
-    content, _ = find_and_replace(content, old_ind_auth, new_ind_auth, "Individual: PG mode toggle")
+        content, _ = find_and_replace(content, old_ind_auth, new_ind_auth, "Individual: PG mode toggle")
+    else:
+        print(f"    [SKIP] Individual: PG mode toggle — already present")
 
     # --- PATCH J-ind: PG reuse query during config building ---
     old_check_ind_pg = '''        # Check if policy group already exists
@@ -1278,9 +1297,11 @@ def patch_individual_port_display(content):
     # --- PATCH O-ind: Inject overwrite deletion before deploy_individual_port call ---
     # NOTE: Target just the deploy_individual_port() call line — works whether
     #       the cleanup patch has already modified the enclosing elif block or not.
-    old_ind_deploy_call = '''                results = deploy_individual_port(session, apic_url, config, dry_run)'''
+    # Guard: skip if already injected (prevents stacking overwrite blocks on re-run)
+    if "[OVERWRITE] Removing existing EPG bindings on port" not in content:
+        old_ind_deploy_call = '''                results = deploy_individual_port(session, apic_url, config, dry_run)'''
 
-    new_ind_deploy_call = '''
+        new_ind_deploy_call = '''
                 
                 # Overwrite: delete ALL existing EPG bindings before Step 4
                 if overwrite_mode and not dry_run:
@@ -1379,8 +1400,10 @@ def patch_individual_port_display(content):
                 
                 results = deploy_individual_port(session, apic_url, config, dry_run)'''
 
-    content, _ = find_and_replace(content, old_ind_deploy_call, new_ind_deploy_call,
-                                  "Individual: overwrite deletion before deploy")
+        content, _ = find_and_replace(content, old_ind_deploy_call, new_ind_deploy_call,
+                                      "Individual: overwrite deletion before deploy")
+    else:
+        print(f"    [SKIP] Individual: overwrite deletion before deploy — already present")
 
     return content
 
@@ -1498,7 +1521,8 @@ def patch_epg_add(content):
     content, _ = find_and_replace(content, old_loaded, new_loaded, "EPG Add: expansion info")
 
     # --- PATCH C: EPG Mode toggle after binding mode ---
-    old_post_binding = '''    # Get credentials
+    if "EPG MODE" not in content:
+        old_post_binding = '''    # Get credentials
     print("\\n" + "-" * 70)
     print(" AUTHENTICATION")
     print("-" * 70)
@@ -1506,7 +1530,7 @@ def patch_epg_add(content):
     sys.stdout.flush()
     username = input().strip()'''
 
-    new_post_binding = '''    # EPG Mode: Add or Overwrite
+        new_post_binding = '''    # EPG Mode: Add or Overwrite
     print("\\n" + "-" * 70)
     print(" EPG MODE")
     print("-" * 70)
@@ -1534,7 +1558,9 @@ def patch_epg_add(content):
     sys.stdout.flush()
     username = input().strip()'''
 
-    content, _ = find_and_replace(content, old_post_binding, new_post_binding, "EPG Add: overwrite mode toggle")
+        content, _ = find_and_replace(content, old_post_binding, new_post_binding, "EPG Add: overwrite mode toggle")
+    else:
+        print(f"    [SKIP] EPG Add: overwrite mode toggle — already present")
 
     # --- PATCH D: Inject overwrite deletion before Phase 4 deployment ---
     # Target 1: original unpatched code
@@ -1775,15 +1801,18 @@ def patch_epg_add(content):
     content, _ = find_and_replace(content, old_summary, new_summary, "EPG Add: final summary with overwrite count")
 
     # --- PATCH G: Fix deploy confirmation to show correct count ---
-    old_confirm = '''    print(f"\\nReady to deploy {len(new_bindings)} binding(s)")'''
+    if "Ready to OVERWRITE: wipe existing" not in content:
+        old_confirm = '''    print(f"\\nReady to deploy {len(new_bindings)} binding(s)")'''
 
-    new_confirm = '''    deploy_count = len(all_bindings) if overwrite_mode else len(new_bindings)
+        new_confirm = '''    deploy_count = len(all_bindings) if overwrite_mode else len(new_bindings)
     if overwrite_mode:
         print(f"\\nReady to OVERWRITE: wipe existing + deploy {deploy_count} binding(s)")
     else:
         print(f"\\nReady to deploy {len(new_bindings)} binding(s)")'''
 
-    content, _ = find_and_replace(content, old_confirm, new_confirm, "EPG Add: confirm count for overwrite")
+        content, _ = find_and_replace(content, old_confirm, new_confirm, "EPG Add: confirm count for overwrite")
+    else:
+        print(f"    [SKIP] EPG Add: confirm count for overwrite — already present")
 
     # --- Token Refresh: inject token_states after auth loop ---
     old_epg_auth_check = '''    if not sessions:
@@ -1998,7 +2027,9 @@ def patch_deployment_app(content):
     content, _ = find_and_replace(content, old_csv_req, new_csv_req, "EPG Delete CSV: VLANS now optional")
 
     # --- PATCH 7: Add find_first_avail_port() function after find_port_in_output ---
-    old_find_port_end = '''    for line in reversed(output_lines[start_idx:]):
+    # Guard: skip if already injected
+    if "find_first_avail_port" not in content:
+        old_find_port_end = '''    for line in reversed(output_lines[start_idx:]):
         lm = re.match(r'^\\s*(\\d+)[.:)\\s]+(?:eth)?(\\d+)/(\\d+)', line.strip())
         if lm:
             menu_num, slot, port_num = lm.group(1), lm.group(2), lm.group(3)
@@ -2006,7 +2037,7 @@ def patch_deployment_app(content):
                 return menu_num
     return None'''
 
-    new_find_port_end = '''    for line in reversed(output_lines[start_idx:]):
+        new_find_port_end = '''    for line in reversed(output_lines[start_idx:]):
         lm = re.match(r'^\\s*(\\d+)[.:)\\s]+(?:eth)?(\\d+)/(\\d+)', line.strip())
         if lm:
             menu_num, slot, port_num = lm.group(1), lm.group(2), lm.group(3)
@@ -2035,7 +2066,9 @@ def find_first_avail_port(output_lines, start_idx=0):
                 return m.group(1), m.group(2)
     return None, None'''
 
-    content, _ = find_and_replace(content, old_find_port_end, new_find_port_end, "Add find_first_avail_port function")
+        content, _ = find_and_replace(content, old_find_port_end, new_find_port_end, "Add find_first_avail_port function")
+    else:
+        print(f"    [SKIP] Add find_first_avail_port function — already present")
 
     # --- PATCH 8: Replace auto-select port 1 with first-AVAIL logic ---
     old_auto_select = """                            elif cfg.get('auto_select_port', True):
@@ -2094,11 +2127,13 @@ def find_first_avail_port(output_lines, start_idx=0):
                                   "Settings: add epg_overwrite_default to DEFAULT_CONFIG")
 
     # --- PATCH 9c: Add EPG Overwrite toggle after auto-select port toggle ---
-    old_settings_end = '''</div>
+    # Guard: skip if already injected
+    if "settingsEpgOverwrite" not in content:
+        old_settings_end = '''</div>
 </div>
 <div class="settings-section"><div class="settings-section-title">ℹ️ Application Info</div>'''
 
-    new_settings_end = '''</div>
+        new_settings_end = '''</div>
 <div class="settings-row">
 <label class="toggle-row" for="settingsEpgOverwrite">
   <div class="toggle-switch">
@@ -2115,8 +2150,10 @@ def find_first_avail_port(output_lines, start_idx=0):
 </div>
 <div class="settings-section"><div class="settings-section-title">ℹ️ Application Info</div>'''
 
-    content, _ = find_and_replace(content, old_settings_end, new_settings_end,
-                                  "Settings: EPG Overwrite toggle")
+        content, _ = find_and_replace(content, old_settings_end, new_settings_end,
+                                      "Settings: EPG Overwrite toggle")
+    else:
+        print(f"    [SKIP] Settings: EPG Overwrite toggle — already present")
 
     # --- PATCH 9d: Add epg_overwrite_default to saveSettings JS ---
     old_save_settings = '''    auto_select_port:document.getElementById('settingsAutoSelectPort').checked,
@@ -2130,11 +2167,11 @@ def find_first_avail_port(output_lines, start_idx=0):
                                   "Settings: save epg_overwrite_default in JS")
 
     # --- PATCH 9e: Auto-inject EPG MODE prompt response ---
-    # Detect "EPG BINDING MODE" or "EPG MODE" in recent output lines,
-    # then auto-respond to the (1/2) prompt based on the setting.
-    old_tenant_autostart = '''                        # AUTO-TENANT SELECTION'''
+    # Guard: skip if already injected
+    if "AUTO-EPG MODE SELECTION" not in content:
+        old_tenant_autostart = '''                        # AUTO-TENANT SELECTION'''
 
-    new_epg_mode_inject = '''                        # AUTO-EPG MODE SELECTION
+        new_epg_mode_inject = '''                        # AUTO-EPG MODE SELECTION
                         # Detects "EPG BINDING MODE" or "EPG MODE" in recent output and
                         # auto-injects "2" (overwrite) or "1" (add) based on settings.
                         recent_5 = [r.lower() for r in current_run["output_lines"][-5:]]
@@ -2154,8 +2191,10 @@ def find_first_avail_port(output_lines, start_idx=0):
 
                         # AUTO-TENANT SELECTION'''
 
-    content, _ = find_and_replace(content, old_tenant_autostart, new_epg_mode_inject,
-                                  "Auto-inject: EPG MODE from settings")
+        content, _ = find_and_replace(content, old_tenant_autostart, new_epg_mode_inject,
+                                      "Auto-inject: EPG MODE from settings")
+    else:
+        print(f"    [SKIP] Auto-inject: EPG MODE from settings — already present")
 
     # --- PATCH README-A: Replace readme tab bar with 7 tabs ---
     old_readme_tabs = """<div class="readme-tabs">
@@ -2337,7 +2376,9 @@ def find_first_avail_port(output_lines, start_idx=0):
     content, _ = find_and_replace(content, old_tab_js, new_tab_js, "README: JS tab switcher for new tabs")
 
     # --- PATCH 10: Enhance extract_deployed_ports to also scan "Selected:" lines ---
-    old_extract = '''def extract_deployed_ports(output_lines, tracked_ports):
+    # Guard: skip if already injected (extract_deployment_statuses only exists in new code)
+    if "extract_deployment_statuses" not in content:
+        old_extract = '''def extract_deployed_ports(output_lines, tracked_ports):
     """
     Resolve the final list of deployed ports (one per CSV row).
 
@@ -2376,7 +2417,7 @@ def find_first_avail_port(output_lines, start_idx=0):
             result.append(p)
     return result'''
 
-    new_extract = '''def extract_deployed_ports(output_lines, tracked_ports):
+        new_extract = '''def extract_deployed_ports(output_lines, tracked_ports):
     """
     Resolve the final list of deployed ports (one per CSV row).
 
@@ -2464,8 +2505,10 @@ def extract_deployment_statuses(output_lines):
             quit_seen = True
     return statuses, quit_seen'''
 
-    content, _ = find_and_replace(content, old_extract, new_extract,
-                                  "Enhanced extract_deployed_ports + extract_deployment_statuses")
+        content, _ = find_and_replace(content, old_extract, new_extract,
+                                      "Enhanced extract_deployed_ports + extract_deployment_statuses")
+    else:
+        print(f"    [SKIP] Enhanced extract_deployed_ports + extract_deployment_statuses — already present")
 
     # --- PATCH 11: Enhance generate_results_csv with STATUS + SELECTED_PORT columns ---
     old_gen_results = '''def generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_lines, tracked_ports):
@@ -2586,14 +2629,16 @@ def extract_deployment_statuses(output_lines):
                                   "Always generate results CSV")
 
     # --- PATCH ROLLBACK-A: Inject parse_rollback_states + inject_restore_phase helpers ---
-    # Insert before generate_rollback_script
-    old_rollback_anchor = '''# =============================================================================
+    # Guard: skip if already injected
+    if "ROLLBACK STATE PARSING" not in content:
+        # Insert before generate_rollback_script
+        old_rollback_anchor = '''# =============================================================================
 # ROLLBACK SCRIPT GENERATION
 # =============================================================================
 
 def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):'''
 
-    new_rollback_anchor = '''# =============================================================================
+        new_rollback_anchor = '''# =============================================================================
 # ROLLBACK STATE PARSING & RESTORE INJECTION
 # =============================================================================
 
@@ -2789,8 +2834,10 @@ def inject_restore_phase(script, prior_states, deploy_type):
 
 def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):'''
 
-    content, _ = find_and_replace(content, old_rollback_anchor, new_rollback_anchor,
-                                  "Rollback: inject parse_rollback_states + inject_restore_phase")
+        content, _ = find_and_replace(content, old_rollback_anchor, new_rollback_anchor,
+                                      "Rollback: inject parse_rollback_states + inject_restore_phase")
+    else:
+        print(f"    [SKIP] Rollback: inject parse_rollback_states + inject_restore_phase — already present")
 
     # --- PATCH ROLLBACK-B: Modify generate_rollback_script to extract states and inject Phase 2 ---
     old_gen_call = '''        rollback_actions = parse_deployment_output(deploy_type, output_lines)
@@ -2826,9 +2873,11 @@ def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):'''
     # =========================================================================
 
     # --- PATCH CRED-A: Add credential file constant + save/load functions ---
-    old_cred_init = '''stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}'''
+    # Guard: skip if already injected (CREDENTIALS_FILE only exists in new code)
+    if "CREDENTIALS_FILE" not in content:
+        old_cred_init = '''stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}'''
 
-    new_cred_init = '''stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
+        new_cred_init = '''stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
 
 CREDENTIALS_FILE = os.path.join(BASE_DIR, '.aci_credentials')
 
@@ -2873,15 +2922,19 @@ def load_credentials_from_disk():
 # Auto-load on startup
 load_credentials_from_disk()'''
 
-    content, _ = find_and_replace(content, old_cred_init, new_cred_init,
-                                  "Credentials: add save/load to disk with base64")
+        content, _ = find_and_replace(content, old_cred_init, new_cred_init,
+                                      "Credentials: add save/load to disk with base64")
+    else:
+        print(f"    [SKIP] Credentials: add save/load to disk with base64 — already present")
 
     # --- PATCH CRED-B: Add API endpoints for save/load disk ---
-    old_cred_delete = '''    elif request.method == 'DELETE':
+    # Guard: skip if already injected (prevents duplicate Flask routes on re-run)
+    if "/api/credentials/save-to-disk" not in content:
+        old_cred_delete = '''    elif request.method == 'DELETE':
         stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
         return jsonify({'status': 'cleared'})'''
 
-    new_cred_delete = '''    elif request.method == 'DELETE':
+        new_cred_delete = '''    elif request.method == 'DELETE':
         stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
         return jsonify({'status': 'cleared'})
 
@@ -2902,8 +2955,10 @@ def api_credentials_load_disk():
         'apic_urls': stored_credentials.get('apic_urls', {"D1": "", "D2": "", "D3": ""})
     })'''
 
-    content, _ = find_and_replace(content, old_cred_delete, new_cred_delete,
-                                  "Credentials: save/load disk API endpoints")
+        content, _ = find_and_replace(content, old_cred_delete, new_cred_delete,
+                                      "Credentials: save/load disk API endpoints")
+    else:
+        print(f"    [SKIP] Credentials: save/load disk API endpoints — already present")
 
     # --- PATCH CRED-C: Add Save/Load disk buttons to UI ---
     old_cred_buttons = '''<div class="cred-actions"><button class="cred-btn save" onclick="saveCredentials()">Save Credentials</button><button class="cred-btn clear" onclick="clearCredentials()">Clear</button></div>'''
@@ -2915,9 +2970,11 @@ def api_credentials_load_disk():
                                   "Credentials: Save/Load disk buttons in UI")
 
     # --- PATCH CRED-D: Add JS functions for save/load disk ---
-    old_check_creds = '''function checkCredentials(){fetch('/api/credentials')'''
+    # Guard: skip if saveToDisk already injected (prevents duplicating JS functions)
+    if "function saveToDisk()" not in content:
+        old_check_creds = '''function checkCredentials(){fetch('/api/credentials')'''
 
-    new_check_creds = '''function saveToDisk(){
+        new_check_creds = '''function saveToDisk(){
   if(!credSet){alert('Set credentials first');return}
   fetch('/api/credentials/save-to-disk',{method:'POST'}).then(r=>r.json()).then(d=>{
     if(d.status==='saved') alert('Credentials saved to disk (.aci_credentials, base64 obfuscated)');
@@ -2939,8 +2996,10 @@ function loadFromDisk(){
 }
 function checkCredentials(){fetch('/api/credentials')'''
 
-    content, _ = find_and_replace(content, old_check_creds, new_check_creds,
-                                  "Credentials: JS save/load disk functions")
+        content, _ = find_and_replace(content, old_check_creds, new_check_creds,
+                                      "Credentials: JS save/load disk functions")
+    else:
+        print(f"    [SKIP] Credentials: JS save/load disk functions — already present")
 
     # --- PATCH CRED-E: Update hint text ---
     old_cred_hint = '''Credentials are stored <strong>in memory only</strong> and are never written to disk. They clear automatically when the app restarts.'''
