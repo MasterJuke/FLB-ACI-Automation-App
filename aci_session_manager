@@ -23,7 +23,7 @@ Usage (minimal change to existing scripts):
     r = apic.post(f"/api/mo/...", json=payload)  # same
 
 Author: Network Automation
-Version: 1.0.0
+Version: 1.1.0 — Matched threshold to aci_port_utils v1.6.0 (120s)
 """
 
 import os
@@ -50,7 +50,7 @@ class APICSession:
 
     # Class-level defaults (can be overridden per-instance or via env vars)
     DEFAULT_SESSION_TIMEOUT = 600       # seconds — request from APIC on login
-    DEFAULT_REFRESH_THRESHOLD = 60      # seconds — refresh when this much time remains
+    DEFAULT_REFRESH_THRESHOLD = 120     # seconds — refresh when this much time remains
     DEFAULT_REQUEST_TIMEOUT = 30        # seconds — per-request HTTP timeout
     MAX_RETRY_ATTEMPTS = 2              # max re-auth retries per request
 
@@ -65,7 +65,7 @@ class APICSession:
             username: APIC username (can be set later via login())
             password: APIC password (can be set later via login())
             session_timeout: Requested session lifetime in seconds (default 600)
-            refresh_threshold: Seconds before expiry to trigger refresh (default 60)
+            refresh_threshold: Seconds before expiry to trigger refresh (default 120)
             request_timeout: HTTP request timeout in seconds (default 30)
             verify_ssl: Verify SSL certificates (default False for lab/enterprise)
         """
@@ -106,7 +106,6 @@ class APICSession:
         Authenticate to APIC. Requests extended session timeout.
 
         Returns True on success, False on failure.
-        Prints status messages for terminal/web UI visibility.
         """
         if username:
             self.username = username
@@ -176,12 +175,9 @@ class APICSession:
     def _set_session_timeout(self, timeout_seconds):
         """
         Strategy 1: Request a longer session timeout from APIC.
-
-        Uses the aaaUserEp or pkiWebTokenData to modify the session
-        refresh timeout. Falls back gracefully if not permitted.
+        Falls back gracefully if not permitted.
         """
         try:
-            # Try to set the web token timeout for this session
             payload = {
                 "pkiWebTokenData": {
                     "attributes": {
@@ -198,7 +194,7 @@ class APICSession:
             if r.status_code == 200:
                 self._token_lifetime = timeout_seconds
         except:
-            pass  # Not all APIC versions/roles support this — fail silently
+            pass
 
     # =========================================================================
     # TOKEN REFRESH (Strategy 2)
@@ -207,7 +203,6 @@ class APICSession:
     def _refresh_token(self):
         """
         Strategy 2: Proactively refresh the APIC token using aaaRefresh.
-
         Returns True if refresh succeeded, False if re-auth is needed.
         """
         if not self._authenticated:
@@ -223,7 +218,6 @@ class APICSession:
                 self._token_time = time.time()
                 self._refresh_count += 1
 
-                # Update lifetime from refresh response
                 try:
                     data = r.json()
                     attrs = data['imdata'][0]['aaaLogin']['attributes']
@@ -241,7 +235,6 @@ class APICSession:
     def _ensure_fresh_token(self):
         """
         Check token age and refresh proactively if needed.
-
         Called automatically before every API request.
         """
         if not self._authenticated or self._token_time is None:
@@ -260,7 +253,6 @@ class APICSession:
             if self._refresh_token():
                 return True
             else:
-                # Refresh failed — re-authenticate
                 sys.stdout.write("[INFO] Token refresh failed, re-authenticating...\n")
                 sys.stdout.flush()
                 return self.login()
@@ -279,7 +271,6 @@ class APICSession:
             text = response.text.lower()
             if 'token was invalid' in text or 'not authenticated' in text:
                 return True
-            # Check JSON error response
             data = response.json()
             for item in data.get('imdata', []):
                 err = item.get('error', {}).get('attributes', {})
@@ -292,14 +283,11 @@ class APICSession:
     def _request(self, method, path, retry_count=0, **kwargs):
         """
         Internal request method with token lifecycle management.
-
         Strategy 2: Proactively refreshes token before each request
         Strategy 3: Catches token errors and retries with fresh auth
         """
-        # Strategy 2: Ensure token is fresh before making the call
         self._ensure_fresh_token()
 
-        # Build full URL if path is relative
         if path.startswith('/'):
             url = f"{self.apic_url}{path}"
         elif path.startswith('http'):
@@ -307,7 +295,6 @@ class APICSession:
         else:
             url = f"{self.apic_url}/{path}"
 
-        # Set defaults
         kwargs.setdefault('verify', self.verify)
         kwargs.setdefault('timeout', self.request_timeout)
 
@@ -330,7 +317,6 @@ class APICSession:
             sys.stdout.flush()
 
             if self.login():
-                # Retry the original request with fresh token
                 return self._request(method, path, retry_count + 1, **kwargs)
             else:
                 print("[ERROR] Re-authentication failed — cannot continue")
@@ -339,23 +325,18 @@ class APICSession:
 
     # Convenience methods matching requests.Session interface
     def get(self, path, **kwargs):
-        """GET request with automatic token management."""
         return self._request('get', path, **kwargs)
 
     def post(self, path, **kwargs):
-        """POST request with automatic token management."""
         return self._request('post', path, **kwargs)
 
     def delete(self, path, **kwargs):
-        """DELETE request with automatic token management."""
         return self._request('delete', path, **kwargs)
 
     def put(self, path, **kwargs):
-        """PUT request with automatic token management."""
         return self._request('put', path, **kwargs)
 
     def patch(self, path, **kwargs):
-        """PATCH request with automatic token management."""
         return self._request('patch', path, **kwargs)
 
     # =========================================================================
@@ -364,12 +345,10 @@ class APICSession:
 
     @property
     def session(self):
-        """Access the underlying requests.Session (for cookies, headers, etc.)"""
         return self._session
 
     @property
     def cookies(self):
-        """Access session cookies directly."""
         return self._session.cookies
 
     # =========================================================================
@@ -378,25 +357,21 @@ class APICSession:
 
     @property
     def token_age(self):
-        """Seconds since last authentication/refresh."""
         if self._token_time is None:
             return None
         return time.time() - self._token_time
 
     @property
     def token_remaining(self):
-        """Estimated seconds until token expires."""
         if self._token_time is None or self._token_lifetime is None:
             return None
         return max(0, self._token_lifetime - self.token_age)
 
     @property
     def is_authenticated(self):
-        """Whether we have an active session."""
         return self._authenticated and self.token_remaining and self.token_remaining > 0
 
     def stats(self):
-        """Return session lifecycle statistics."""
         return {
             "logins": self._login_count,
             "refreshes": self._refresh_count,
@@ -407,7 +382,6 @@ class APICSession:
         }
 
     def print_stats(self):
-        """Print session statistics summary."""
         s = self.stats()
         print(f"\n{'=' * 50}")
         print(f" Session Statistics")
@@ -429,7 +403,7 @@ class APICSession:
 # =============================================================================
 
 if __name__ == "__main__":
-    print("ACI Session Manager v1.0.0")
+    print("ACI Session Manager v1.1.0")
     print("=" * 50)
     print()
     print("Usage in your deployment scripts:")
