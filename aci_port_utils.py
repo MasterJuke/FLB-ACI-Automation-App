@@ -40,7 +40,7 @@ Usage:
     )
 
 Author: Network Automation
-Version: 1.5.0 — 3-strategy query: individual + per-tenant + VPC protpaths discovery
+Version: 1.6.0 — Aggressive token refresh (120s threshold), safe_get/safe_delete with retry, mid-query checkpoints
 """
 
 import os
@@ -1548,6 +1548,12 @@ def display_policy_group_selection(policy_groups, pg_type="access", link_level=N
 
 import time as _time
 
+# Default refresh threshold — refresh when this many seconds remain.
+# Set high enough that multi-step operations (Strategy 3 VPC discovery
+# can make 5-10 API calls per port) don't run out mid-query.
+TOKEN_REFRESH_THRESHOLD = 120  # seconds
+
+
 def refresh_apic_token(session, apic_url):
     """
     Refresh APIC token via /api/aaaRefresh.json.
@@ -1574,6 +1580,9 @@ def ensure_token_fresh(session, apic_url, token_state):
     token_state is a mutable dict: {"login_time": float, "lifetime": int}
     Call this before each deployment iteration to prevent 403 errors.
     
+    Uses TOKEN_REFRESH_THRESHOLD (120s) — aggressive enough to survive
+    Strategy 3 VPC discovery which makes 5-10 API calls per port.
+    
     Returns True if token is fresh, False if refresh failed (caller should re-auth).
     """
     if not token_state:
@@ -1582,8 +1591,7 @@ def ensure_token_fresh(session, apic_url, token_state):
     elapsed = _time.time() - token_state.get('login_time', _time.time())
     remaining = token_state.get('lifetime', 300) - elapsed
     
-    # Refresh when <60 seconds remain
-    if remaining < 60:
+    if remaining < TOKEN_REFRESH_THRESHOLD:
         new_lifetime = refresh_apic_token(session, apic_url)
         if new_lifetime:
             token_state['login_time'] = _time.time()
@@ -1621,6 +1629,92 @@ def reauth_apic(session, apic_url, username, password, token_state=None):
         pass
     print(f"  [TOKEN] Re-authentication FAILED")
     return False
+
+
+def _is_token_invalid(response):
+    """Check if an API response indicates expired/invalid token."""
+    if response.status_code in [401, 403]:
+        return True
+    try:
+        text = response.text.lower()
+        if 'token was invalid' in text or 'not authenticated' in text:
+            return True
+    except:
+        pass
+    return False
+
+
+def safe_get(session, apic_url, url, token_state=None, credentials=None,
+             timeout=30, verify=False):
+    """
+    Token-aware GET request with automatic refresh and retry.
+    
+    Before each request: checks token age, refreshes proactively if needed.
+    After each request: if 401/403, re-authenticates and retries once.
+    
+    Args:
+        session: requests.Session with APIC auth
+        apic_url: APIC base URL (for refresh/re-auth calls)
+        url: Full URL to GET
+        token_state: Mutable dict {"login_time": float, "lifetime": int}
+        credentials: Dict {"username": str, "password": str} for re-auth
+        timeout: Request timeout in seconds
+        verify: SSL verification
+    
+    Returns: requests.Response (or None on complete failure)
+    """
+    # Proactive refresh before the call
+    if token_state:
+        if not ensure_token_fresh(session, apic_url, token_state):
+            if credentials:
+                reauth_apic(session, apic_url, credentials["username"],
+                           credentials["password"], token_state)
+    
+    try:
+        resp = session.get(url, verify=verify, timeout=timeout)
+    except Exception:
+        return None
+    
+    # Reactive retry: if token was invalid, re-auth and try once more
+    if _is_token_invalid(resp) and credentials and token_state:
+        print(f"  [TOKEN] 401/403 detected mid-query — re-authenticating...")
+        if reauth_apic(session, apic_url, credentials["username"],
+                      credentials["password"], token_state):
+            try:
+                resp = session.get(url, verify=verify, timeout=timeout)
+            except Exception:
+                return None
+    
+    return resp
+
+
+def safe_delete(session, apic_url, url, token_state=None, credentials=None,
+                timeout=30, verify=False):
+    """
+    Token-aware DELETE request with automatic refresh and retry.
+    Same pattern as safe_get but for DELETE operations.
+    """
+    if token_state:
+        if not ensure_token_fresh(session, apic_url, token_state):
+            if credentials:
+                reauth_apic(session, apic_url, credentials["username"],
+                           credentials["password"], token_state)
+    
+    try:
+        resp = session.delete(url, verify=verify, timeout=timeout)
+    except Exception:
+        return None
+    
+    if _is_token_invalid(resp) and credentials and token_state:
+        print(f"  [TOKEN] 401/403 detected mid-delete — re-authenticating...")
+        if reauth_apic(session, apic_url, credentials["username"],
+                      credentials["password"], token_state):
+            try:
+                resp = session.delete(url, verify=verify, timeout=timeout)
+            except Exception:
+                return None
+    
+    return resp
 
 
 # =============================================================================
@@ -1666,7 +1760,7 @@ def _parse_binding_attrs(attrs, seen_dns):
 
 
 def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
-                                  verbose=True):
+                                  verbose=True, token_state=None, credentials=None):
     """
     Discover VPC protpaths DN(s) for a physical port.
 
@@ -1734,7 +1828,13 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
 
     # ------------------------------------------------------------------
     # Step 2: Verify each is a VPC bundle (lagT="node")
+    # TOKEN CHECKPOINT — discovery involves multiple API calls
     # ------------------------------------------------------------------
+    if token_state:
+        if not ensure_token_fresh(session, apic_url, token_state):
+            if credentials:
+                reauth_apic(session, apic_url, credentials["username"],
+                           credentials["password"], token_state)
     vpc_pg_names = []
     for pg in pg_names:
         try:
@@ -1759,7 +1859,13 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
 
     # ------------------------------------------------------------------
     # Step 3: Find VPC peer node via fabricExplicitGEp
+    # TOKEN CHECKPOINT
     # ------------------------------------------------------------------
+    if token_state:
+        if not ensure_token_fresh(session, apic_url, token_state):
+            if credentials:
+                reauth_apic(session, apic_url, credentials["username"],
+                           credentials["password"], token_state)
     peer_node = None
     try:
         vpc_url = f"{apic_url}/api/class/fabricExplicitGEp.json?rsp-subtree=children"
@@ -1810,7 +1916,8 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
 
 def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                                tenants=None, path_type="individual",
-                               node2=None, pg_name=None, verbose=True):
+                               node2=None, pg_name=None, verbose=True,
+                               token_state=None, credentials=None):
     """
     Query ALL fvRsPathAtt bindings on a port using THREE merged strategies.
 
@@ -1871,6 +1978,15 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
 
     if verbose:
         print(f"  [QUERY] Strategy 1 (class-level individual): {s1_count} binding(s)")
+
+    # ------------------------------------------------------------------
+    # TOKEN CHECKPOINT — refresh before Strategy 2 if token is aging
+    # ------------------------------------------------------------------
+    if token_state:
+        if not ensure_token_fresh(session, apic_url, token_state):
+            if credentials:
+                reauth_apic(session, apic_url, credentials["username"],
+                           credentials["password"], token_state)
 
     # ------------------------------------------------------------------
     # Strategy 2: Per-tenant EPG subtree walk (ALWAYS runs, merges new)
@@ -1939,6 +2055,15 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
             print(f"  [QUERY] Strategy 2: confirmed (0 additional)")
 
     # ------------------------------------------------------------------
+    # TOKEN CHECKPOINT — refresh before Strategy 3 if token is aging
+    # ------------------------------------------------------------------
+    if token_state:
+        if not ensure_token_fresh(session, apic_url, token_state):
+            if credentials:
+                reauth_apic(session, apic_url, credentials["username"],
+                           credentials["password"], token_state)
+
+    # ------------------------------------------------------------------
     # Strategy 3: VPC protpaths discovery
     # The port may have bindings deployed via VPC policy groups that use
     # protpaths-{node1}-{node2}/pathep-[{pg_name}] — a completely different
@@ -1953,7 +2078,8 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
             print(f"  [QUERY] Strategy 3 (VPC protpaths discovery)...")
 
         vpc_protpaths = _discover_vpc_paths_for_port(
-            session, apic_url, node_id, port, pod_id, verbose
+            session, apic_url, node_id, port, pod_id, verbose,
+            token_state, credentials
         )
 
         for vpc_path in vpc_protpaths:
