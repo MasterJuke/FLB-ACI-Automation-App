@@ -40,7 +40,7 @@ Usage:
     )
 
 Author: Network Automation
-Version: 1.3.0 — Added PG reuse, port binding query/delete, multi-port parse
+Version: 1.4.0 — Merged dual-strategy query (always runs both, deduplicates)
 """
 
 import os
@@ -1638,12 +1638,16 @@ def reauth_apic(session, apic_url, username, password, token_state=None):
 # This returns ALL bindings on that port in a SINGLE API call regardless of
 # which tenant/AP/EPG they belong to. The exam tests this pattern heavily.
 
-def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
+def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
+                               tenants=None, path_type="individual",
+                               node2=None, pg_name=None, verbose=True):
     """
-    Query ALL fvRsPathAtt bindings on a specific port across all tenants/EPGs.
+    Query ALL fvRsPathAtt bindings on a port using merged dual-strategy.
 
-    Uses class-level query with tDn filter — single API call returns every
-    EPG binding on the port.
+    ALWAYS runs both strategies and merges results with deduplication.
+    This catches partial results from Strategy 1 on D1 where bracket
+    encoding in the eq() filter causes the class-level query to miss
+    some bindings.
 
     Args:
         session: requests.Session with APIC auth
@@ -1651,64 +1655,162 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
         node_id: Leaf node ID (e.g., '1301')
         port: Port string (e.g., '1/68')
         pod_id: Pod ID (default '1')
+        tenants: List of tenant names for Strategy 2. If None, auto-discovers.
+        path_type: "individual" for single ports, "vpc" for protpaths
+        node2: Second node ID (required when path_type="vpc")
+        pg_name: Policy group name (required when path_type="vpc")
+        verbose: Print query progress (default True)
 
     Returns:
         List of dicts: [{"dn": "...", "tDn": "...", "encap": "vlan-32",
                          "mode": "regular", "tenant": "...",
                          "app_profile": "...", "epg": "...", "vlan": 32}, ...]
     """
-    eth_port = f"eth{port}" if not port.startswith("eth") else port
-    path_dn = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{eth_port}]"
+    # Build the path DN based on port type
+    if path_type == "vpc" and node2 and pg_name:
+        path_dn = f"topology/pod-{pod_id}/protpaths-{node_id}-{node2}/pathep-[{pg_name}]"
+    else:
+        eth_port = f"eth{port}" if not port.startswith("eth") else port
+        path_dn = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{eth_port}]"
 
+    bindings = []
+    seen_dns = set()
+
+    # ------------------------------------------------------------------
+    # Strategy 1: Class-level query with eq() filter (fast, single call)
+    # ------------------------------------------------------------------
+    s1_count = 0
     try:
         url = (f"{apic_url}/api/class/fvRsPathAtt.json"
                f"?query-target-filter=eq(fvRsPathAtt.tDn,\"{path_dn}\")")
         resp = session.get(url, verify=False, timeout=30)
-        if resp.status_code != 200:
-            return []
-
-        bindings = []
-        for item in resp.json().get("imdata", []):
-            attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
-            dn = attrs.get("dn", "")
-            encap = attrs.get("encap", "")
-
-            # Extract tenant, app_profile, epg from DN
-            # DN format: uni/tn-{TENANT}/ap-{AP}/epg-{EPG}/rspathAtt-[...]
-            tn_match = re.search(r'/tn-([^/]+)/', dn)
-            ap_match = re.search(r'/ap-([^/]+)/', dn)
-            epg_match = re.search(r'/epg-([^/]+)/', dn)
-            vlan_match = re.search(r'vlan-(\d+)', encap)
-
-            bindings.append({
-                "dn": dn,
-                "tDn": attrs.get("tDn", ""),
-                "encap": encap,
-                "mode": attrs.get("mode", ""),
-                "tenant": tn_match.group(1) if tn_match else "",
-                "app_profile": ap_match.group(1) if ap_match else "",
-                "epg": epg_match.group(1) if epg_match else "",
-                "vlan": int(vlan_match.group(1)) if vlan_match else 0
-            })
-
-        bindings.sort(key=lambda x: x.get("vlan", 0))
-        return bindings
+        if resp.status_code == 200:
+            for item in resp.json().get("imdata", []):
+                attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                dn = attrs.get("dn", "")
+                if dn and dn not in seen_dns:
+                    seen_dns.add(dn)
+                    encap = attrs.get("encap", "")
+                    tn_match = re.search(r'/tn-([^/]+)/', dn)
+                    ap_match = re.search(r'/ap-([^/]+)/', dn)
+                    epg_match = re.search(r'/epg-([^/]+)/', dn)
+                    vlan_match = re.search(r'vlan-(\d+)', encap)
+                    bindings.append({
+                        "dn": dn,
+                        "tDn": attrs.get("tDn", ""),
+                        "encap": encap,
+                        "mode": attrs.get("mode", ""),
+                        "tenant": tn_match.group(1) if tn_match else "",
+                        "app_profile": ap_match.group(1) if ap_match else "",
+                        "epg": epg_match.group(1) if epg_match else "",
+                        "vlan": int(vlan_match.group(1)) if vlan_match else 0
+                    })
+                    s1_count += 1
     except Exception as e:
-        print(f"    [WARNING] Error querying bindings on port: {e}")
-        return []
+        if verbose:
+            print(f"    [WARNING] Strategy 1 error: {e}")
+
+    if verbose:
+        print(f"  [QUERY] Strategy 1 (class-level): {s1_count} binding(s)")
+
+    # ------------------------------------------------------------------
+    # Strategy 2: Per-tenant EPG subtree walk (ALWAYS runs, merges new)
+    # Uses Python substring match — immune to URL encoding issues on D1.
+    # ------------------------------------------------------------------
+    # Auto-discover tenants if not provided
+    if tenants is None:
+        tenants = []
+        try:
+            t_resp = session.get(
+                f"{apic_url}/api/class/fvTenant.json?query-target-filter=not(wcard(fvTenant.dn,\"common\"))",
+                verify=False, timeout=15
+            )
+            if t_resp.status_code == 200:
+                for t_item in t_resp.json().get("imdata", []):
+                    t_name = t_item.get("fvTenant", {}).get("attributes", {}).get("name", "")
+                    if t_name and t_name not in ("common", "infra", "mgmt"):
+                        tenants.append(t_name)
+        except:
+            pass
+        if verbose and tenants:
+            print(f"  [QUERY] Auto-discovered {len(tenants)} tenant(s) for Strategy 2")
+
+    s2_new = 0
+    if verbose:
+        print(f"  [QUERY] Strategy 2 (per-tenant EPG walk): scanning {len(tenants)} tenant(s)...")
+
+    for tenant in tenants:
+        try:
+            # Get all app profiles in this tenant
+            ap_url = f"{apic_url}/api/mo/uni/tn-{tenant}.json?query-target=children&target-subtree-class=fvAp"
+            ap_resp = session.get(ap_url, verify=False, timeout=15)
+            if ap_resp.status_code != 200:
+                continue
+
+            for ap_item in ap_resp.json().get("imdata", []):
+                ap_name = ap_item.get("fvAp", {}).get("attributes", {}).get("name", "")
+                if not ap_name:
+                    continue
+
+                # Get all fvRsPathAtt under this app profile
+                epg_url = (f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{ap_name}.json"
+                           f"?query-target=subtree&target-subtree-class=fvRsPathAtt")
+                epg_resp = session.get(epg_url, verify=False, timeout=20)
+                if epg_resp.status_code != 200:
+                    continue
+
+                for item in epg_resp.json().get("imdata", []):
+                    attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                    tdn = attrs.get("tDn", "")
+                    dn = attrs.get("dn", "")
+
+                    # Python substring match — catches what eq() misses
+                    if path_dn in tdn and dn not in seen_dns:
+                        seen_dns.add(dn)
+                        encap = attrs.get("encap", "")
+                        tn_match = re.search(r'/tn-([^/]+)/', dn)
+                        ap_match = re.search(r'/ap-([^/]+)/', dn)
+                        epg_match = re.search(r'/epg-([^/]+)/', dn)
+                        vlan_match = re.search(r'vlan-(\d+)', encap)
+                        bindings.append({
+                            "dn": dn,
+                            "tDn": tdn,
+                            "encap": encap,
+                            "mode": attrs.get("mode", ""),
+                            "tenant": tn_match.group(1) if tn_match else "",
+                            "app_profile": ap_match.group(1) if ap_match else "",
+                            "epg": epg_match.group(1) if epg_match else "",
+                            "vlan": int(vlan_match.group(1)) if vlan_match else 0
+                        })
+                        s2_new += 1
+        except Exception as e:
+            if verbose:
+                print(f"    [WARNING] Strategy 2 error for {tenant}: {e}")
+
+    if verbose:
+        if s2_new > 0:
+            print(f"  [QUERY] Strategy 2 found {s2_new} additional binding(s) missed by Strategy 1")
+        else:
+            print(f"  [QUERY] Strategy 2: confirmed (0 additional)")
+        print(f"  [TOTAL] {len(bindings)} unique binding(s)")
+
+    bindings.sort(key=lambda x: x.get("vlan", 0))
+    return bindings
 
 
-def delete_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
+def delete_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
+                                tenants=None):
     """
     Delete ALL fvRsPathAtt bindings on a specific port.
 
-    Queries all bindings first, emits [ROLLBACK:STATE] for each one,
-    then deletes each one.
+    Queries all bindings first (merged dual-strategy), emits
+    [ROLLBACK:STATE] for each one, then deletes each one.
     Returns (deleted_count, failed_count, binding_details).
 
     binding_details is a list of {"vlan", "epg", "success"} for logging.
     """
-    bindings = query_all_bindings_on_port(session, apic_url, node_id, port, pod_id)
+    bindings = query_all_bindings_on_port(session, apic_url, node_id, port,
+                                          pod_id, tenants=tenants)
 
     if not bindings:
         return 0, 0, []
