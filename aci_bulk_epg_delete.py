@@ -9,6 +9,8 @@ Features:
   1. CSV Mode: Provide SWITCH, PORT, and VLANS in CSV to delete specific bindings
   2. Query Mode: Provide SWITCH and PORT only — script queries ALL EPG bindings
      on the port and presents a multi-select list to choose which to delete
+- Merged dual-strategy port query (class-level + per-tenant EPG subtree)
+  catches all bindings across D1/D2/D3
 - Preview all deletions before executing
 - Dry-run mode
 - Batch deletion
@@ -23,7 +25,7 @@ EDCLEAFACC1502,1/10
 When VLANS is blank, the script queries the port and lets you pick interactively.
 
 Author: Network Automation Script
-Version: 2.0.0 — Added query-and-select mode
+Version: 3.0.0 — Merged dual-strategy query via aci_port_utils v1.4.0
 """
 
 import csv
@@ -39,10 +41,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Import shared utilities
+# Import shared utilities — query_all_bindings_on_port now uses merged
+# dual-strategy (class-level + per-tenant subtree walk, always both)
 from aci_port_utils import (
     detect_environment, extract_node_id, parse_vlans, parse_port,
-    prompt_input
+    prompt_input, query_all_bindings_on_port
 )
 
 
@@ -51,15 +54,15 @@ from aci_port_utils import (
 # =============================================================================
 
 APIC_URLS = {
-    "D1": "",  # <-- UPDATE THIS (ACC switches)
-    "D2": "",  # <-- UPDATE THIS (SDC switches)
-    "D3": ""   # <-- UPDATE THIS (NSM switches)
+    "D1": "https://edcapic01.gwnsm.guidewell.net/",
+    "D2": "https://sdcapic01.gwnsm.guidewell.net/",
+    "D3": "https://edcnsmapic01.gwnsm.guidewell.net/"
 }
 
 # Multiple tenants per datacenter
 TENANTS = {
     "D1": ["BLU", "GWC", "GWS"],
-    "D2": ["BLU", "GWC", "GWS"],
+    "D2": ["BLU", "GWC", "GWS", "SDCFLB", "SDCGWS"],
     "D3": ["NSM_BLU", "NSM_BRN", "NSM_GLD", "NSM_GRN"]
 }
 
@@ -141,74 +144,14 @@ def find_epg_binding(session, apic_url, tenant, app_profile, epg_name, path_dn):
     return None
 
 
-def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1"):
-    """
-    Query ALL EPG static bindings currently deployed on a specific port.
-
-    This is the core of the new query-and-select feature.
-    Searches fvRsPathAtt class for any binding matching this port's path DN.
-
-    Returns list of dicts with: tenant, app_profile, epg_name, vlan, mode, dn
-
-    CCIE Automation Note:
-    This uses the ACI REST API fvRsPathAtt class query with a tDn filter —
-    a common pattern for auditing deployed static paths on the fabric.
-    """
-    eth_port = f"eth{port}" if not port.startswith("eth") else port
-    path_dn = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{eth_port}]"
-
-    bindings = []
-
-    try:
-        # Query all fvRsPathAtt objects that reference this port's path DN
-        url = (f"{apic_url}/api/class/fvRsPathAtt.json"
-               f"?query-target-filter=eq(fvRsPathAtt.tDn,\"{path_dn}\")")
-        response = session.get(url, verify=False, timeout=30)
-
-        if response.status_code != 200:
-            print(f"    [ERROR] Failed to query bindings: HTTP {response.status_code}")
-            return []
-
-        for item in response.json().get("imdata", []):
-            attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
-            dn = attrs.get("dn", "")
-            encap = attrs.get("encap", "")  # e.g., "vlan-32"
-            mode = attrs.get("mode", "")
-
-            # Extract VLAN number from encap
-            vlan_match = re.search(r'vlan-(\d+)', encap)
-            vlan_id = int(vlan_match.group(1)) if vlan_match else 0
-
-            # Extract tenant, app_profile, epg from the DN
-            # DN format: uni/tn-{tenant}/ap-{app_profile}/epg-{epg}/rspathAtt-[...]
-            tenant_match = re.search(r'/tn-([^/]+)/', dn)
-            ap_match = re.search(r'/ap-([^/]+)/', dn)
-            epg_match = re.search(r'/epg-([^/]+)/', dn)
-
-            if tenant_match and ap_match and epg_match:
-                bindings.append({
-                    "tenant": tenant_match.group(1),
-                    "app_profile": ap_match.group(1),
-                    "epg_name": epg_match.group(1),
-                    "vlan": vlan_id,
-                    "mode": mode,
-                    "encap": encap,
-                    "binding_dn": dn
-                })
-
-    except Exception as e:
-        print(f"    [ERROR] Failed to query port bindings: {e}")
-
-    # Sort by VLAN number
-    bindings.sort(key=lambda x: x['vlan'])
-    return bindings
-
-
 def display_binding_selection(bindings, switch, port):
     """
     Display all EPG bindings on a port and let user multi-select which to delete.
 
     Returns list of selected binding dicts, or empty list to skip.
+
+    Accepts bindings from the shared query_all_bindings_on_port() which returns
+    dicts with keys: dn, tDn, encap, mode, tenant, app_profile, epg, vlan
     """
     if not bindings:
         print(f"\n  [INFO] No EPG bindings found on {switch} port {port}")
@@ -221,8 +164,10 @@ def display_binding_selection(bindings, switch, port):
     print("  " + "-" * 76)
 
     for i, b in enumerate(bindings, 1):
-        mode_display = "trunk" if b['mode'] == "regular" else "access" if b['mode'] == "untagged" else b['mode']
-        print(f"  [{i:>2}]  {b['vlan']:<6} {b['epg_name']:<28} {b['app_profile']:<18} {b['tenant']:<12} {mode_display}")
+        mode_val = b.get('mode', '')
+        mode_display = "trunk" if mode_val == "regular" else "access" if mode_val == "untagged" else mode_val
+        epg_name = b.get('epg', b.get('epg_name', ''))
+        print(f"  [{i:>2}]  {b['vlan']:<6} {epg_name:<28} {b.get('app_profile', ''):<18} {b.get('tenant', ''):<12} {mode_display}")
 
     print("  " + "-" * 76)
     print("  [A] Select ALL bindings")
@@ -236,7 +181,7 @@ def display_binding_selection(bindings, switch, port):
         if choice == 'S':
             return []
 
-        if choice == 'A' or choice == 'ALL':
+        if choice in ('A', 'ALL'):
             print(f"  [SELECTED] All {len(bindings)} binding(s)")
             return list(bindings)
 
@@ -256,11 +201,11 @@ def display_binding_selection(bindings, switch, port):
                         selected.append(bindings[idx - 1])
 
             if selected:
-                # Deduplicate
+                # Deduplicate by DN
                 seen = set()
                 unique = []
                 for s in selected:
-                    key = s['binding_dn']
+                    key = s.get('dn', '')
                     if key not in seen:
                         seen.add(key)
                         unique.append(s)
@@ -319,7 +264,7 @@ def load_epg_delete_csv(filename):
 
 def main():
     print("\n" + "=" * 70)
-    print(" ACI BULK EPG DELETE SCRIPT v2.0")
+    print(" ACI BULK EPG DELETE SCRIPT v3.0")
     print("=" * 70)
 
     # Check configuration
@@ -430,9 +375,9 @@ def main():
         print("\n[ERROR] No successful authentications.")
         sys.exit(1)
 
-    # ==========================================================================
+    # =========================================================================
     # PHASE 1: FIND ALL BINDINGS TO DELETE
-    # ==========================================================================
+    # =========================================================================
 
     print("\n" + "=" * 70)
     print(" PHASE 1: FINDING EPG BINDINGS")
@@ -463,13 +408,18 @@ def main():
         eth_port = f"eth{dep['port']}" if not dep['port'].startswith("eth") else dep['port']
         path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_port}]"
 
-        # ======================================================================
+        # =================================================================
         # QUERY MODE: No VLANs specified — query port and let user select
-        # ======================================================================
+        # =================================================================
         if not dep['vlans'].strip():
-            print(f"  Querying all EPG bindings on port...")
+            print(f"  Querying all EPG bindings on port (merged dual-strategy)...")
+
+            # Use the shared merged query from aci_port_utils v1.4.0
+            # Always runs both Strategy 1 (class-level) and Strategy 2
+            # (per-tenant subtree walk), merges and deduplicates results
             port_bindings = query_all_bindings_on_port(
-                session, apic_url, node_id, dep['port'], POD_ID
+                session, apic_url, node_id, dep['port'], POD_ID,
+                tenants=tenants_list
             )
 
             if not port_bindings:
@@ -486,18 +436,18 @@ def main():
                     "node_id": node_id,
                     "vlan": b['vlan'],
                     "env": env,
-                    "tenant": b['tenant'],
-                    "app_profile": b['app_profile'],
-                    "epg_name": b['epg_name'],
-                    "binding_dn": b['binding_dn'],
-                    "mode": b['mode']
+                    "tenant": b.get('tenant', ''),
+                    "app_profile": b.get('app_profile', ''),
+                    "epg_name": b.get('epg', b.get('epg_name', '')),
+                    "binding_dn": b.get('dn', ''),
+                    "mode": b.get('mode', '')
                 })
 
             continue
 
-        # ======================================================================
-        # CSV MODE: Specific VLANs provided — targeted delete (original behavior)
-        # ======================================================================
+        # =================================================================
+        # CSV MODE: Specific VLANs provided — targeted delete
+        # =================================================================
         vlans = parse_vlans(dep['vlans'])
         print(f"  Searching for {len(vlans)} VLAN binding(s) (across {len(tenants_list)} tenants)...")
 
@@ -575,9 +525,9 @@ def main():
                         "reason": f"No binding on {epg['app_profile']}"
                     })
 
-    # ==========================================================================
+    # =========================================================================
     # PHASE 2: PREVIEW DELETIONS
-    # ==========================================================================
+    # =========================================================================
 
     print("\n" + "=" * 70)
     print(" PHASE 2: DELETION PREVIEW")
@@ -610,9 +560,9 @@ def main():
 
     print("  " + "-" * 76)
 
-    # ==========================================================================
+    # =========================================================================
     # PHASE 3: CONFIRM AND DELETE
-    # ==========================================================================
+    # =========================================================================
 
     print("\n" + "=" * 70)
     print(" PHASE 3: DELETION")
