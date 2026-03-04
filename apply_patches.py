@@ -743,15 +743,15 @@ def patch_vpc_port_display(content):
     # =========================================================================
 
     # --- PATCH N-vpc: EPG Binding Mode prompt before auth ---
+    # Target 1: original unpatched (no EPG mode exists yet)
     old_vpc_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
     
     # Get credentials
     print("\\n" + "-" * 70)
     print(" AUTHENTICATION")'''
 
-    new_vpc_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
-    
-    # EPG Binding Mode
+    # Target 2: v1 already applied (2-option prompt) — upgrade to 3-option
+    old_vpc_pre_auth_v1 = '''    # EPG Binding Mode
     print("\\n" + "-" * 70)
     print(" EPG BINDING MODE")
     print("-" * 70)
@@ -766,8 +766,46 @@ def patch_vpc_port_display(content):
     print("\\n" + "-" * 70)
     print(" AUTHENTICATION")'''
 
-    content, _ = find_and_replace(content, old_vpc_pre_auth, new_vpc_pre_auth,
+    new_vpc_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # EPG Binding Mode
+    print("\\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
+    print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
+    epg_mode_choice = prompt_input("\\nSelect (1/2/3) [default=1]: ").strip()
+    overwrite_mode = epg_mode_choice in ['2', '3']
+    if overwrite_mode:
+        print("\\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")'''
+
+    # New_str without the pg_exists prefix (for v1 upgrade which already has it)
+    new_vpc_pre_auth_upgrade = '''    # EPG Binding Mode
+    print("\\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
+    print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
+    epg_mode_choice = prompt_input("\\nSelect (1/2/3) [default=1]: ").strip()
+    overwrite_mode = epg_mode_choice in ['2', '3']
+    if overwrite_mode:
+        print("\\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")'''
+
+    content, applied = find_and_replace(content, old_vpc_pre_auth, new_vpc_pre_auth,
                                   "VPC: EPG Binding Mode prompt")
+    if not applied:
+        content, _ = find_and_replace(content, old_vpc_pre_auth_v1, new_vpc_pre_auth_upgrade,
+                                      "VPC: EPG Binding Mode prompt (upgrading v1 to v3)")
 
     # --- PATCH O-vpc: Inject overwrite deletion before deploy_vpc call ---
     # NOTE: Target just the deploy_vpc() call line — works whether the
@@ -1264,6 +1302,7 @@ def patch_individual_port_display(content):
     # =========================================================================
 
     # --- PATCH N-ind: EPG Binding Mode prompt before auth ---
+    # Target 1: original unpatched
     old_ind_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
     
     # Get credentials
@@ -1272,9 +1311,8 @@ def patch_individual_port_display(content):
     print("-" * 70)
     username = prompt_input("\\nUsername: ").strip()'''
 
-    new_ind_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
-    
-    # EPG Binding Mode
+    # Target 2: v1 already applied (2-option) — upgrade to 3-option
+    old_ind_pre_auth_v1 = '''    # EPG Binding Mode
     print("\\n" + "-" * 70)
     print(" EPG BINDING MODE")
     print("-" * 70)
@@ -1291,8 +1329,50 @@ def patch_individual_port_display(content):
     print("-" * 70)
     username = prompt_input("\\nUsername: ").strip()'''
 
-    content, _ = find_and_replace(content, old_ind_pre_auth, new_ind_pre_auth,
+    new_ind_pre_auth = '''    pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # EPG Binding Mode
+    print("\\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
+    print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
+    epg_mode_choice = prompt_input("\\nSelect (1/2/3) [default=1]: ").strip()
+    overwrite_mode = epg_mode_choice in ['2', '3']
+    if overwrite_mode:
+        print("\\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    username = prompt_input("\\nUsername: ").strip()'''
+
+    # New_str without pg_exists prefix (for v1 upgrade)
+    new_ind_pre_auth_upgrade = '''    # EPG Binding Mode
+    print("\\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
+    print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
+    epg_mode_choice = prompt_input("\\nSelect (1/2/3) [default=1]: ").strip()
+    overwrite_mode = epg_mode_choice in ['2', '3']
+    if overwrite_mode:
+        print("\\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    username = prompt_input("\\nUsername: ").strip()'''
+
+    content, applied = find_and_replace(content, old_ind_pre_auth, new_ind_pre_auth,
                                   "Individual: EPG Binding Mode prompt")
+    if not applied:
+        content, _ = find_and_replace(content, old_ind_pre_auth_v1, new_ind_pre_auth_upgrade,
+                                      "Individual: EPG Binding Mode prompt (upgrading v1 to v3)")
 
     # --- PATCH O-ind: Inject overwrite deletion before deploy_individual_port call ---
     # NOTE: Target just the deploy_individual_port() call line — works whether
@@ -1521,16 +1601,12 @@ def patch_epg_add(content):
     content, _ = find_and_replace(content, old_loaded, new_loaded, "EPG Add: expansion info")
 
     # --- PATCH C: EPG Mode toggle after binding mode ---
-    if "EPG MODE" not in content:
-        old_post_binding = '''    # Get credentials
-    print("\\n" + "-" * 70)
-    print(" AUTHENTICATION")
-    print("-" * 70)
-    sys.stdout.write("\\nUsername: ")
-    sys.stdout.flush()
-    username = input().strip()'''
-
-        new_post_binding = '''    # EPG Mode: Add or Overwrite
+    # v3 marker = overwrite_auto; v1 marker = EPG MODE without overwrite_auto
+    if "overwrite_auto" in content:
+        print(f"    [SKIP] EPG Add: overwrite mode toggle — v3 already present")
+    elif "EPG MODE" in content:
+        # v1 (2-option) is applied — upgrade to v3 (3-option)
+        old_post_binding_v1 = '''    # EPG Mode: Add or Overwrite
     print("\\n" + "-" * 70)
     print(" EPG MODE")
     print("-" * 70)
@@ -1550,6 +1626,74 @@ def patch_epg_add(content):
         print("\\n  [WARNING] Overwrite mode: ALL existing EPG bindings on each port")
         print("            will be DELETED before adding the new ones.")
     
+    # Get credentials'''
+
+        new_post_binding_v3 = '''    # EPG Mode: Add, Overwrite (interactive), or Overwrite ALL
+    print("\\n" + "-" * 70)
+    print(" EPG MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Add new EPG bindings (keep existing)")
+    print("  [2] Overwrite - Show existing EPGs per port, choose which to delete")
+    print("  [3] Overwrite ALL - Automatically delete ALL existing EPGs on every port")
+    
+    while True:
+        sys.stdout.write("\\nSelect mode (1/2/3) [default=1]: ")
+        sys.stdout.flush()
+        epg_mode_choice = input().strip()
+        if epg_mode_choice in ["", "1", "2", "3"]:
+            break
+    
+    overwrite_mode = epg_mode_choice in ["2", "3"]
+    overwrite_interactive = (epg_mode_choice == "2")
+    overwrite_auto = (epg_mode_choice == "3")
+    
+    if overwrite_auto:
+        print("\\n  [OVERWRITE ALL] Every port will have ALL existing EPG bindings")
+        print("                  deleted automatically before deploying new ones.")
+    elif overwrite_interactive:
+        print("\\n  [OVERWRITE] Per port you will see existing EPG bindings and")
+        print("              choose which to delete before deploying new ones.")
+    
+    # Get credentials'''
+
+        content, _ = find_and_replace(content, old_post_binding_v1, new_post_binding_v3,
+                                      "EPG Add: overwrite mode toggle (upgrading v1 to v3)")
+    else:
+        # Fresh install — no EPG MODE exists yet
+        old_post_binding = '''    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    sys.stdout.write("\\nUsername: ")
+    sys.stdout.flush()
+    username = input().strip()'''
+
+        new_post_binding = '''    # EPG Mode: Add, Overwrite (interactive), or Overwrite ALL
+    print("\\n" + "-" * 70)
+    print(" EPG MODE")
+    print("-" * 70)
+    print("\\n  [1] Add - Add new EPG bindings (keep existing)")
+    print("  [2] Overwrite - Show existing EPGs per port, choose which to delete")
+    print("  [3] Overwrite ALL - Automatically delete ALL existing EPGs on every port")
+    
+    while True:
+        sys.stdout.write("\\nSelect mode (1/2/3) [default=1]: ")
+        sys.stdout.flush()
+        epg_mode_choice = input().strip()
+        if epg_mode_choice in ["", "1", "2", "3"]:
+            break
+    
+    overwrite_mode = epg_mode_choice in ["2", "3"]
+    overwrite_interactive = (epg_mode_choice == "2")
+    overwrite_auto = (epg_mode_choice == "3")
+    
+    if overwrite_auto:
+        print("\\n  [OVERWRITE ALL] Every port will have ALL existing EPG bindings")
+        print("                  deleted automatically before deploying new ones.")
+    elif overwrite_interactive:
+        print("\\n  [OVERWRITE] Per port you will see existing EPG bindings and")
+        print("              choose which to delete before deploying new ones.")
+    
     # Get credentials
     print("\\n" + "-" * 70)
     print(" AUTHENTICATION")
@@ -1559,8 +1703,6 @@ def patch_epg_add(content):
     username = input().strip()'''
 
         content, _ = find_and_replace(content, old_post_binding, new_post_binding, "EPG Add: overwrite mode toggle")
-    else:
-        print(f"    [SKIP] EPG Add: overwrite mode toggle — already present")
 
     # --- PATCH D: Inject overwrite deletion before Phase 4 deployment ---
     # Target 1: original unpatched code
@@ -1620,14 +1762,25 @@ def patch_epg_add(content):
         session = sessions[b['env']]
         apic_url = APIC_URLS[b['env']]'''
 
-    new_phase4_deploy = '''    # Overwrite mode: delete existing bindings first (v2 — dual-strategy)
+    # Target 3: previously patched v2 overwrite code (for updating from v2 to v3)
+    old_phase4_deploy_v2_marker = '''    # Overwrite mode: delete existing bindings first (v2 — dual-strategy)'''
+
+    new_phase4_deploy = '''    # ==========================================================================
+    # OVERWRITE: QUERY AND DELETE EXISTING EPG BINDINGS (v3 — interactive + auto)
+    # ==========================================================================
     overwrite_deleted = 0
     if overwrite_mode:
+        import time as _time
+        import re as _re
+        
         print("\\n" + "=" * 70)
-        print(" OVERWRITE: REMOVING EXISTING EPG BINDINGS")
+        if overwrite_auto:
+            print(" OVERWRITE ALL: REMOVING EXISTING EPG BINDINGS")
+        else:
+            print(" OVERWRITE: INTERACTIVE EPG BINDING REMOVAL")
         print("=" * 70)
         
-        # Build unique set of switch+port combinations
+        # Build unique set of switch+port combinations from CSV
         ports_to_clean = {}
         for b in all_bindings:
             key = (b['switch'], b['port'], b['node_id'], b['env'])
@@ -1635,9 +1788,13 @@ def patch_epg_add(content):
                 ports_to_clean[key] = []
             ports_to_clean[key].append(b)
         
+        port_num = 0
+        port_total = len(ports_to_clean)
+        
         for (switch, port, node_id, env), port_bindings in sorted(ports_to_clean.items()):
+            port_num += 1
             print(f"\\n  {'=' * 60}")
-            print(f"  {switch} port {port}")
+            print(f"  Port {port_num}/{port_total}: {switch} port {port}")
             print(f"  {'=' * 60}")
             
             if env not in sessions:
@@ -1645,27 +1802,50 @@ def patch_epg_add(content):
                 continue
             session = sessions[env]
             apic_url = APIC_URLS[env]
-            tenants_list = TENANTS[env]
+            tenants_list = TENANTS.get(env, [])
             
             eth_port = f"eth{port}" if not port.startswith("eth") else port
             indiv_path = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_port}]"
             
-            # Strategy 1: Class-level query with exact tDn filter
-            existing = query_all_bindings_on_port(session, apic_url, node_id, port, POD_ID)
-            print(f"  [QUERY] Class-level search: {len(existing)} binding(s) found")
+            # ------------------------------------------------------------------
+            # DUAL-STRATEGY QUERY: find ALL existing EPG bindings on this port
+            # ------------------------------------------------------------------
+            existing = []
+            seen_dns = set()
             
-            # Strategy 2: Per-EPG fallback — scan EPG children across all tenants
-            # Uses the same per-EPG child query pattern that works in EPG Delete.
-            # This catches bindings the class-level eq() filter may miss due to
-            # URL encoding of brackets or path format differences.
+            # Strategy 1: Class-level query (fast, works on most fabrics)
+            try:
+                cls_url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\\"{indiv_path}\\")"
+                cls_resp = session.get(cls_url, verify=False, timeout=30)
+                if cls_resp.status_code == 200:
+                    for item in cls_resp.json().get("imdata", []):
+                        attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                        dn = attrs.get("dn", "")
+                        if dn and dn not in seen_dns:
+                            seen_dns.add(dn)
+                            encap = attrs.get("encap", "")
+                            _tn = _re.search(r'/tn-([^/]+)/', dn)
+                            _ap = _re.search(r'/ap-([^/]+)/', dn)
+                            _epg = _re.search(r'/epg-([^/]+)/', dn)
+                            _vlan = _re.search(r'vlan-(\\d+)', encap)
+                            existing.append({
+                                "dn": dn, "encap": encap,
+                                "tenant": _tn.group(1) if _tn else "",
+                                "app_profile": _ap.group(1) if _ap else "",
+                                "epg": _epg.group(1) if _epg else "",
+                                "vlan": int(_vlan.group(1)) if _vlan else 0
+                            })
+            except Exception as e:
+                print(f"    [WARNING] Class query error: {e}")
+            
+            print(f"  [QUERY] Strategy 1 (class-level): {len(existing)} binding(s)")
+            
+            # Strategy 2: Per-tenant EPG subtree fallback (catches D1 encoding issues)
             if not existing:
-                print(f"  [QUERY] Trying per-tenant EPG fallback search...")
-                fallback_dns = set()
-                
-                for tenant in tenants_list:
+                print(f"  [QUERY] Trying per-tenant EPG subtree fallback...")
+                for fb_tenant in tenants_list:
                     try:
-                        # Get all app profiles in this tenant
-                        ap_url = f"{apic_url}/api/mo/uni/tn-{tenant}.json?query-target=children&target-subtree-class=fvAp"
+                        ap_url = f"{apic_url}/api/mo/uni/tn-{fb_tenant}.json?query-target=children&target-subtree-class=fvAp"
                         ap_resp = session.get(ap_url, verify=False, timeout=15)
                         if ap_resp.status_code != 200:
                             continue
@@ -1673,8 +1853,7 @@ def patch_epg_add(content):
                             ap_name = ap_item.get("fvAp", {}).get("attributes", {}).get("name", "")
                             if not ap_name:
                                 continue
-                            # Get all EPGs in this app profile
-                            epg_url = f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{ap_name}.json?query-target=subtree&target-subtree-class=fvRsPathAtt"
+                            epg_url = f"{apic_url}/api/mo/uni/tn-{fb_tenant}/ap-{ap_name}.json?query-target=subtree&target-subtree-class=fvRsPathAtt"
                             epg_resp = session.get(epg_url, verify=False, timeout=20)
                             if epg_resp.status_code != 200:
                                 continue
@@ -1682,33 +1861,76 @@ def patch_epg_add(content):
                                 attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
                                 tdn = attrs.get("tDn", "")
                                 dn = attrs.get("dn", "")
-                                # Python substring match — same pattern as EPG Delete
-                                if indiv_path in tdn and dn not in fallback_dns:
-                                    fallback_dns.add(dn)
+                                if indiv_path in tdn and dn not in seen_dns:
+                                    seen_dns.add(dn)
                                     encap = attrs.get("encap", "")
-                                    _tn = re.search(r'/tn-([^/]+)/', dn)
-                                    _ap = re.search(r'/ap-([^/]+)/', dn)
-                                    _epg = re.search(r'/epg-([^/]+)/', dn)
-                                    _vlan = re.search(r'vlan-(\\d+)', encap)
+                                    _tn = _re.search(r'/tn-([^/]+)/', dn)
+                                    _ap = _re.search(r'/ap-([^/]+)/', dn)
+                                    _epg = _re.search(r'/epg-([^/]+)/', dn)
+                                    _vlan = _re.search(r'vlan-(\\d+)', encap)
                                     existing.append({
-                                        "dn": dn, "tDn": tdn, "encap": encap,
-                                        "mode": attrs.get("mode", ""),
+                                        "dn": dn, "encap": encap,
                                         "tenant": _tn.group(1) if _tn else "",
                                         "app_profile": _ap.group(1) if _ap else "",
                                         "epg": _epg.group(1) if _epg else "",
                                         "vlan": int(_vlan.group(1)) if _vlan else 0
                                     })
                     except Exception as e:
-                        print(f"    [WARNING] Fallback error for tenant {tenant}: {e}")
+                        print(f"    [WARNING] Fallback error for {fb_tenant}: {e}")
                 
-                if existing:
-                    print(f"  [QUERY] Fallback found: {len(existing)} binding(s)")
-                else:
-                    print(f"  [QUERY] Fallback found: 0 binding(s)")
+                print(f"  [QUERY] Strategy 2 (per-tenant fallback): {len(existing)} binding(s)")
             
-            if existing:
-                print(f"  [DELETE] Removing {len(existing)} binding(s)...")
-                for b_del in existing:
+            # ------------------------------------------------------------------
+            # NO BINDINGS FOUND
+            # ------------------------------------------------------------------
+            if not existing:
+                print(f"  [INFO] No existing bindings found on this port")
+                continue
+            
+            # Sort by VLAN for clean display
+            existing.sort(key=lambda x: x.get('vlan', 0))
+            
+            # ------------------------------------------------------------------
+            # INTERACTIVE MODE: show list, let user select which to delete
+            # ------------------------------------------------------------------
+            to_delete = []
+            if overwrite_interactive:
+                print(f"\\n  Existing EPG bindings on this port:")
+                for idx, b_ex in enumerate(existing, 1):
+                    print(f"    [{idx}] VLAN {b_ex.get('vlan', '?')} — {b_ex.get('epg', '?')} ({b_ex.get('tenant', '?')})")
+                
+                sys.stdout.write(f"\\n  Delete which? (comma-separated numbers, 'all', or 'none') [default=all]: ")
+                sys.stdout.flush()
+                selection = input().strip().lower()
+                
+                if selection in ["", "all", "a"]:
+                    to_delete = existing[:]
+                    print(f"  -> Deleting ALL {len(to_delete)} binding(s)")
+                elif selection in ["none", "n", "0"]:
+                    to_delete = []
+                    print(f"  -> Skipping deletion on this port")
+                else:
+                    # Parse comma-separated indices
+                    try:
+                        indices = [int(x.strip()) for x in selection.split(",") if x.strip().isdigit()]
+                        to_delete = [existing[i - 1] for i in indices if 1 <= i <= len(existing)]
+                        print(f"  -> Deleting {len(to_delete)} of {len(existing)} binding(s)")
+                    except (ValueError, IndexError):
+                        print(f"  [WARNING] Invalid selection, skipping this port")
+                        to_delete = []
+            
+            # ------------------------------------------------------------------
+            # AUTO MODE: delete all automatically, no prompts
+            # ------------------------------------------------------------------
+            elif overwrite_auto:
+                to_delete = existing[:]
+                print(f"  [AUTO] Deleting all {len(to_delete)} existing binding(s)")
+            
+            # ------------------------------------------------------------------
+            # DELETE SELECTED BINDINGS
+            # ------------------------------------------------------------------
+            if to_delete:
+                for b_del in to_delete:
                     try:
                         resp = session.delete(
                             f"{apic_url}/api/mo/{b_del['dn']}.json",
@@ -1725,21 +1947,24 @@ def patch_epg_add(content):
                     else:
                         print(f"           DN: {b_del.get('dn', '?')[:80]}")
                 
-                # Verify deletion
-                import time as _time
-                _time.sleep(1)  # Brief pause to let APIC commit
-                verify = query_all_bindings_on_port(session, apic_url, node_id, port, POD_ID)
-                if verify:
-                    print(f"  [WARNING] {len(verify)} binding(s) still remain after deletion!")
-                    for v in verify:
-                        print(f"    Still bound: VLAN {v.get('vlan', '?')} — {v.get('epg', '?')}")
-                else:
+                # Verify port is clean after deletion
+                _time.sleep(1)
+                verify = []
+                try:
+                    v_url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\\"{indiv_path}\\")"
+                    v_resp = session.get(v_url, verify=False, timeout=30)
+                    if v_resp.status_code == 200:
+                        verify = v_resp.json().get("imdata", [])
+                except:
+                    pass
+                
+                if not verify:
                     print(f"  [VERIFIED] Port is clean — 0 bindings remain")
-            else:
-                print(f"  [INFO] No existing bindings found on this port")
+                else:
+                    print(f"  [WARNING] {len(verify)} binding(s) still remain after deletion")
         
         print(f"\\n  {'=' * 60}")
-        print(f"  OVERWRITE CLEANUP COMPLETE: {overwrite_deleted} binding(s) removed")
+        print(f"  OVERWRITE COMPLETE: {overwrite_deleted} binding(s) removed")
         print(f"  {'=' * 60}")
     
     # Deploy new bindings
@@ -1750,7 +1975,7 @@ def patch_epg_add(content):
     success_count = 0
     fail_count = 0
     
-    # In overwrite mode, deploy ALL bindings (not just "new" ones since we just wiped the port)
+    # In overwrite mode, deploy ALL bindings (not just "new" ones since we wiped ports)
     deploy_list = all_bindings if overwrite_mode else new_bindings
     
     # Track port changes for separator output
@@ -1766,10 +1991,27 @@ def patch_epg_add(content):
         session = sessions[b['env']]
         apic_url = APIC_URLS[b['env']]'''
 
-    # Try both targets: original first, then previously-patched
-    content, applied = find_and_replace(content, old_phase4_deploy, new_phase4_deploy, "EPG Add: overwrite deletion v2 (from original)")
+    # Try targets in order: original unpatched → v1 → v2
+    content, applied = find_and_replace(content, old_phase4_deploy, new_phase4_deploy, "EPG Add: overwrite deletion v3 (from original)")
     if not applied:
-        content, _ = find_and_replace(content, old_phase4_deploy_v1, new_phase4_deploy, "EPG Add: overwrite deletion v2 (updating v1)")
+        content, applied = find_and_replace(content, old_phase4_deploy_v1, new_phase4_deploy, "EPG Add: overwrite deletion v3 (updating v1)")
+    if not applied:
+        # v2 was previously applied — detect and replace
+        if old_phase4_deploy_v2_marker in content:
+            # Find the v2 block boundaries: starts at marker, ends at deploy loop
+            v2_start = content.index(old_phase4_deploy_v2_marker)
+            # Find the deploy loop that follows (same in v2 and v3)
+            deploy_marker = "    for b in deploy_list:"
+            v2_deploy_pos = content.index(deploy_marker, v2_start)
+            # Find the `for b in deploy_list:` line and the `session = sessions[b['env']]` 2 lines later
+            v2_end_marker = "        apic_url = APIC_URLS[b['env']]"
+            v2_end = content.index(v2_end_marker, v2_deploy_pos) + len(v2_end_marker)
+            
+            old_v2_block = content[v2_start:v2_end]
+            content = content[:v2_start] + new_phase4_deploy + content[v2_end:]
+            print(f"    [OK] EPG Add: overwrite deletion v3 (updating v2)")
+        else:
+            print(f"    [SKIP] EPG Add: overwrite deletion v3 — pattern not found")
 
     # --- PATCH E: Update Phase 3 preview to show overwrite info ---
     old_preview_summary = '''    print(f"\\n  Total bindings: {len(all_bindings)}")
@@ -1782,7 +2024,8 @@ def patch_epg_add(content):
           (" (will be RE-DEPLOYED after wipe)" if overwrite_mode else " (will be skipped)"))
     if overwrite_mode:
         unique_ports = set((b['switch'], b['port']) for b in all_bindings)
-        print(f"  [OVERWRITE] {len(unique_ports)} port(s) will have ALL existing bindings wiped first")'''
+        mode_label = "ALL auto-deleted" if overwrite_auto else "interactive selection"
+        print(f"  [OVERWRITE] {len(unique_ports)} port(s) — existing bindings will be {mode_label}")'''
 
     content, _ = find_and_replace(content, old_preview_summary, new_preview_summary, "EPG Add: preview overwrite info")
 
@@ -1801,12 +2044,14 @@ def patch_epg_add(content):
     content, _ = find_and_replace(content, old_summary, new_summary, "EPG Add: final summary with overwrite count")
 
     # --- PATCH G: Fix deploy confirmation to show correct count ---
-    if "Ready to OVERWRITE: wipe existing" not in content:
+    if "Ready to OVERWRITE" not in content:
         old_confirm = '''    print(f"\\nReady to deploy {len(new_bindings)} binding(s)")'''
 
         new_confirm = '''    deploy_count = len(all_bindings) if overwrite_mode else len(new_bindings)
-    if overwrite_mode:
-        print(f"\\nReady to OVERWRITE: wipe existing + deploy {deploy_count} binding(s)")
+    if overwrite_auto:
+        print(f"\\nReady to OVERWRITE ALL: auto-delete existing + deploy {deploy_count} binding(s)")
+    elif overwrite_interactive:
+        print(f"\\nReady to OVERWRITE (interactive): select deletions + deploy {deploy_count} binding(s)")
     else:
         print(f"\\nReady to deploy {len(new_bindings)} binding(s)")'''
 
@@ -2142,7 +2387,7 @@ def find_first_avail_port(output_lines, start_idx=0):
   </div>
   <div class="toggle-info">
     <div class="toggle-title">Default EPG Overwrite Mode</div>
-    <div class="toggle-desc">When enabled, all scripts default to <strong>Overwrite</strong> (wipe existing EPG bindings before deploying new). When disabled, scripts default to <strong>Add</strong> (keep existing). Applies to VPC, Static Port, and EPG Add.</div>
+    <div class="toggle-desc">When enabled, all scripts default to <strong>Overwrite ALL</strong> (auto-delete ALL existing EPG bindings before deploying new). When disabled, scripts default to <strong>Add</strong> (keep existing). Applies to VPC, Static Port, and EPG Add.</div>
   </div>
   <span class="toggle-badge {% if config.epg_overwrite_default %}on{% else %}off{% endif %}" id="epgOverwriteBadge">{% if config.epg_overwrite_default %}ON{% else %}OFF{% endif %}</span>
 </label>
@@ -2167,19 +2412,36 @@ def find_first_avail_port(output_lines, start_idx=0):
                                   "Settings: save epg_overwrite_default in JS")
 
     # --- PATCH 9e: Auto-inject EPG MODE prompt response ---
-    # Guard: skip if already injected
-    if "AUTO-EPG MODE SELECTION" not in content:
+    # v3 sends '3' for overwrite-all; v1 sent '2'
+    if "epg_ow = '3'" in content:
+        print(f"    [SKIP] Auto-inject: EPG MODE from settings — v3 already present")
+    elif "AUTO-EPG MODE SELECTION" in content:
+        # v1 is applied (sends '2') — upgrade to send '3' and match (1/2 prompt format
+        old_epg_inject_v1 = """                        if is_epg_mode and ('(1/2)' in tl or 'select mode' in tl) and tl.endswith(':'):
+                            cfg = load_config()
+                            epg_ow = '2' if cfg.get('epg_overwrite_default', False) else '1'
+                            epg_label = 'Overwrite' if epg_ow == '2' else 'Add'"""
+
+        new_epg_inject_v3 = """                        if is_epg_mode and ('(1/2' in tl or 'select mode' in tl) and tl.endswith(':'):
+                            cfg = load_config()
+                            epg_ow = '3' if cfg.get('epg_overwrite_default', False) else '1'
+                            epg_label = 'Overwrite ALL' if epg_ow == '3' else 'Add'"""
+
+        content, _ = find_and_replace(content, old_epg_inject_v1, new_epg_inject_v3,
+                                      "Auto-inject: EPG MODE upgrade v1→v3 (sends '3' now)")
+    else:
+        # Fresh install — inject before AUTO-TENANT SELECTION
         old_tenant_autostart = '''                        # AUTO-TENANT SELECTION'''
 
         new_epg_mode_inject = '''                        # AUTO-EPG MODE SELECTION
                         # Detects "EPG BINDING MODE" or "EPG MODE" in recent output and
-                        # auto-injects "2" (overwrite) or "1" (add) based on settings.
+                        # auto-injects "3" (overwrite all) or "1" (add) based on settings.
                         recent_5 = [r.lower() for r in current_run["output_lines"][-5:]]
                         is_epg_mode = any('epg binding mode' in r or 'epg mode' in r for r in recent_5)
-                        if is_epg_mode and ('(1/2)' in tl or 'select mode' in tl) and tl.endswith(':'):
+                        if is_epg_mode and ('(1/2' in tl or 'select mode' in tl) and tl.endswith(':'):
                             cfg = load_config()
-                            epg_ow = '2' if cfg.get('epg_overwrite_default', False) else '1'
-                            epg_label = 'Overwrite' if epg_ow == '2' else 'Add'
+                            epg_ow = '3' if cfg.get('epg_overwrite_default', False) else '1'
+                            epg_label = 'Overwrite ALL' if epg_ow == '3' else 'Add'
                             time.sleep(0.1)
                             try:
                                 running_process.stdin.write((epg_ow + '\\n').encode('utf-8'))
@@ -2193,8 +2455,6 @@ def find_first_avail_port(output_lines, start_idx=0):
 
         content, _ = find_and_replace(content, old_tenant_autostart, new_epg_mode_inject,
                                       "Auto-inject: EPG MODE from settings")
-    else:
-        print(f"    [SKIP] Auto-inject: EPG MODE from settings — already present")
 
     # --- PATCH README-A: Replace readme tab bar with 7 tabs ---
     old_readme_tabs = """<div class="readme-tabs">
