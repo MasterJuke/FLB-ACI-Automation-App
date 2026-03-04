@@ -665,6 +665,53 @@ def patch_vpc_port_display(content):
 
     content, _ = find_and_replace(content, old_vpc_loop_env, new_vpc_loop_env, "VPC: token refresh in deploy loop")
 
+    # =========================================================================
+    # FEATURE 3: Select-once — PG exists handling (VPC)
+    # =========================================================================
+
+    # --- PATCH L-vpc: Add pg_exists_always_use setting before auth ---
+    old_vpc_pg_mode_end = '''    reuse_pg_mode = (pg_mode_choice == '2')
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")'''
+
+    new_vpc_pg_mode_end = '''    reuse_pg_mode = (pg_mode_choice == '2')
+    
+    # When PG already exists with same name
+    pg_exists_always_use = True
+    if not reuse_pg_mode:
+        print("\\n" + "-" * 70)
+        print(" WHEN POLICY GROUP NAME ALREADY EXISTS")
+        print("-" * 70)
+        print("\\n  [1] Always use existing policy group (default)")
+        print("  [2] Ask each time")
+        pg_exists_choice = prompt_input("\\nSelect (1/2) [default=1]: ").strip()
+        pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")'''
+
+    content, _ = find_and_replace(content, old_vpc_pg_mode_end, new_vpc_pg_mode_end,
+                                  "VPC: select-once PG exists handling")
+
+    # --- PATCH M-vpc: Replace per-deployment prompt with global check ---
+    old_vpc_use_existing = '''            print(f"\\n  [WARNING] Policy group '{config['policy_group']}' already exists")
+            use_existing = prompt_input("  Use existing policy group? (yes/no): ").strip().lower()
+            if use_existing not in ['yes', 'y']:'''
+
+    new_vpc_use_existing = '''            print(f"\\n  [WARNING] Policy group '{config['policy_group']}' already exists")
+            if pg_exists_always_use:
+                print("  [AUTO] Using existing policy group (global setting)")
+                use_existing = 'yes'
+            else:
+                use_existing = prompt_input("  Use existing policy group? (yes/no): ").strip().lower()
+            if use_existing not in ['yes', 'y']:'''
+
+    content, _ = find_and_replace(content, old_vpc_use_existing, new_vpc_use_existing,
+                                  "VPC: auto-answer PG exists prompt")
+
     return content
 
 
@@ -968,6 +1015,57 @@ def patch_individual_port_display(content):
 
     content, _ = find_and_replace(content, old_ind_loop_env, new_ind_loop_env, "Individual: token refresh in deploy loop")
 
+    # =========================================================================
+    # FEATURE 3: Select-once — PG exists handling (Individual)
+    # =========================================================================
+
+    # --- PATCH L-ind: Add pg_exists_always_use setting before auth ---
+    old_ind_pg_mode_end = '''    reuse_pg_mode = (pg_mode_choice == '2')
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    username = prompt_input("\\nUsername: ").strip()'''
+
+    new_ind_pg_mode_end = '''    reuse_pg_mode = (pg_mode_choice == '2')
+    
+    # When PG already exists with same name
+    pg_exists_always_use = True
+    if not reuse_pg_mode:
+        print("\\n" + "-" * 70)
+        print(" WHEN POLICY GROUP NAME ALREADY EXISTS")
+        print("-" * 70)
+        print("\\n  [1] Always use existing policy group (default)")
+        print("  [2] Ask each time")
+        pg_exists_choice = prompt_input("\\nSelect (1/2) [default=1]: ").strip()
+        pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # Get credentials
+    print("\\n" + "-" * 70)
+    print(" AUTHENTICATION")
+    print("-" * 70)
+    username = prompt_input("\\nUsername: ").strip()'''
+
+    content, _ = find_and_replace(content, old_ind_pg_mode_end, new_ind_pg_mode_end,
+                                  "Individual: select-once PG exists handling")
+
+    # --- PATCH M-ind: Replace per-deployment prompt with global check ---
+    old_ind_use_existing = '''            print(f"\\n  [WARNING] Policy group '{policy_group_name}' already exists")
+            use_existing = prompt_input("  Use existing policy group? (yes/no): ").strip().lower()
+            if use_existing not in ['yes', 'y']:'''
+
+    new_ind_use_existing = '''            print(f"\\n  [WARNING] Policy group '{policy_group_name}' already exists")
+            if pg_exists_always_use:
+                print("  [AUTO] Using existing policy group (global setting)")
+                use_existing = 'yes'
+            else:
+                use_existing = prompt_input("  Use existing policy group? (yes/no): ").strip().lower()
+            if use_existing not in ['yes', 'y']:'''
+
+    content, _ = find_and_replace(content, old_ind_use_existing, new_ind_use_existing,
+                                  "Individual: auto-answer PG exists prompt")
+
     return content
 
 
@@ -1123,15 +1221,19 @@ def patch_epg_add(content):
     content, _ = find_and_replace(content, old_post_binding, new_post_binding, "EPG Add: overwrite mode toggle")
 
     # --- PATCH D: Inject overwrite deletion before Phase 4 deployment ---
+    # Target 1: original unpatched code
     old_phase4_deploy = '''    # Deploy
     print("\\n[INFO] Deploying bindings...")
     
     success_count = 0
     fail_count = 0
     
-    for b in new_bindings:'''
+    for b in new_bindings:
+        session = sessions[b['env']]
+        apic_url = APIC_URLS[b['env']]'''
 
-    new_phase4_deploy = '''    # Overwrite mode: delete existing bindings first
+    # Target 2: previously patched overwrite code (for updating)
+    old_phase4_deploy_v1 = '''    # Overwrite mode: delete existing bindings first
     overwrite_deleted = 0
     if overwrite_mode:
         print("\\n[INFO] Overwrite mode — removing existing EPG bindings first...")
@@ -1172,9 +1274,160 @@ def patch_epg_add(content):
     # In overwrite mode, deploy ALL bindings (not just "new" ones since we just wiped the port)
     deploy_list = all_bindings if overwrite_mode else new_bindings
     
-    for b in deploy_list:'''
+    for b in deploy_list:
+        session = sessions[b['env']]
+        apic_url = APIC_URLS[b['env']]'''
 
-    content, _ = find_and_replace(content, old_phase4_deploy, new_phase4_deploy, "EPG Add: overwrite deletion + deploy list")
+    new_phase4_deploy = '''    # Overwrite mode: delete existing bindings first (v2 — dual-strategy)
+    overwrite_deleted = 0
+    if overwrite_mode:
+        print("\\n" + "=" * 70)
+        print(" OVERWRITE: REMOVING EXISTING EPG BINDINGS")
+        print("=" * 70)
+        
+        # Build unique set of switch+port combinations
+        ports_to_clean = {}
+        for b in all_bindings:
+            key = (b['switch'], b['port'], b['node_id'], b['env'])
+            if key not in ports_to_clean:
+                ports_to_clean[key] = []
+            ports_to_clean[key].append(b)
+        
+        for (switch, port, node_id, env), port_bindings in sorted(ports_to_clean.items()):
+            print(f"\\n  {'=' * 60}")
+            print(f"  {switch} port {port}")
+            print(f"  {'=' * 60}")
+            
+            if env not in sessions:
+                print(f"  [SKIP] No session for {env}")
+                continue
+            session = sessions[env]
+            apic_url = APIC_URLS[env]
+            tenants_list = TENANTS[env]
+            
+            eth_port = f"eth{port}" if not port.startswith("eth") else port
+            indiv_path = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_port}]"
+            
+            # Strategy 1: Class-level query with exact tDn filter
+            existing = query_all_bindings_on_port(session, apic_url, node_id, port, POD_ID)
+            print(f"  [QUERY] Class-level search: {len(existing)} binding(s) found")
+            
+            # Strategy 2: Per-EPG fallback — scan EPG children across all tenants
+            # Uses the same per-EPG child query pattern that works in EPG Delete.
+            # This catches bindings the class-level eq() filter may miss due to
+            # URL encoding of brackets or path format differences.
+            if not existing:
+                print(f"  [QUERY] Trying per-tenant EPG fallback search...")
+                fallback_dns = set()
+                
+                for tenant in tenants_list:
+                    try:
+                        # Get all app profiles in this tenant
+                        ap_url = f"{apic_url}/api/mo/uni/tn-{tenant}.json?query-target=children&target-subtree-class=fvAp"
+                        ap_resp = session.get(ap_url, verify=False, timeout=15)
+                        if ap_resp.status_code != 200:
+                            continue
+                        for ap_item in ap_resp.json().get("imdata", []):
+                            ap_name = ap_item.get("fvAp", {}).get("attributes", {}).get("name", "")
+                            if not ap_name:
+                                continue
+                            # Get all EPGs in this app profile
+                            epg_url = f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{ap_name}.json?query-target=subtree&target-subtree-class=fvRsPathAtt"
+                            epg_resp = session.get(epg_url, verify=False, timeout=20)
+                            if epg_resp.status_code != 200:
+                                continue
+                            for item in epg_resp.json().get("imdata", []):
+                                attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
+                                tdn = attrs.get("tDn", "")
+                                dn = attrs.get("dn", "")
+                                # Python substring match — same pattern as EPG Delete
+                                if indiv_path in tdn and dn not in fallback_dns:
+                                    fallback_dns.add(dn)
+                                    encap = attrs.get("encap", "")
+                                    _tn = re.search(r'/tn-([^/]+)/', dn)
+                                    _ap = re.search(r'/ap-([^/]+)/', dn)
+                                    _epg = re.search(r'/epg-([^/]+)/', dn)
+                                    _vlan = re.search(r'vlan-(\\d+)', encap)
+                                    existing.append({
+                                        "dn": dn, "tDn": tdn, "encap": encap,
+                                        "mode": attrs.get("mode", ""),
+                                        "tenant": _tn.group(1) if _tn else "",
+                                        "app_profile": _ap.group(1) if _ap else "",
+                                        "epg": _epg.group(1) if _epg else "",
+                                        "vlan": int(_vlan.group(1)) if _vlan else 0
+                                    })
+                    except Exception as e:
+                        print(f"    [WARNING] Fallback error for tenant {tenant}: {e}")
+                
+                if existing:
+                    print(f"  [QUERY] Fallback found: {len(existing)} binding(s)")
+                else:
+                    print(f"  [QUERY] Fallback found: 0 binding(s)")
+            
+            if existing:
+                print(f"  [DELETE] Removing {len(existing)} binding(s)...")
+                for b_del in existing:
+                    try:
+                        resp = session.delete(
+                            f"{apic_url}/api/mo/{b_del['dn']}.json",
+                            verify=False, timeout=30
+                        )
+                        ok = resp.status_code == 200
+                    except Exception:
+                        ok = False
+                    
+                    status = "[DELETED]" if ok else "[FAIL]"
+                    print(f"    {status} VLAN {b_del.get('vlan', '?')} — {b_del.get('epg', '?')} ({b_del.get('tenant', '?')})")
+                    if ok:
+                        overwrite_deleted += 1
+                    else:
+                        print(f"           DN: {b_del.get('dn', '?')[:80]}")
+                
+                # Verify deletion
+                import time as _time
+                _time.sleep(1)  # Brief pause to let APIC commit
+                verify = query_all_bindings_on_port(session, apic_url, node_id, port, POD_ID)
+                if verify:
+                    print(f"  [WARNING] {len(verify)} binding(s) still remain after deletion!")
+                    for v in verify:
+                        print(f"    Still bound: VLAN {v.get('vlan', '?')} — {v.get('epg', '?')}")
+                else:
+                    print(f"  [VERIFIED] Port is clean — 0 bindings remain")
+            else:
+                print(f"  [INFO] No existing bindings found on this port")
+        
+        print(f"\\n  {'=' * 60}")
+        print(f"  OVERWRITE CLEANUP COMPLETE: {overwrite_deleted} binding(s) removed")
+        print(f"  {'=' * 60}")
+    
+    # Deploy new bindings
+    print("\\n" + "=" * 70)
+    print(" DEPLOYING EPG BINDINGS")
+    print("=" * 70)
+    
+    success_count = 0
+    fail_count = 0
+    
+    # In overwrite mode, deploy ALL bindings (not just "new" ones since we just wiped the port)
+    deploy_list = all_bindings if overwrite_mode else new_bindings
+    
+    # Track port changes for separator output
+    _last_deploy_port = None
+    for b in deploy_list:
+        _dp_key = (b['switch'], b['port'])
+        if _dp_key != _last_deploy_port:
+            _last_deploy_port = _dp_key
+            _dp_count = sum(1 for x in deploy_list if (x['switch'], x['port']) == _dp_key)
+            print(f"\\n  {'-' * 60}")
+            print(f"  {b['switch']} port {b['port']} — {_dp_count} binding(s)")
+            print(f"  {'-' * 60}")
+        session = sessions[b['env']]
+        apic_url = APIC_URLS[b['env']]'''
+
+    # Try both targets: original first, then previously-patched
+    content, applied = find_and_replace(content, old_phase4_deploy, new_phase4_deploy, "EPG Add: overwrite deletion v2 (from original)")
+    if not applied:
+        content, _ = find_and_replace(content, old_phase4_deploy_v1, new_phase4_deploy, "EPG Add: overwrite deletion v2 (updating v1)")
 
     # --- PATCH E: Update Phase 3 preview to show overwrite info ---
     old_preview_summary = '''    print(f"\\n  Total bindings: {len(all_bindings)}")
@@ -1270,13 +1523,124 @@ def patch_epg_add(content):
 def patch_deployment_app(content):
     """Patch aci_deployment_app.py with CSS and JavaScript changes."""
 
+    # --- PATCH 0-CSS: Theme refresh — Tailwind-400 palette from simulation ---
+    old_root = """:root{--bg-darkest:#0d1117;--bg-dark:#161b22;--bg-sidebar:#0d1117;--bg-terminal:#1e1e2e;--bg-input:#252535;--border-color:#30363d;--text-primary:#e6edf3;--text-secondary:#8b949e;--text-muted:#6e7681;--accent-blue:#58a6ff;--accent-cyan:#39d4d4;--accent-green:#3fb950;--accent-orange:#f0883e;--accent-red:#f85149;--accent-purple:#a371f7;--accent-yellow:#d29922;--glow-cyan:rgba(57,212,212,0.15)}"""
+
+    new_root = """:root{--bg-darkest:#0a0e17;--bg-dark:#0f172a;--bg-sidebar:#0a0e17;--bg-terminal:#0f172a;--bg-input:#1e293b;--border-color:#334155;--text-primary:#e2e8f0;--text-secondary:#94a3b8;--text-muted:#64748b;--accent-blue:#60a5fa;--accent-cyan:#22d3ee;--accent-green:#4ade80;--accent-orange:#fb923c;--accent-red:#f87171;--accent-purple:#a78bfa;--accent-yellow:#fbbf24;--glow-cyan:rgba(34,211,238,0.15)}"""
+
+    content, _ = find_and_replace(content, old_root, new_root, "CSS theme: Tailwind-400 palette")
+
+    # Update hardcoded toggle slider colors to match new border-color
+    content, _ = find_and_replace(content,
+        ".toggle-slider{position:absolute;inset:0;background:#30363d;",
+        ".toggle-slider{position:absolute;inset:0;background:#334155;",
+        "CSS theme: toggle slider bg")
+
+    content, _ = find_and_replace(content,
+        ".toggle-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#8b949e;",
+        ".toggle-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#94a3b8;",
+        "CSS theme: toggle slider knob")
+
+    # Update toggle checked states to match new cyan
+    content, _ = find_and_replace(content,
+        ".toggle-switch input:checked+.toggle-slider{background:rgba(57,212,212,.3);border:1px solid var(--accent-cyan)}",
+        ".toggle-switch input:checked+.toggle-slider{background:rgba(34,211,238,.3);border:1px solid var(--accent-cyan)}",
+        "CSS theme: toggle checked bg")
+
+    content, _ = find_and_replace(content,
+        "background:var(--accent-cyan);box-shadow:0 0 8px rgba(57,212,212,.5)}",
+        "background:var(--accent-cyan);box-shadow:0 0 8px rgba(34,211,238,.5)}",
+        "CSS theme: toggle checked glow")
+
+    # Update credential save button gradient to match new amber/yellow
+    content, _ = find_and_replace(content,
+        ".cred-btn.save{background:linear-gradient(135deg,#f7971e,#ffd200);color:#0d1117}",
+        ".cred-btn.save{background:linear-gradient(135deg,#fb923c,#fbbf24);color:#0a0e17}",
+        "CSS theme: cred save button gradient")
+
+    content, _ = find_and_replace(content,
+        ".cred-btn.save:hover{box-shadow:0 4px 16px rgba(247,151,30,.3)}",
+        ".cred-btn.save:hover{box-shadow:0 4px 16px rgba(251,146,60,.3)}",
+        "CSS theme: cred save button hover glow")
+
+    # Update credential input focus ring to match new amber
+    content, _ = find_and_replace(content,
+        ".cred-input:focus{outline:none;border-color:#ffd200;box-shadow:0 0 0 3px rgba(247,151,30,.15)}",
+        ".cred-input:focus{outline:none;border-color:#fbbf24;box-shadow:0 0 0 3px rgba(251,191,36,.15)}",
+        "CSS theme: cred input focus ring")
+
+    # Update credential section title to match new amber
+    content, _ = find_and_replace(content,
+        ".cred-section-title{font-size:14px;font-weight:600;color:#ffd200;",
+        ".cred-section-title{font-size:14px;font-weight:600;color:#fbbf24;",
+        "CSS theme: cred section title color")
+
+    # Update credential nav icon gradient
+    content, _ = find_and_replace(content,
+        ".nav-item.credentials .nav-icon{background:linear-gradient(135deg,#f7971e,#ffd200)}",
+        ".nav-item.credentials .nav-icon{background:linear-gradient(135deg,#fb923c,#fbbf24)}",
+        "CSS theme: cred nav icon gradient")
+
+    # Update header badge credential color
+    content, _ = find_and_replace(content,
+        ".header-badge.credentials{background:rgba(247,151,30,.2);color:#ffd200}",
+        ".header-badge.credentials{background:rgba(251,191,36,.2);color:#fbbf24}",
+        "CSS theme: cred header badge")
+
+    # Update nav item hover to match new blue
+    content, _ = find_and_replace(content,
+        ".nav-item:hover{background:rgba(88,166,255,.08);border-color:rgba(88,166,255,.2)}",
+        ".nav-item:hover{background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.2)}",
+        "CSS theme: nav hover")
+
+    # Update nav active to match new cyan
+    content, _ = find_and_replace(content,
+        ".nav-item.active{background:linear-gradient(135deg,rgba(57,212,212,.12),rgba(88,166,255,.12));border-color:var(--accent-cyan);box-shadow:0 0 20px var(--glow-cyan)}",
+        ".nav-item.active{background:linear-gradient(135deg,rgba(34,211,238,.12),rgba(96,165,250,.12));border-color:var(--accent-cyan);box-shadow:0 0 20px var(--glow-cyan)}",
+        "CSS theme: nav active")
+
+    # Update file picker hover glow
+    content, _ = find_and_replace(content,
+        ".file-picker-btn:hover{background:linear-gradient(135deg,rgba(57,212,212,.2),rgba(88,166,255,.2));box-shadow:0 0 16px var(--glow-cyan)}",
+        ".file-picker-btn:hover{background:linear-gradient(135deg,rgba(34,211,238,.2),rgba(96,165,250,.2));box-shadow:0 0 16px var(--glow-cyan)}",
+        "CSS theme: file picker hover")
+
+    # Update file picker default bg
+    content, _ = find_and_replace(content,
+        "background:linear-gradient(135deg,rgba(57,212,212,.1),rgba(88,166,255,.1));color:var(--accent-cyan)",
+        "background:linear-gradient(135deg,rgba(34,211,238,.1),rgba(96,165,250,.1));color:var(--accent-cyan)",
+        "CSS theme: file picker bg")
+
+    # Update time-saved banner gradient
+    content, _ = find_and_replace(content,
+        "background:linear-gradient(135deg,rgba(57,212,212,.06),rgba(88,166,255,.06));border:1px solid rgba(57,212,212,.25)",
+        "background:linear-gradient(135deg,rgba(34,211,238,.06),rgba(96,165,250,.06));border:1px solid rgba(34,211,238,.25)",
+        "CSS theme: time saved banner")
+
+    # Update post-run bar gradient
+    content, _ = find_and_replace(content,
+        ".post-run-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(135deg,rgba(63,185,80,.08),rgba(57,212,212,.08));border-top:1px solid rgba(63,185,80,.3)}",
+        ".post-run-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(135deg,rgba(74,222,128,.08),rgba(34,211,238,.08));border-top:1px solid rgba(74,222,128,.3)}",
+        "CSS theme: post-run bar")
+
+    # Update cred status set/unset backgrounds
+    content, _ = find_and_replace(content,
+        ".cred-status.set{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3);color:var(--accent-green)}",
+        ".cred-status.set{background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.3);color:var(--accent-green)}",
+        "CSS theme: cred status set")
+
+    content, _ = find_and_replace(content,
+        ".cred-status.unset{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.2);color:var(--accent-red)}",
+        ".cred-status.unset{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);color:var(--accent-red)}",
+        "CSS theme: cred status unset")
+
     # --- PATCH 1: CSS — Add port status styles after .bracket-num ---
     css_anchor = ".bracket-num{color:var(--accent-blue)!important;font-weight:700}"
     css_addition = """.bracket-num{color:var(--accent-blue)!important;font-weight:700}
 .port-avail{color:var(--accent-green)!important;font-weight:700}
 .port-inuse{color:var(--accent-red)!important;font-weight:700}
-.terminal-line.port-available{background:rgba(63,185,80,.06);border-left:3px solid var(--accent-green);padding-left:8px}
-.terminal-line.port-in-use{background:rgba(248,81,73,.06);border-left:3px solid var(--accent-red);padding-left:8px}"""
+.terminal-line.port-available{background:rgba(74,222,128,.06);border-left:3px solid var(--accent-green);padding-left:8px}
+.terminal-line.port-in-use{background:rgba(248,113,113,.06);border-left:3px solid var(--accent-red);padding-left:8px}"""
 
     content, _ = find_and_replace(content, css_anchor, css_addition, "CSS port status styles")
 
@@ -2059,6 +2423,185 @@ def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):'''
 
     content, _ = find_and_replace(content, old_gen_call, new_gen_call,
                                   "Rollback: inject Phase 2 restore from captured state")
+
+    # =========================================================================
+    # FEATURE 1: SAVE/LOAD CREDENTIALS TO DISK (base64 obfuscated)
+    # =========================================================================
+
+    # --- PATCH CRED-A: Add credential file constant + save/load functions ---
+    old_cred_init = '''stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}'''
+
+    new_cred_init = '''stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
+
+CREDENTIALS_FILE = os.path.join(BASE_DIR, '.aci_credentials')
+
+def save_credentials_to_disk():
+    """Save current credentials to disk with base64 obfuscation."""
+    import base64, json as _json
+    try:
+        data = {
+            "username": stored_credentials.get("username", ""),
+            "apic_urls": stored_credentials.get("apic_urls", {"D1": "", "D2": "", "D3": ""}),
+        }
+        pwd = stored_credentials.get("password", "")
+        if pwd:
+            data["_p"] = base64.b64encode(pwd.encode("utf-8")).decode("ascii")
+        with open(CREDENTIALS_FILE, "w") as f:
+            _json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[WARNING] Failed to save credentials: {e}")
+        return False
+
+def load_credentials_from_disk():
+    """Load credentials from disk (base64 obfuscated)."""
+    import base64, json as _json
+    global stored_credentials
+    try:
+        if not os.path.exists(CREDENTIALS_FILE):
+            return False
+        with open(CREDENTIALS_FILE, "r") as f:
+            data = _json.load(f)
+        stored_credentials["username"] = data.get("username", "")
+        if data.get("_p"):
+            stored_credentials["password"] = base64.b64decode(data["_p"]).decode("utf-8")
+        if data.get("apic_urls"):
+            stored_credentials["apic_urls"] = data["apic_urls"]
+        stored_credentials["set"] = bool(stored_credentials["username"] and stored_credentials.get("password"))
+        return stored_credentials["set"]
+    except Exception as e:
+        print(f"[WARNING] Failed to load credentials: {e}")
+        return False
+
+# Auto-load on startup
+load_credentials_from_disk()'''
+
+    content, _ = find_and_replace(content, old_cred_init, new_cred_init,
+                                  "Credentials: add save/load to disk with base64")
+
+    # --- PATCH CRED-B: Add API endpoints for save/load disk ---
+    old_cred_delete = '''    elif request.method == 'DELETE':
+        stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
+        return jsonify({'status': 'cleared'})'''
+
+    new_cred_delete = '''    elif request.method == 'DELETE':
+        stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
+        return jsonify({'status': 'cleared'})
+
+@app.route('/api/credentials/save-to-disk', methods=['POST'])
+def api_credentials_save_disk():
+    if not stored_credentials.get('set'):
+        return jsonify({'status': 'error', 'message': 'No credentials to save'})
+    ok = save_credentials_to_disk()
+    return jsonify({'status': 'saved' if ok else 'error'})
+
+@app.route('/api/credentials/load-from-disk', methods=['POST'])
+def api_credentials_load_disk():
+    ok = load_credentials_from_disk()
+    return jsonify({
+        'status': 'loaded' if ok else 'not_found',
+        'set': stored_credentials.get('set', False),
+        'username': stored_credentials.get('username', ''),
+        'apic_urls': stored_credentials.get('apic_urls', {"D1": "", "D2": "", "D3": ""})
+    })'''
+
+    content, _ = find_and_replace(content, old_cred_delete, new_cred_delete,
+                                  "Credentials: save/load disk API endpoints")
+
+    # --- PATCH CRED-C: Add Save/Load disk buttons to UI ---
+    old_cred_buttons = '''<div class="cred-actions"><button class="cred-btn save" onclick="saveCredentials()">Save Credentials</button><button class="cred-btn clear" onclick="clearCredentials()">Clear</button></div>'''
+
+    new_cred_buttons = '''<div class="cred-actions"><button class="cred-btn save" onclick="saveCredentials()">Save to Memory</button><button class="cred-btn clear" onclick="clearCredentials()">Clear</button></div>
+<div class="cred-actions" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-color)"><button class="cred-btn save" style="background:#2563eb" onclick="saveToDisk()">💾 Save to Disk</button><button class="cred-btn save" style="background:#059669" onclick="loadFromDisk()">📂 Load from Disk</button></div>'''
+
+    content, _ = find_and_replace(content, old_cred_buttons, new_cred_buttons,
+                                  "Credentials: Save/Load disk buttons in UI")
+
+    # --- PATCH CRED-D: Add JS functions for save/load disk ---
+    old_check_creds = '''function checkCredentials(){fetch('/api/credentials')'''
+
+    new_check_creds = '''function saveToDisk(){
+  if(!credSet){alert('Set credentials first');return}
+  fetch('/api/credentials/save-to-disk',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.status==='saved') alert('Credentials saved to disk (.aci_credentials, base64 obfuscated)');
+    else alert('Failed to save: '+(d.message||'unknown error'));
+  });
+}
+function loadFromDisk(){
+  fetch('/api/credentials/load-from-disk',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.status==='loaded'){
+      updateCredStatus(true);
+      document.getElementById('credUsername').value=d.username||'';
+      document.getElementById('credApicD1').value=(d.apic_urls||{}).D1||'';
+      document.getElementById('credApicD2').value=(d.apic_urls||{}).D2||'';
+      document.getElementById('credApicD3').value=(d.apic_urls||{}).D3||'';
+      document.getElementById('credPassword').value='\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022';
+      alert('Credentials loaded from disk');
+    } else { alert('No saved credentials found on disk'); }
+  });
+}
+function checkCredentials(){fetch('/api/credentials')'''
+
+    content, _ = find_and_replace(content, old_check_creds, new_check_creds,
+                                  "Credentials: JS save/load disk functions")
+
+    # --- PATCH CRED-E: Update hint text ---
+    old_cred_hint = '''Credentials are stored <strong>in memory only</strong> and are never written to disk. They clear automatically when the app restarts.'''
+
+    new_cred_hint = '''Credentials are stored <strong>in memory</strong> by default and clear on app restart. Use <strong>Save to Disk</strong> to persist across restarts (base64 obfuscated in <code>.aci_credentials</code>). Use <strong>Load from Disk</strong> to restore them.'''
+
+    content, _ = find_and_replace(content, old_cred_hint, new_cred_hint,
+                                  "Credentials: update hint text for disk save")
+
+    # =========================================================================
+    # FEATURE 2: PORT AUTO-INPUT — send raw port number for VPC & Static
+    # =========================================================================
+    # The EPG Add/Delete port lookup works fine — this only changes the
+    # "Select port number:" handler for VPC and Individual deployments.
+    # Instead of scanning the menu for a matching line, we extract the
+    # port number directly from the CSV (e.g. "1/61" → "61", "eth1/61" → "61")
+    # and send it as the raw answer.
+
+    old_port_auto = '''                            if desired_iface:
+                                # Find the menu number that matches the desired interface
+                                menu_num = find_port_in_output(desired_iface, current_run["output_lines"], search_from)
+                                if menu_num:
+                                    time.sleep(0.1)
+                                    try:
+                                        running_process.stdin.write((menu_num + '\\n').encode('utf-8'))
+                                        running_process.stdin.flush()
+                                        output_queue.put(('output', f'[AUTO] Port matched: {desired_iface} → option {menu_num}'))
+                                        current_run["output_lines"].append(f'[AUTO] Port matched: {desired_iface} → option {menu_num}')
+                                        current_run["deployed_ports"].append(desired_iface)
+                                    except:
+                                        current_run["deployed_ports"].append('')
+                                else:
+                                    output_queue.put(('output', f'[WARNING] Port {desired_iface} not found in menu — waiting for manual input'))
+                                    current_run["output_lines"].append(f'[WARNING] Port {desired_iface} not found in port list')
+                                    current_run["deployed_ports"].append('')'''
+
+    new_port_auto = '''                            if desired_iface:
+                                # Extract raw port number: "1/61" → "61", "eth1/61" → "61", "Eth1/61" → "61"
+                                import re as _re
+                                _port_m = _re.match(r'(?:[Ee]th)?(\\d+)/(\\d+)', desired_iface.strip())
+                                if _port_m:
+                                    raw_port_num = _port_m.group(2)
+                                    time.sleep(0.1)
+                                    try:
+                                        running_process.stdin.write((raw_port_num + '\\n').encode('utf-8'))
+                                        running_process.stdin.flush()
+                                        output_queue.put(('output', f'[AUTO] Port input: {desired_iface} → sending {raw_port_num}'))
+                                        current_run["output_lines"].append(f'[AUTO] Port input: {desired_iface} → sending {raw_port_num}')
+                                        current_run["deployed_ports"].append(desired_iface)
+                                    except:
+                                        current_run["deployed_ports"].append('')
+                                else:
+                                    output_queue.put(('output', f'[WARNING] Cannot parse port: {desired_iface} — waiting for manual input'))
+                                    current_run["output_lines"].append(f'[WARNING] Cannot parse port: {desired_iface}')
+                                    current_run["deployed_ports"].append('')'''
+
+    content, _ = find_and_replace(content, old_port_auto, new_port_auto,
+                                  "Port auto-input: send raw port number instead of menu match")
 
     return content
 
