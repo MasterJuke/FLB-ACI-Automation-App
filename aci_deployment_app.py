@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
     "default_epgadd_csv": "epg_add.csv",
     "default_epgdelete_csv": "epg_delete.csv",
     "auto_select_port": True,
+    "epg_overwrite_default": False,
     "version": "1.3.0"
 }
 
@@ -82,7 +83,7 @@ CSV_REQUIREMENTS = {
                    "validators": {"TYPE": r"^(ACCESS|TRUNK)$", "SPEED": r"^(1G|10G|25G|40G|100G)$", "VLANS": r"^[\d,\-\s\"]+$"}},
     "epgadd": {"required": ["SWITCH", "PORT", "VLANS"],
                "validators": {"PORT": r"^(eth)?[\d]+/[\d]+$", "VLANS": r"^[\d,\-\s\"]+$"}},
-    "epgdelete": {"required": ["SWITCH", "PORT", "VLANS"],
+    "epgdelete": {"required": ["SWITCH", "PORT"],
                   "validators": {"PORT": r"^(eth)?[\d]+/[\d]+$", "VLANS": r"^[\d,\-\s\"]+$"}}
 }
 
@@ -93,6 +94,49 @@ input_queue = queue.Queue()
 
 # In-memory credential storage (NEVER written to disk)
 stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
+
+CREDENTIALS_FILE = os.path.join(BASE_DIR, '.aci_credentials')
+
+def save_credentials_to_disk():
+    """Save current credentials to disk with base64 obfuscation."""
+    import base64, json as _json
+    try:
+        data = {
+            "username": stored_credentials.get("username", ""),
+            "apic_urls": stored_credentials.get("apic_urls", {"D1": "", "D2": "", "D3": ""}),
+        }
+        pwd = stored_credentials.get("password", "")
+        if pwd:
+            data["_p"] = base64.b64encode(pwd.encode("utf-8")).decode("ascii")
+        with open(CREDENTIALS_FILE, "w") as f:
+            _json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[WARNING] Failed to save credentials: {e}")
+        return False
+
+def load_credentials_from_disk():
+    """Load credentials from disk (base64 obfuscated)."""
+    import base64, json as _json
+    global stored_credentials
+    try:
+        if not os.path.exists(CREDENTIALS_FILE):
+            return False
+        with open(CREDENTIALS_FILE, "r") as f:
+            data = _json.load(f)
+        stored_credentials["username"] = data.get("username", "")
+        if data.get("_p"):
+            stored_credentials["password"] = base64.b64decode(data["_p"]).decode("utf-8")
+        if data.get("apic_urls"):
+            stored_credentials["apic_urls"] = data["apic_urls"]
+        stored_credentials["set"] = bool(stored_credentials["username"] and stored_credentials.get("password"))
+        return stored_credentials["set"]
+    except Exception as e:
+        print(f"[WARNING] Failed to load credentials: {e}")
+        return False
+
+# Auto-load on startup
+load_credentials_from_disk()
 
 # Track current run for logging
 current_run = {"type": None, "start_time": None, "csv_path": None, "output_lines": [], "status": None}
@@ -171,10 +215,11 @@ def add_log_entry(deploy_type, csv_path, status, deployment_count, duration_seco
     if rollback:
         entry["rollback_file"] = rollback
 
-    # Generate results CSV (only meaningful for vpc/individual where ports are selected)
+    # Generate results CSV — always, for all deploy types and all outcomes
     tracked_ports = current_run.get("deployed_ports", [])
-    if csv_path and tracked_ports and deploy_type in ('vpc', 'individual'):
-        results = generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_lines, tracked_ports)
+    if csv_path:
+        results = generate_results_csv(deploy_type, csv_path, entry_id, timestamp,
+                                        output_lines, tracked_ports, run_status=status)
         if results:
             entry["results_file"] = results
 
@@ -239,6 +284,202 @@ def auto_save_log(deploy_type, entry_id, timestamp, output_lines):
         return None
 
 # =============================================================================
+# ROLLBACK STATE PARSING & RESTORE INJECTION
+# =============================================================================
+
+def parse_rollback_states(output_lines):
+    """
+    Extract [ROLLBACK:STATE] markers from deployment output.
+    
+    These markers are emitted by aci_port_utils cleanup functions BEFORE
+    deleting old configuration. They capture the prior state so the
+    rollback script can restore it.
+    
+    Returns list of state dicts.
+    """
+    import json as _json
+    states = []
+    for line in output_lines:
+        if '[ROLLBACK:STATE]' in line:
+            try:
+                json_str = line.split('[ROLLBACK:STATE]', 1)[1].strip()
+                states.append(_json.loads(json_str))
+            except Exception:
+                pass
+    return states
+
+
+def inject_restore_phase(script, prior_states, deploy_type):
+    """
+    Inject Phase 2 (restore prior state) code into a rollback script.
+    
+    Modifies the script string to add:
+    1. import json to imports
+    2. PRIOR_STATE constant with captured state data
+    3. Phase 2 restore logic before ROLLBACK COMPLETE
+    """
+    import json as _json
+    
+    if not prior_states:
+        return script
+    
+    # 1. Add import json
+    script = script.replace(
+        'import re\n\nurllib3',
+        'import re\nimport json\n\nurllib3'
+    )
+    
+    # 2. Add PRIOR_STATE constant after POD_ID
+    state_json = _json.dumps(prior_states, indent=2)
+    tq = "'" + "'" + "'"
+    script = script.replace(
+        'POD_ID = "1"\n\nWEB_UI',
+        'POD_ID = "1"\n\nPRIOR_STATE = ' + tq + '\n' + state_json + '\n' + tq + '\n\nWEB_UI'
+    )
+    
+    # 3. Insert Phase 2 before ROLLBACK COMPLETE
+    restore_code = """
+    # ==========================================================================
+    # PHASE 2: RESTORE PRIOR STATE
+    # ==========================================================================
+    
+    prior = json.loads(PRIOR_STATE)
+    if prior:
+        print()
+        print("=" * 60)
+        print(" PHASE 2: RESTORING PRIOR STATE")
+        print("=" * 60)
+        print()
+        
+        restore_num = 0
+        
+        # Restore descriptions first (least impactful)
+        for s in prior:
+            if s.get("type") != "description":
+                continue
+            restore_num += 1
+            node = s["node"]
+            port = s["port"]
+            value = s["value"]
+            eth = f"eth{port}" if not port.startswith("eth") else port
+            dn = f"topology/pod-{POD_ID}/node-{node}/sys/phys-[{eth}]"
+            print(f"  [R{restore_num}] Restoring description on node {node} eth{port}: {value}")
+            try:
+                r = safe_request('post', session, f"{apic_url}/api/node/mo/{dn}.json",
+                    apic_url, username, password, auth_state,
+                    json={"l1PhysIf": {"attributes": {"descr": value}}})
+                print(f"      {'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}")
+            except Exception as e:
+                print(f"      [ERROR] {e}")
+        
+        # Restore port selectors (re-links port to old policy group)
+        for s in prior:
+            if s.get("type") != "selector":
+                continue
+            restore_num += 1
+            sel_name = s["name"]
+            profile = s["profile"]
+            pg_name = s.get("policy_group", "")
+            port = s["port"]
+            pg_type = s.get("pg_type", "access")
+            
+            port_parts = port.split("/")
+            from_card = port_parts[0] if len(port_parts) > 1 else "1"
+            from_port = port_parts[-1]
+            
+            if pg_type == "vpc":
+                pg_dn = f"uni/infra/funcprof/accbundle-{pg_name}"
+            else:
+                pg_dn = f"uni/infra/funcprof/accportgrp-{pg_name}"
+            
+            if not pg_name:
+                print(f"  [R{restore_num}] [SKIP] No policy group to restore for selector {sel_name}")
+                continue
+            
+            print(f"  [R{restore_num}] Restoring port selector: {sel_name} -> {pg_name}")
+            try:
+                payload = {
+                    "infraHPortS": {
+                        "attributes": {"name": sel_name, "type": "range"},
+                        "children": [
+                            {"infraPortBlk": {"attributes": {
+                                "name": "block2",
+                                "fromCard": from_card, "toCard": from_card,
+                                "fromPort": from_port, "toPort": from_port
+                            }}},
+                            {"infraRsAccBaseGrp": {"attributes": {"tDn": pg_dn}}}
+                        ]
+                    }
+                }
+                r = safe_request('post', session,
+                    f"{apic_url}/api/node/mo/uni/infra/accportprof-{profile}/hports-{sel_name}-typ-range.json",
+                    apic_url, username, password, auth_state, json=payload)
+                print(f"      {'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}")
+            except Exception as e:
+                print(f"      [ERROR] {e}")
+        
+        # Restore EPG bindings last (depends on selector being in place)
+        for s in prior:
+            if s.get("type") != "binding":
+                continue
+            restore_num += 1
+            tenant = s["tenant"]
+            ap = s["ap"]
+            epg = s["epg"]
+            vlan = s["vlan"]
+            mode = s.get("mode", "regular")
+            path_type = s.get("path_type", "individual")
+            
+            if path_type == "vpc":
+                node1 = s.get("node", "")
+                node2 = s.get("node2", "")
+                vpc_pg = s.get("vpc_pg", "")
+                path = f"topology/pod-{POD_ID}/protpaths-{node1}-{node2}/pathep-[{vpc_pg}]"
+                label = f"VPC {node1}-{node2}"
+            else:
+                node = s.get("node", "")
+                port = s.get("port", "")
+                eth = f"eth{port}" if not port.startswith("eth") else port
+                path = f"topology/pod-{POD_ID}/paths-{node}/pathep-[{eth}]"
+                label = f"node {node} eth{port}"
+            
+            print(f"  [R{restore_num}] Restoring VLAN {vlan} on {label} -> {epg}")
+            try:
+                payload = {
+                    "fvRsPathAtt": {
+                        "attributes": {
+                            "tDn": path,
+                            "encap": f"vlan-{vlan}",
+                            "mode": mode,
+                            "instrImedcy": "immediate"
+                        }
+                    }
+                }
+                r = safe_request('post', session,
+                    f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{ap}/epg-{epg}.json",
+                    apic_url, username, password, auth_state, json=payload)
+                print(f"      {'[OK]' if r.status_code == 200 else '[FAIL] ' + r.text[:80]}")
+            except Exception as e:
+                print(f"      [ERROR] {e}")
+        
+        print(f"\n  Phase 2 complete: {restore_num} restore action(s)")
+
+"""
+    
+    old_complete = '    print()\n    print("=" * 60)\n    print(" ROLLBACK COMPLETE")'
+    new_complete = restore_code + '    print()\n    print("=" * 60)\n    print(" ROLLBACK COMPLETE")'
+    script = script.replace(old_complete, new_complete, 1)
+    
+    return script
+
+
+# =============================================================================
+# ROLLBACK STATE PARSING & RESTORE INJECTION
+# =============================================================================
+
+
+
+# =============================================================================
 # ROLLBACK SCRIPT GENERATION
 # =============================================================================
 
@@ -256,6 +497,11 @@ def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):
             return None
 
         script = build_rollback_script(deploy_type, entry_id, timestamp, rollback_actions)
+
+        # Multi-tier rollback: extract [ROLLBACK:STATE] markers and inject Phase 2
+        prior_states = parse_rollback_states(output_lines)
+        if prior_states:
+            script = inject_restore_phase(script, prior_states, deploy_type)
 
         with open(filepath, 'w') as f:
             f.write(script)
@@ -767,18 +1013,23 @@ def extract_deployed_ports(output_lines, tracked_ports):
 
     tracked_ports is the list built during execution:
       - "1/93"      → port was pre-selected and matched from the menu
-      - "__auto__"  → script fell back to auto-select (port 1); resolve from output
+      - "__auto__"  → script fell back to auto-select; resolve from output
       - ""          → port was specified but not found in menu; unresolvable
 
-    For __auto__ slots we scan Node success lines, subtract any already-matched
-    ports, and assign the remainder in order.
+    Uses THREE strategies to resolve ports:
+      1. tracked_ports entries (from auto-select / CSV PORT column)
+      2. "Selected: ethX/Y -> X/Y" lines from script output (manual selections)
+      3. "Node NNN ethX/Y: [SUCCESS]" lines (deployment confirmations)
     """
-    matched = {p for p in tracked_ports if p and p != '__auto__'}
+    # Strategy 2: Scan ALL "Selected:" lines from output (covers manual picks)
+    selected_ports = []
+    for line in output_lines:
+        m = re.search(r'Selected:\s*eth?(\d+/\d+)\s*->\s*(\d+/\d+)', line)
+        if m:
+            selected_ports.append(m.group(2))
 
-    # Collect unique physical ports from Node success lines, in order, excluding
-    # ports that were explicitly pre-selected (they're already accounted for).
-    # VPC deploys the same port on two nodes — (node_id, port) dedup collapses
-    # those pairs into a single port entry.
+    # Strategy 3: Scan Node SUCCESS lines (deployment confirmations)
+    matched = {p for p in tracked_ports if p and p != '__auto__'}
     seen_node_port = set()
     auto_resolved = []
     for line in output_lines:
@@ -791,19 +1042,64 @@ def extract_deployed_ports(output_lines, tracked_ports):
                 if port not in matched:
                     auto_resolved.append(port)
 
+    # Resolve: prefer tracked_ports, fall back to selected_ports, then auto_resolved
     auto_iter = iter(auto_resolved)
+    selected_iter = iter(selected_ports)
     result = []
-    for p in tracked_ports:
-        if p == '__auto__':
-            result.append(next(auto_iter, ''))
-        else:
-            result.append(p)
+
+    if tracked_ports:
+        for p in tracked_ports:
+            if p and p != '__auto__':
+                result.append(p)
+            else:
+                # Try selected_ports first, then auto_resolved
+                sel = next(selected_iter, None)
+                if sel:
+                    result.append(sel)
+                else:
+                    result.append(next(auto_iter, ''))
+    else:
+        # No tracking at all — use selected_ports from output
+        result = selected_ports
+
     return result
 
 
-def generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_lines, tracked_ports):
+def extract_deployment_statuses(output_lines):
     """
-    Write a copy of the original CSV with a DEPLOYED_PORT column appended.
+    Scan output for per-deployment status indicators.
+    Returns list of status strings in deployment order.
+    
+    Looks for patterns like:
+      - "Complete: Desc=OK, PolicyGrp=OK" → DEPLOYED
+      - "[SKIPPED by user]" or "[SKIP]"   → SKIPPED
+      - "[CANCELLED]"                      → CANCELLED
+      - "PolicyGrp=FAIL"                   → FAILED
+      - "[INFO] Quitting..."               → QUIT
+    """
+    statuses = []
+    quit_seen = False
+    for line in output_lines:
+        lu = line.upper().strip()
+        if 'COMPLETE:' in lu and ('POLICYGR' in lu or 'SELECTOR' in lu or 'BINDING' in lu):
+            if 'FAIL' in lu:
+                statuses.append('FAILED')
+            else:
+                statuses.append('DEPLOYED')
+        elif '[SKIPPED BY USER]' in lu or ('[SKIP]' in lu and 'NO VALIDATED' not in lu 
+              and 'ENVIRONMENT' not in lu and 'COULD NOT' not in lu):
+            statuses.append('SKIPPED')
+        elif '[CANCELLED]' in lu:
+            statuses.append('CANCELLED')
+        elif 'QUITTING' in lu:
+            quit_seen = True
+    return statuses, quit_seen
+
+
+def generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_lines, tracked_ports, run_status="success"):
+    """
+    Write a copy of the original CSV with SELECTED_PORT and STATUS columns.
+    Always generated — success, failure, quit, or stopped.
     Returns the filename on success, None otherwise.
     """
     try:
@@ -823,14 +1119,34 @@ def generate_results_csv(deploy_type, csv_path, entry_id, timestamp, output_line
         if not rows:
             return None
 
+        # Extract port selections and per-deployment statuses
         deployed = extract_deployed_ports(output_lines, tracked_ports)
+        statuses, quit_seen = extract_deployment_statuses(output_lines)
 
-        result_headers = orig_headers + ['DEPLOYED_PORT']
+        # Build result columns based on deploy type
+        extra_cols = []
+        if deploy_type in ('vpc', 'individual'):
+            extra_cols.append('SELECTED_PORT')
+        extra_cols.append('STATUS')
+
+        result_headers = orig_headers + extra_cols
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=result_headers, extrasaction='ignore')
             writer.writeheader()
             for i, row in enumerate(rows):
-                row['DEPLOYED_PORT'] = deployed[i] if i < len(deployed) else ''
+                if deploy_type in ('vpc', 'individual'):
+                    row['SELECTED_PORT'] = deployed[i] if i < len(deployed) else ''
+                
+                # Assign status: use extracted if available, else infer
+                if i < len(statuses):
+                    row['STATUS'] = statuses[i]
+                elif quit_seen and i >= len(statuses):
+                    row['STATUS'] = 'NOT_REACHED'
+                elif run_status == 'stopped':
+                    row['STATUS'] = 'STOPPED'
+                else:
+                    row['STATUS'] = ''
+                
                 writer.writerow(row)
 
         return filename
@@ -871,6 +1187,29 @@ def find_port_in_output(desired_port, output_lines, start_idx=0):
             if slot == desired_slot and port_num == desired_num:
                 return menu_num
     return None
+
+
+def find_first_avail_port(output_lines, start_idx=0):
+    """
+    Scan the port menu output for the first [AVAIL] port and return its
+    menu number and interface string.
+
+    Port display lines look like:
+        [ 1] [AVAIL]  eth1/1       25G     inherit    (Usage: discovery)
+        [ 2] [IN-USE] eth1/2       25G     ...
+        [23] [AVAIL]  eth1/23      25G     ...
+
+    Returns (menu_number_str, interface_str) or (None, None) if no AVAIL found.
+    """
+    for line in output_lines[start_idx:]:
+        if '[AVAIL]' in line:
+            # Extract menu number: leading [XX] or bare number
+            m = re.match(r'^\s*\[?\s*(\d+)\]?\s*\[AVAIL\]\s+(?:eth)?(\d+/\d+)', line.strip())
+            if m:
+                return m.group(1), m.group(2)
+    return None, None
+
+
 
 
 def parse_port_column(csv_path):
@@ -1034,30 +1373,37 @@ def run_script_thread(script_path, csv_path):
                             search_from = current_run.get("last_port_prompt_output_idx", 0)
 
                             if desired_iface:
-                                # Find the menu number that matches the desired interface
-                                menu_num = find_port_in_output(desired_iface, current_run["output_lines"], search_from)
-                                if menu_num:
+                                # Extract raw port number: "1/61" → "61", "eth1/61" → "61", "Eth1/61" → "61"
+                                import re as _re
+                                _port_m = _re.match(r'(?:[Ee]th)?(\d+)/(\d+)', desired_iface.strip())
+                                if _port_m:
+                                    raw_port_num = _port_m.group(2)
                                     time.sleep(0.1)
                                     try:
-                                        running_process.stdin.write((menu_num + '\n').encode('utf-8'))
+                                        running_process.stdin.write((raw_port_num + '\n').encode('utf-8'))
                                         running_process.stdin.flush()
-                                        output_queue.put(('output', f'[AUTO] Port matched: {desired_iface} → option {menu_num}'))
-                                        current_run["output_lines"].append(f'[AUTO] Port matched: {desired_iface} → option {menu_num}')
+                                        output_queue.put(('output', f'[AUTO] Port input: {desired_iface} → sending {raw_port_num}'))
+                                        current_run["output_lines"].append(f'[AUTO] Port input: {desired_iface} → sending {raw_port_num}')
                                         current_run["deployed_ports"].append(desired_iface)
                                     except:
                                         current_run["deployed_ports"].append('')
                                 else:
-                                    output_queue.put(('output', f'[WARNING] Port {desired_iface} not found in menu — waiting for manual input'))
-                                    current_run["output_lines"].append(f'[WARNING] Port {desired_iface} not found in port list')
+                                    output_queue.put(('output', f'[WARNING] Cannot parse port: {desired_iface} — waiting for manual input'))
+                                    current_run["output_lines"].append(f'[WARNING] Cannot parse port: {desired_iface}')
                                     current_run["deployed_ports"].append('')
                             elif cfg.get('auto_select_port', True):
+                                # Find first [AVAIL] port instead of blindly picking #1
+                                avail_num, avail_iface = find_first_avail_port(
+                                    current_run["output_lines"], search_from)
+                                pick = avail_num if avail_num else '1'
+                                label = f'{avail_iface} (first available)' if avail_iface else '#1 (no AVAIL tags found)'
                                 time.sleep(0.1)
                                 try:
-                                    running_process.stdin.write(('1\n').encode('utf-8'))
+                                    running_process.stdin.write((pick + '\n').encode('utf-8'))
                                     running_process.stdin.flush()
-                                    output_queue.put(('output', '[AUTO] Port auto-selected: 1'))
-                                    current_run["output_lines"].append('[AUTO] Port auto-selected: 1')
-                                    current_run["deployed_ports"].append('__auto__')
+                                    output_queue.put(('output', f'[AUTO] Port auto-selected: {label} → option {pick}'))
+                                    current_run["output_lines"].append(f'[AUTO] Port auto-selected: {label} → option {pick}')
+                                    current_run["deployed_ports"].append(avail_iface if avail_iface else '__auto__')
                                 except:
                                     current_run["deployed_ports"].append('')
 
@@ -1078,6 +1424,24 @@ def run_script_thread(script_path, csv_path):
                                     current_run["output_lines"].append('[AUTO] Rollback confirmed: YES')
                                 except:
                                     pass
+
+                        # AUTO-EPG MODE SELECTION
+                        # Detects "EPG BINDING MODE" or "EPG MODE" in recent output and
+                        # auto-injects "3" (overwrite all) or "1" (add) based on settings.
+                        recent_5 = [r.lower() for r in current_run["output_lines"][-5:]]
+                        is_epg_mode = any('epg binding mode' in r or 'epg mode' in r for r in recent_5)
+                        if is_epg_mode and ('(1/2' in tl or 'select mode' in tl) and tl.endswith(':'):
+                            cfg = load_config()
+                            epg_ow = '3' if cfg.get('epg_overwrite_default', False) else '1'
+                            epg_label = 'Overwrite ALL' if epg_ow == '3' else 'Add'
+                            time.sleep(0.1)
+                            try:
+                                running_process.stdin.write((epg_ow + '\n').encode('utf-8'))
+                                running_process.stdin.flush()
+                                output_queue.put(('output', f'[AUTO] EPG mode: {epg_label} (from settings)'))
+                                current_run["output_lines"].append(f'[AUTO] EPG mode: {epg_label}')
+                            except:
+                                pass
 
                         # AUTO-TENANT SELECTION
                         is_tenant_prompt = ('applies to all' in tl and 'select' in tl) or \
@@ -1177,7 +1541,7 @@ HTML_TEMPLATE = r'''
 <title>ACI Automation Console</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
-:root{--bg-darkest:#0d1117;--bg-dark:#161b22;--bg-sidebar:#0d1117;--bg-terminal:#1e1e2e;--bg-input:#252535;--border-color:#30363d;--text-primary:#e6edf3;--text-secondary:#8b949e;--text-muted:#6e7681;--accent-blue:#58a6ff;--accent-cyan:#39d4d4;--accent-green:#3fb950;--accent-orange:#f0883e;--accent-red:#f85149;--accent-purple:#a371f7;--accent-yellow:#d29922;--glow-cyan:rgba(57,212,212,0.15)}
+:root{--bg-darkest:#0a0e17;--bg-dark:#0f172a;--bg-sidebar:#0a0e17;--bg-terminal:#0f172a;--bg-input:#1e293b;--border-color:#334155;--text-primary:#e2e8f0;--text-secondary:#94a3b8;--text-muted:#64748b;--accent-blue:#60a5fa;--accent-cyan:#22d3ee;--accent-green:#4ade80;--accent-orange:#fb923c;--accent-red:#f87171;--accent-purple:#a78bfa;--accent-yellow:#fbbf24;--glow-cyan:rgba(34,211,238,0.15)}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-darkest);color:var(--text-primary);height:100vh;overflow:hidden}
 .app-container{display:flex;height:100vh}
@@ -1191,8 +1555,8 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .nav-label{font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;padding:0 12px;margin-bottom:8px;margin-top:16px}
 .nav-label:first-child{margin-top:0}
 .nav-item{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:8px;cursor:pointer;transition:all .2s ease;margin-bottom:4px;border:1px solid transparent}
-.nav-item:hover{background:rgba(88,166,255,.08);border-color:rgba(88,166,255,.2)}
-.nav-item.active{background:linear-gradient(135deg,rgba(57,212,212,.12),rgba(88,166,255,.12));border-color:var(--accent-cyan);box-shadow:0 0 20px var(--glow-cyan)}
+.nav-item:hover{background:rgba(96,165,250,.08);border-color:rgba(96,165,250,.2)}
+.nav-item.active{background:linear-gradient(135deg,rgba(34,211,238,.12),rgba(96,165,250,.12));border-color:var(--accent-cyan);box-shadow:0 0 20px var(--glow-cyan)}
 .nav-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px}
 .nav-item.vpc .nav-icon{background:linear-gradient(135deg,var(--accent-purple),var(--accent-blue))}
 .nav-item.individual .nav-icon{background:linear-gradient(135deg,var(--accent-orange),var(--accent-yellow))}
@@ -1201,7 +1565,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .nav-item.epgadd .nav-icon{background:linear-gradient(135deg,#11998e,#38ef7d)}
 .nav-item.epgdelete .nav-icon{background:linear-gradient(135deg,#eb3349,#f45c43)}
 .nav-item.logs .nav-icon{background:linear-gradient(135deg,#667eea,#764ba2)}
-.nav-item.credentials .nav-icon{background:linear-gradient(135deg,#f7971e,#ffd200)}
+.nav-item.credentials .nav-icon{background:linear-gradient(135deg,#fb923c,#fbbf24)}
 .nav-item-title{font-weight:600;font-size:14px;margin-bottom:2px}
 .nav-item-desc{font-size:11px;color:var(--text-muted)}
 .cred-badge{margin-left:auto;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600}
@@ -1225,7 +1589,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .header-badge.epgadd{background:rgba(56,239,125,.2);color:#38ef7d}
 .header-badge.epgdelete{background:rgba(244,92,67,.2);color:#f45c43}
 .header-badge.logs{background:rgba(118,75,162,.2);color:#a78bfa}
-.header-badge.credentials{background:rgba(247,151,30,.2);color:#ffd200}
+.header-badge.credentials{background:rgba(251,191,36,.2);color:#fbbf24}
 .header-actions{display:flex;gap:8px}
 .header-btn{padding:8px 16px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;transition:all .2s ease;border:1px solid var(--border-color);background:transparent;color:var(--text-secondary);font-family:inherit}
 .header-btn:hover{border-color:var(--accent-cyan);color:var(--accent-cyan)}
@@ -1245,8 +1609,8 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .file-picker-display{flex:1;padding:12px 16px;background:var(--bg-input);border:2px dashed var(--border-color);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;display:flex;align-items:center;gap:10px;min-height:46px;transition:border-color .2s}
 .file-picker-display.has-file{border-style:solid;border-color:var(--accent-green)}
 .fp-icon{font-size:18px}.fp-name{color:var(--text-primary);font-weight:500}.fp-placeholder{color:var(--text-muted)}
-.file-picker-btn{padding:12px 20px;border:1px solid var(--accent-cyan);border-radius:8px;background:linear-gradient(135deg,rgba(57,212,212,.1),rgba(88,166,255,.1));color:var(--accent-cyan);font-family:'IBM Plex Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;white-space:nowrap}
-.file-picker-btn:hover{background:linear-gradient(135deg,rgba(57,212,212,.2),rgba(88,166,255,.2));box-shadow:0 0 16px var(--glow-cyan)}
+.file-picker-btn{padding:12px 20px;border:1px solid var(--accent-cyan);border-radius:8px;background:linear-gradient(135deg,rgba(34,211,238,.1),rgba(96,165,250,.1));color:var(--accent-cyan);font-family:'IBM Plex Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;white-space:nowrap}
+.file-picker-btn:hover{background:linear-gradient(135deg,rgba(34,211,238,.2),rgba(96,165,250,.2));box-shadow:0 0 16px var(--glow-cyan)}
 .file-input-hidden{display:none}
 .csv-validation{margin-top:8px;padding:10px 14px;border-radius:6px;font-size:12px;font-family:'JetBrains Mono',monospace}
 .csv-validation.valid{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3);color:var(--accent-green)}
@@ -1287,8 +1651,28 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .terminal-line.prompt{color:var(--accent-purple)}
 .terminal-line.credential{color:var(--accent-yellow)}
 .bracket-num{color:var(--accent-blue)!important;font-weight:700}
+.port-avail{color:var(--accent-green)!important;font-weight:700}
+.port-inuse{color:var(--accent-red)!important;font-weight:700}
+.terminal-line.port-available{background:rgba(74,222,128,.06);border-left:3px solid var(--accent-green);padding-left:8px}
+.terminal-line.port-in-use{background:rgba(248,113,113,.06);border-left:3px solid var(--accent-red);padding-left:8px}
+.port-avail{color:var(--accent-green)!important;font-weight:700}
+.port-inuse{color:var(--accent-red)!important;font-weight:700}
+.terminal-line.port-available{background:rgba(74,222,128,.06);border-left:3px solid var(--accent-green);padding-left:8px}
+.terminal-line.port-in-use{background:rgba(248,113,113,.06);border-left:3px solid var(--accent-red);padding-left:8px}
+.port-avail{color:var(--accent-green)!important;font-weight:700}
+.port-inuse{color:var(--accent-red)!important;font-weight:700}
+.terminal-line.port-available{background:rgba(63,185,80,.06);border-left:3px solid var(--accent-green);padding-left:8px}
+.terminal-line.port-in-use{background:rgba(248,81,73,.06);border-left:3px solid var(--accent-red);padding-left:8px}
+.port-avail{color:var(--accent-green)!important;font-weight:700}
+.port-inuse{color:var(--accent-red)!important;font-weight:700}
+.terminal-line.port-available{background:rgba(63,185,80,.06);border-left:3px solid var(--accent-green);padding-left:8px}
+.terminal-line.port-in-use{background:rgba(248,81,73,.06);border-left:3px solid var(--accent-red);padding-left:8px}
+.port-avail{color:var(--accent-green)!important;font-weight:700}
+.port-inuse{color:var(--accent-red)!important;font-weight:700}
+.terminal-line.port-available{background:rgba(63,185,80,.06);border-left:3px solid var(--accent-green);padding-left:8px}
+.terminal-line.port-in-use{background:rgba(248,81,73,.06);border-left:3px solid var(--accent-red);padding-left:8px}
 .terminal-input-area{display:flex;align-items:center;padding:12px 16px;background:rgba(0,0,0,.3);border-top:1px solid var(--border-color);gap:12px}
-.post-run-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(135deg,rgba(63,185,80,.08),rgba(57,212,212,.08));border-top:1px solid rgba(63,185,80,.3)}
+.post-run-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(135deg,rgba(74,222,128,.08),rgba(34,211,238,.08));border-top:1px solid rgba(74,222,128,.3)}
 .post-run-bar.hidden{display:none}
 .post-run-label{font-size:13px;font-weight:600;color:var(--accent-green);font-family:'JetBrains Mono',monospace}
 .post-run-actions{display:flex;gap:8px}
@@ -1319,7 +1703,7 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .welcome-card.individual .welcome-card-icon{background:linear-gradient(135deg,var(--accent-orange),var(--accent-yellow))}
 .welcome-card-title{font-weight:600;font-size:15px;margin-bottom:8px}
 .welcome-card-desc{font-size:12px;color:var(--text-muted);line-height:1.5}
-.time-saved-banner{margin-top:32px;padding:20px 36px;background:linear-gradient(135deg,rgba(57,212,212,.06),rgba(88,166,255,.06));border:1px solid rgba(57,212,212,.25);border-radius:12px;display:flex;gap:32px;align-items:center}
+.time-saved-banner{margin-top:32px;padding:20px 36px;background:linear-gradient(135deg,rgba(34,211,238,.06),rgba(96,165,250,.06));border:1px solid rgba(34,211,238,.25);border-radius:12px;display:flex;gap:32px;align-items:center}
 .ts-stat{text-align:center}
 .ts-value{font-size:28px;font-weight:700;font-family:'JetBrains Mono',monospace;background:linear-gradient(135deg,var(--accent-cyan),var(--accent-green));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .ts-value.blue{background:linear-gradient(135deg,var(--accent-blue),var(--accent-purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
@@ -1328,19 +1712,19 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 /* Credential Panel */
 .cred-panel{padding:32px;overflow-y:auto;flex:1}
 .cred-section{background:var(--bg-darkest);border:1px solid var(--border-color);border-radius:12px;padding:24px;margin-bottom:20px;max-width:600px}
-.cred-section-title{font-size:14px;font-weight:600;color:#ffd200;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.cred-section-title{font-size:14px;font-weight:600;color:#fbbf24;margin-bottom:16px;display:flex;align-items:center;gap:8px}
 .cred-status{padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:13px;display:flex;align-items:center;gap:10px}
-.cred-status.set{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3);color:var(--accent-green)}
-.cred-status.unset{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.2);color:var(--accent-red)}
+.cred-status.set{background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.3);color:var(--accent-green)}
+.cred-status.unset{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);color:var(--accent-red)}
 .cred-row{margin-bottom:16px}
 .cred-label{display:block;font-size:12px;font-weight:500;color:var(--text-secondary);margin-bottom:8px}
 .cred-input{width:100%;padding:12px 16px;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px}
-.cred-input:focus{outline:none;border-color:#ffd200;box-shadow:0 0 0 3px rgba(247,151,30,.15)}
+.cred-input:focus{outline:none;border-color:#fbbf24;box-shadow:0 0 0 3px rgba(251,191,36,.15)}
 .cred-hint{font-size:11px;color:var(--text-muted);margin-top:12px;padding:10px;background:var(--bg-input);border-radius:6px;line-height:1.6}
 .cred-actions{display:flex;gap:12px;margin-top:20px}
 .cred-btn{padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;font-family:inherit}
-.cred-btn.save{background:linear-gradient(135deg,#f7971e,#ffd200);color:#0d1117}
-.cred-btn.save:hover{box-shadow:0 4px 16px rgba(247,151,30,.3)}
+.cred-btn.save{background:linear-gradient(135deg,#fb923c,#fbbf24);color:#0a0e17}
+.cred-btn.save:hover{box-shadow:0 4px 16px rgba(251,146,60,.3)}
 .cred-btn.clear{background:transparent;border:1px solid var(--accent-red);color:var(--accent-red)}
 .cred-btn.clear:hover{background:rgba(248,81,73,.1)}
 /* Settings, Readme, Logs panels */
@@ -1357,10 +1741,10 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 .toggle-row:hover{border-color:var(--accent-cyan)}
 .toggle-switch{position:relative;width:42px;height:24px;flex-shrink:0}
 .toggle-switch input{opacity:0;width:0;height:0;position:absolute}
-.toggle-slider{position:absolute;inset:0;background:#30363d;border-radius:24px;transition:.3s;cursor:pointer}
-.toggle-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#8b949e;border-radius:50%;transition:.3s}
-.toggle-switch input:checked+.toggle-slider{background:rgba(57,212,212,.3);border:1px solid var(--accent-cyan)}
-.toggle-switch input:checked+.toggle-slider:before{transform:translateX(18px);background:var(--accent-cyan);box-shadow:0 0 8px rgba(57,212,212,.5)}
+.toggle-slider{position:absolute;inset:0;background:#334155;border-radius:24px;transition:.3s;cursor:pointer}
+.toggle-slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:#94a3b8;border-radius:50%;transition:.3s}
+.toggle-switch input:checked+.toggle-slider{background:rgba(34,211,238,.3);border:1px solid var(--accent-cyan)}
+.toggle-switch input:checked+.toggle-slider:before{transform:translateX(18px);background:var(--accent-cyan);box-shadow:0 0 8px rgba(34,211,238,.5)}
 .toggle-info{flex:1}
 .toggle-title{font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:3px}
 .toggle-desc{font-size:11px;color:var(--text-muted);line-height:1.5}
@@ -1500,8 +1884,9 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div class="cred-row"><label class="cred-label">D1 (Primary DC)</label><input type="text" class="cred-input" id="credApicD1" placeholder="https://apic-d1.example.com" autocomplete="off"></div>
 <div class="cred-row"><label class="cred-label">D2 (Secondary DC)</label><input type="text" class="cred-input" id="credApicD2" placeholder="https://apic-d2.example.com" autocomplete="off"></div>
 <div class="cred-row"><label class="cred-label">D3 (Tertiary DC)</label><input type="text" class="cred-input" id="credApicD3" placeholder="https://apic-d3.example.com" autocomplete="off"></div>
-<div class="cred-actions"><button class="cred-btn save" onclick="saveCredentials()">Save Credentials</button><button class="cred-btn clear" onclick="clearCredentials()">Clear</button></div>
-<div class="cred-hint">🛡️ Credentials are stored <strong>in memory only</strong> and are never written to disk. They clear automatically when the app restarts.<br><br>When set, credentials are auto-injected into scripts when they prompt for Username/Password — no manual typing needed. APIC URLs are embedded into generated rollback scripts.</div>
+<div class="cred-actions"><button class="cred-btn save" onclick="saveCredentials()">Save to Memory</button><button class="cred-btn clear" onclick="clearCredentials()">Clear</button></div>
+<div class="cred-actions" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-color)"><button class="cred-btn save" style="background:#2563eb" onclick="saveToDisk()">💾 Save to Disk</button><button class="cred-btn save" style="background:#059669" onclick="loadFromDisk()">📂 Load from Disk</button></div>
+<div class="cred-hint">🛡️ Credentials are stored <strong>in memory</strong> by default and clear on app restart. Use <strong>Save to Disk</strong> to persist across restarts (base64 obfuscated in <code>.aci_credentials</code>). Use <strong>Load from Disk</strong> to restore them.<br><br>When set, credentials are auto-injected into scripts when they prompt for Username/Password — no manual typing needed. APIC URLs are embedded into generated rollback scripts.</div>
 </div>
 </div></div>
 
@@ -1537,10 +1922,23 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
     <span class="toggle-slider"></span>
   </div>
   <div class="toggle-info">
-    <div class="toggle-title">Auto-select port 1</div>
-    <div class="toggle-desc">When the script prompts <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:10px">Select port number:</code>, automatically respond with <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:10px">1</code> — skipping the manual prompt entirely.</div>
+    <div class="toggle-title">Auto-select first available port</div>
+    <div class="toggle-desc">When the script prompts <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:10px">Select port number:</code>, automatically pick the first <span class="port-avail">[AVAIL]</span> port — skipping the manual prompt entirely.</div>
   </div>
   <span class="toggle-badge {% if config.auto_select_port %}on{% else %}off{% endif %}" id="autoPortBadge">{% if config.auto_select_port %}ON{% else %}OFF{% endif %}</span>
+</label>
+</div>
+<div class="settings-row">
+<label class="toggle-row" for="settingsEpgOverwrite">
+  <div class="toggle-switch">
+    <input type="checkbox" id="settingsEpgOverwrite" {% if config.epg_overwrite_default %}checked{% endif %} onchange="updateToggleBadge(this)">
+    <span class="toggle-slider"></span>
+  </div>
+  <div class="toggle-info">
+    <div class="toggle-title">Default EPG Overwrite Mode</div>
+    <div class="toggle-desc">When enabled, all scripts default to <strong>Overwrite ALL</strong> (auto-delete ALL existing EPG bindings before deploying new). When disabled, scripts default to <strong>Add</strong> (keep existing). Applies to VPC, Static Port, and EPG Add.</div>
+  </div>
+  <span class="toggle-badge {% if config.epg_overwrite_default %}on{% else %}off{% endif %}" id="epgOverwriteBadge">{% if config.epg_overwrite_default %}ON{% else %}OFF{% endif %}</span>
 </label>
 </div>
 </div>
@@ -1551,22 +1949,152 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
 <div id="readmeScreen" class="hidden" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
 <div class="header-bar"><div class="header-title"><h2>Documentation</h2><span class="header-badge readme">README</span></div></div>
 <div class="readme-panel">
-<div class="readme-tabs">
+<div class="readme-tabs" style="flex-wrap:wrap">
 <div class="readme-tab active" onclick="switchReadmeTab('ui')">🖥️ Using the UI</div>
-<div class="readme-tab" onclick="switchReadmeTab('vpc')">🔀 VPC</div>
-<div class="readme-tab" onclick="switchReadmeTab('individual')">🔌 Port</div>
+<div class="readme-tab" onclick="switchReadmeTab('vpc')">🔀 VPC Deploy</div>
+<div class="readme-tab" onclick="switchReadmeTab('individual')">🔌 Static Port</div>
+<div class="readme-tab" onclick="switchReadmeTab('epgadd')">➕ EPG Add</div>
+<div class="readme-tab" onclick="switchReadmeTab('epgdelete')">➖ EPG Delete</div>
+<div class="readme-tab" onclick="switchReadmeTab('management')">⚙️ Management</div>
 <div class="readme-tab" onclick="switchReadmeTab('troubleshoot')">🔧 Troubleshoot</div>
 </div>
-<div id="readmeTabUi" class="readme-tab-content active"><div class="readme-section"><div class="readme-section-title"><span>🚀</span> Getting Started</div><div class="readme-content">
-<div class="step"><div class="step-number">1</div><div class="step-content"><div class="step-title">Set Credentials</div><div>Click <strong>Credentials</strong> in the sidebar and enter your APIC username/password. These auto-fill during deployments.</div></div></div>
-<div class="step"><div class="step-number">2</div><div class="step-content"><div class="step-title">Select Deployment Type</div><div>Click a deployment type in the sidebar.</div></div></div>
-<div class="step"><div class="step-number">3</div><div class="step-content"><div class="step-title">Select CSV File</div><div>Click <strong>Browse Files</strong> to open your file explorer. CSV is validated automatically.</div></div></div>
-<div class="step"><div class="step-number">4</div><div class="step-content"><div class="step-title">Run &amp; Respond</div><div>Click <strong>Run Script</strong>. Credentials auto-inject. Type responses for prompts in the input bar.</div></div></div>
-<div class="step"><div class="step-number">5</div><div class="step-content"><div class="step-title">Review Logs &amp; Rollback</div><div>Check <strong>Deploy Log</strong> for history. Download sanitized logs for work orders. Use <strong>Rollback</strong> to generate reversal scripts.</div></div></div>
+<div id="readmeTabUi" class="readme-tab-content active">
+<div class="readme-section"><div class="readme-section-title"><span>🚀</span> Getting Started</div><div class="readme-content">
+<div class="step"><div class="step-number">1</div><div class="step-content"><div class="step-title">Set Credentials</div><div>Click <strong>Credentials</strong> in the sidebar and enter your APIC username and password, plus the APIC URL for each datacenter (D1, D2, D3). These are stored <strong>in-memory only</strong> and auto-injected into every script prompt — no manual typing needed during deployments.</div></div></div>
+<div class="step"><div class="step-number">2</div><div class="step-content"><div class="step-title">Prepare Your CSV</div><div>Each deployment type has its own CSV format. You can <strong>browse</strong> for an existing file, <strong>build inline</strong> using the table editor, or <strong>drag-and-drop</strong>. Column headers are validated before launch — you'll see errors and warnings before the script runs.</div></div></div>
+<div class="step"><div class="step-number">3</div><div class="step-content"><div class="step-title">Select Deployment Type</div><div>Pick from the sidebar: <strong>VPC Deploy</strong>, <strong>Static Port</strong>, <strong>EPG Add</strong>, or <strong>EPG Delete</strong>. Each has its own terminal, CSV builder, and post-run actions.</div></div></div>
+<div class="step"><div class="step-number">4</div><div class="step-content"><div class="step-title">Run &amp; Respond</div><div>Click <strong>Run Script</strong>. Credentials auto-inject. The script runs in a live terminal — interact with prompts using the input bar at the bottom. Ports tagged <span style="color:var(--accent-green);font-weight:600">[AVAIL]</span> and <span style="color:var(--accent-red);font-weight:600">[IN-USE]</span> are color-coded for easy scanning.</div></div></div>
+<div class="step"><div class="step-number">5</div><div class="step-content"><div class="step-title">Review Results</div><div>After every run (success, fail, or quit), you get:<br>• <strong>Results CSV</strong> — your original CSV with SELECTED_PORT and STATUS columns appended<br>• <strong>Sanitized Log</strong> — full terminal output with credentials redacted, ready for work orders<br>• <strong>Rollback Script</strong> — one-click reversal of everything that was deployed</div></div></div>
+</div></div>
+<div class="readme-section"><div class="readme-section-title"><span>⚡</span> Automation Features</div><div class="readme-content">
+<h3>Auto-Credential Injection</h3><p>Username, password, and APIC URLs are injected automatically when the script prompts for them. No copy-pasting between windows.</p>
+<h3>Auto-Select First Available Port</h3><p>When enabled in Settings, the UI scans the port menu for the first <span style="color:var(--accent-green);font-weight:600">[AVAIL]</span> port and selects it automatically — skipping <span style="color:var(--accent-red);font-weight:600">[IN-USE]</span> ports. You can also pre-select specific ports in the CSV PORT column.</p>
+<h3>Tenant Memory</h3><p>When a multi-tenant prompt appears, after you make your selection, the UI offers to lock that choice and auto-apply it to all remaining deployments in the batch.</p>
+<h3>Token Auto-Refresh</h3><p>APIC tokens expire after 5 minutes. During long batch runs, the scripts proactively refresh the token before each deployment — no more mid-run 403 "Token was invalid" failures.</p>
+<h3>Pre-Selected Port via CSV</h3><p>Add an optional <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">PORT</code> column to your VPC or Static Port CSV (e.g. <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">1/93</code>). The UI matches it to the numbered port menu and selects it automatically.</p>
 </div></div></div>
-<div id="readmeTabVpc" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔀</span> VPC Deploy</div><div class="readme-content"><p>Deploy VPCs across switch pairs. CSV columns: Hostname, Switch1, Switch2, Speed, VLANS, WorkOrder.</p></div></div></div>
-<div id="readmeTabIndividual" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔌</span> Static Port Deploy</div><div class="readme-content"><p>Deploy static ports. ACCESS = single VLAN untagged, TRUNK = multiple VLANs tagged.</p></div></div></div>
-<div id="readmeTabTroubleshoot" class="readme-tab-content"><div class="readme-section"><div class="readme-section-title"><span>🔧</span> Troubleshooting</div><div class="readme-content"><h3>Script Not Found</h3><p>Go to Settings and verify script paths.</p><h3>CSV Errors</h3><p>Check headers match exactly. Wrap VLAN ranges in quotes. Save as UTF-8.</p><h3>Credentials Not Auto-Filling</h3><p>Ensure credentials are set in the Credentials panel before running scripts.</p></div></div></div>
+
+<div id="readmeTabVpc" class="readme-tab-content">
+<div class="readme-section"><div class="readme-section-title"><span>🔀</span> VPC Deploy</div><div class="readme-content">
+<p>Deploy Virtual Port Channels across leaf switch pairs. Creates the full policy stack from port description through EPG bindings in one automated pass.</p>
+<h3>CSV Format</h3>
+<p><code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">Hostname, Switch1, Switch2, Speed, VLANS, WorkOrder, PORT (optional)</code></p>
+<p>Example: <code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">MEDHVIOP173_SEA,EDCLEAFACC1501,EDCLEAFACC1502,25G,"32,64-67",WO123456,1/93</code></p>
+<h3>What Gets Deployed (4 Steps)</h3>
+<p><strong>Step 1 — Port Description:</strong> Sets <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">HOSTNAME WORKORDER</code> on both leaf nodes.</p>
+<p><strong>Step 2 — VPC Interface Policy Group:</strong> Creates a bundled policy group with your selected AEP, Link Level (speed), CDP, LLDP, Port Channel, MCP, Storm Control, and Flow Control policies.</p>
+<p><strong>Step 3 — Port Selector:</strong> Links the physical port to the new policy group under the correct Interface Profile.</p>
+<p><strong>Step 4 — EPG Static Bindings:</strong> Deploys each VLAN as a static path binding (VPC type, trunk/tagged, immediate deployment).</p>
+<h3>Smart Features</h3>
+<p><strong>Port Validation:</strong> Queries both switches and shows only ports that pass all 4 criteria: usage = discovery, no description, no policy group, no EPG bindings. Ports are color-coded <span style="color:var(--accent-green);font-weight:600">[AVAIL]</span> / <span style="color:var(--accent-red);font-weight:600">[IN-USE]</span>.</p>
+<p><strong>Common Port Matching:</strong> Only shows ports that are available on <em>both</em> switches in the VPC pair.</p>
+<p><strong>Policy Group Reuse:</strong> If a VPC policy group already exists for the same hostname, the script detects it and offers to reuse it instead of creating a duplicate.</p>
+<p><strong>Port Cleanup for Redeployment:</strong> If you need to redeploy to a port that already has a policy group, the script can delete the existing selector and policy group first.</p>
+<p><strong>Flow Control:</strong> Choose between default or FLOW-CONTROL-ON at the start of the batch.</p>
+<p><strong>Pre-Flight Checks:</strong> Before any deployment, the script queries APIC for AEPs, Interface Profiles, and Link Level policies — letting you select once and apply to the entire batch.</p>
+<p><strong>Multi-Tenant Search:</strong> VLANs are searched across all tenants (BLU, GWC, GWS or NSM_BLU, NSM_BRN, etc.) and you're prompted to choose if a VLAN exists in multiple Application Profiles.</p>
+</div></div></div>
+
+<div id="readmeTabIndividual" class="readme-tab-content">
+<div class="readme-section"><div class="readme-section-title"><span>🔌</span> Static Port Deploy</div><div class="readme-content">
+<p>Deploy individual (non-VPC) access and trunk ports. Creates the full policy stack from description through EPG bindings.</p>
+<h3>CSV Format</h3>
+<p><code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">Hostname, Switch, Type, Speed, VLANS, WorkOrder, PORT (optional)</code></p>
+<p>Example: <code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">MEDHVIOP173_MGMT,EDCLEAFNSM2163,ACCESS,1G,2958,WO123456</code></p>
+<h3>Access vs Trunk</h3>
+<p><strong>ACCESS</strong> — Single VLAN, untagged traffic. Use for management interfaces, single-purpose ports.</p>
+<p><strong>TRUNK</strong> — Multiple VLANs, tagged (802.1Q). Use for hypervisors, multi-VLAN servers.</p>
+<h3>What Gets Deployed (4 Steps)</h3>
+<p><strong>Step 1 — Port Description:</strong> Sets <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">HOSTNAME WORKORDER</code> on the leaf node.</p>
+<p><strong>Step 2 — Leaf Access Port Policy Group:</strong> Creates an individual (non-bundled) policy group with your selected AEP, Link Level, CDP, and LLDP policies.</p>
+<p><strong>Step 3 — Port Selector:</strong> Links the physical port to the policy group under the Interface Profile for that node.</p>
+<p><strong>Step 4 — EPG Static Bindings:</strong> Deploys each VLAN as a static path binding. Mode is set to untagged for ACCESS or trunk for TRUNK.</p>
+<h3>Smart Features</h3>
+<p><strong>Port Validation:</strong> Same 4-criteria check as VPC — only shows genuinely available ports, color-coded in the terminal.</p>
+<p><strong>Policy Group Reuse:</strong> Detects existing policy groups for the same hostname and offers to reuse them instead of creating duplicates.</p>
+<p><strong>Port Cleanup:</strong> Can remove existing selectors and policy groups when redeploying to a previously configured port.</p>
+<p><strong>Interactive Preview:</strong> Before deploying each device, shows a full preview of what will be created — with numbered options to change any setting (interface, AEP, speed, profile, etc.).</p>
+<p><strong>Speed Support:</strong> 1G, 10G, 25G, 40G, 100G. Link Level policy is selected during pre-flight and mapped per speed tier.</p>
+</div></div></div>
+
+<div id="readmeTabEpgadd" class="readme-tab-content">
+<div class="readme-section"><div class="readme-section-title"><span>➕</span> EPG Add</div><div class="readme-content">
+<p>Add EPG static path bindings to ports that already have policy groups configured. Use this when a port is already deployed but needs additional VLANs.</p>
+<h3>CSV Format</h3>
+<p><code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">Switch, Port, VLANS</code></p>
+<p>Example: <code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">EDCLEAFACC1501,1/68,"32,64-67"</code></p>
+<h3>Multi-Port CSV Expansion</h3>
+<p>Specify multiple ports in a single row: <code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">EDCLEAFACC1301,"1/67, 1/68, 1/69","0032, 0058"</code></p>
+<p>This expands to 3 ports × 2 VLANs = 6 individual bindings. Leading zeros in VLANs are handled automatically.</p>
+<h3>Binding Mode</h3>
+<p><strong>Trunk (Tagged)</strong> — Default. Multiple VLANs share the port with 802.1Q tags.</p>
+<p><strong>Access (Untagged)</strong> — Single VLAN, no tagging.</p>
+<h3>EPG Mode</h3>
+<p><strong>Add</strong> — Deploy new bindings only. Existing bindings are detected and skipped.</p>
+<p><strong>Overwrite</strong> — Wipe ALL existing EPG bindings on the target port(s) first, then deploy only the VLANs from your CSV. Use this to reset a port to a known state.</p>
+<h3>How It Works (4 Phases)</h3>
+<p><strong>Phase 1 — Analyze:</strong> For each switch+port+VLAN combo, searches all tenants for the matching EPG, checks if the binding already exists, and builds the deployment plan.</p>
+<p><strong>Phase 2 — Resolve Conflicts:</strong> If a VLAN exists in multiple Application Profiles or tenants, you're prompted to choose. That selection applies to all ports with the same VLAN.</p>
+<p><strong>Phase 3 — Preview:</strong> Shows a table of all new bindings, existing bindings (will be skipped or re-deployed), and any warnings (VLANs with no EPG found).</p>
+<p><strong>Phase 4 — Deploy:</strong> In Add mode, only new bindings are pushed. In Overwrite mode, existing bindings on each target port are deleted first (using a class-level reverse query), then all bindings are deployed fresh.</p>
+</div></div></div>
+
+<div id="readmeTabEpgdelete" class="readme-tab-content">
+<div class="readme-section"><div class="readme-section-title"><span>➖</span> EPG Delete</div><div class="readme-content">
+<p>Remove EPG static path bindings from ports. Use this to clean up VLANs from decommissioned servers or to remove specific bindings without touching the port policy group.</p>
+<h3>CSV Format</h3>
+<p><code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">Switch, Port, VLANS</code></p>
+<p>Example: <code style="background:var(--bg-darkest);padding:2px 6px;border-radius:3px;font-size:11px">EDCLEAFACC1501,1/68,"32,64-67"</code></p>
+<p>VLANS column is optional — if omitted, the script finds all bindings on that port and lets you confirm deletion of each one.</p>
+<h3>How It Works (3 Phases)</h3>
+<p><strong>Phase 1 — Find Bindings:</strong> For each switch+port+VLAN, searches all tenants to locate the exact fvRsPathAtt binding DN. If a VLAN exists in multiple APs, you're prompted to choose which one to delete.</p>
+<p><strong>Phase 2 — Preview:</strong> Shows every binding that will be deleted — switch, port, VLAN, EPG name, and Application Profile. Also lists any bindings that weren't found.</p>
+<p><strong>Phase 3 — Delete:</strong> After typing <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">YES</code> to confirm, each binding is removed via API DELETE on the full DN. Results show per-binding success/failure.</p>
+<h3>Safety</h3>
+<p>Dry-run mode available — validates everything without deleting. Requires explicit <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">YES</code> confirmation before any deletion occurs.</p>
+</div></div></div>
+
+<div id="readmeTabManagement" class="readme-tab-content">
+<div class="readme-section"><div class="readme-section-title"><span>🔑</span> Credentials</div><div class="readme-content">
+<p>Stored <strong>in-memory only</strong> — never written to disk. Cleared automatically when the app restarts.</p>
+<h3>What to Configure</h3>
+<p><strong>Username &amp; Password:</strong> Your APIC login. Auto-injected when scripts prompt for Username/Password.</p>
+<p><strong>APIC URLs:</strong> One URL per datacenter environment (D1, D2, D3). These are embedded into generated rollback scripts so rollbacks can authenticate independently.</p>
+<h3>How Auto-Injection Works</h3>
+<p>The UI watches the terminal output for prompts containing "username" or "password" and types your credentials automatically. This happens for initial login <em>and</em> for any token re-authentication during the run.</p>
+</div></div>
+<div class="readme-section"><div class="readme-section-title"><span>📊</span> Deploy Log</div><div class="readme-content">
+<p>Every script execution is logged automatically — whether it succeeds, fails, or is stopped mid-run.</p>
+<h3>Dashboard Stats</h3>
+<p><strong>Time Saved:</strong> Compares automated run time against estimated manual APIC GUI time per deployment.<br>
+<strong>Total Deployments:</strong> Count of all objects created/deleted across all runs.<br>
+<strong>Script Runs:</strong> Total number of script executions.<br>
+<strong>Success Rate:</strong> Percentage of runs that completed without errors.</p>
+<h3>Per-Run Artifacts</h3>
+<p><strong>📥 Sanitized Log:</strong> Full terminal output with all passwords and tokens redacted. Download and attach to work orders.</p>
+<p><strong>📋 Results CSV:</strong> Your original input CSV with two extra columns appended: <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">SELECTED_PORT</code> (which physical port was deployed) and <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">STATUS</code> (DEPLOYED, FAILED, SKIPPED, NOT_REACHED, or STOPPED). Generated for every run regardless of outcome.</p>
+<p><strong>↩ Rollback Script:</strong> Auto-generated Python script that reverses every change from that deployment. Deletes port selectors, policy groups, EPG bindings, and clears descriptions — in reverse order. Can be downloaded or executed directly from the UI with one click.</p>
+</div></div>
+<div class="readme-section"><div class="readme-section-title"><span>⚙️</span> Settings</div><div class="readme-content">
+<h3>Script Paths</h3>
+<p>File paths for each of the four deployment scripts. Update these if you've renamed or moved the scripts.</p>
+<h3>Auto-Select First Available Port</h3>
+<p>When enabled, the UI automatically picks the first <span style="color:var(--accent-green);font-weight:600">[AVAIL]</span> port from the validation list — skipping any <span style="color:var(--accent-red);font-weight:600">[IN-USE]</span> ports. Disable this to always choose ports manually.</p>
+<h3>Version</h3>
+<p>Current app version. Shown in the sidebar footer.</p>
+</div></div></div>
+
+<div id="readmeTabTroubleshoot" class="readme-tab-content">
+<div class="readme-section"><div class="readme-section-title"><span>🔧</span> Troubleshooting</div><div class="readme-content">
+<h3>Script Not Found</h3><p>Go to <strong>Settings</strong> and verify all four script paths point to actual files. Paths are relative to the directory where <code style="background:var(--bg-darkest);padding:1px 5px;border-radius:3px;font-size:11px">aci_deployment_app.py</code> is running.</p>
+<h3>CSV Validation Errors</h3><p>Column headers must match exactly (case-insensitive). Common issues: missing HOSTNAME column, VLANS not wrapped in quotes when using commas or ranges, TYPE not set to ACCESS or TRUNK. Check the CSV reference table on each deployment screen.</p>
+<h3>Credentials Not Auto-Filling</h3><p>Make sure credentials are set in the <strong>Credentials</strong> panel <em>before</em> starting the script. The badge should show <span style="color:var(--accent-green)">SET</span>. Credentials clear on app restart.</p>
+<h3>Token Expired (403 "Token was invalid")</h3><p>This should be handled automatically by the token refresh system. If you still see this error, the APIC may be unreachable or your password may have changed. Stop the script, update credentials, and re-run.</p>
+<h3>Port Shows [IN-USE] Unexpectedly</h3><p>The port validation checks 4 criteria: usage = discovery, no description, no policy group assigned, and no EPG bindings. If any one fails, the port shows as [IN-USE] with the reason. Use the VPC or Static Port cleanup feature to remove existing configs before redeploying.</p>
+<h3>No Available Ports on Both Switches</h3><p>For VPC, both switches must have matching available ports. If one switch is full, the common port list will be empty. Check each switch individually in APIC to confirm port availability.</p>
+<h3>VLAN Not Found / No EPG</h3><p>The scripts search all tenants for each environment (D1 = BLU, GWC, GWS; D3 = NSM_BLU, NSM_BRN, etc.). If no EPG is found for a VLAN, it means no EPG with encap matching that VLAN ID exists in any of the searched tenants. Verify the VLAN ID and tenant configuration in APIC.</p>
+<h3>Rollback Script Fails</h3><p>Rollback scripts require APIC URLs to be set in Credentials. If you downloaded the rollback and are running it standalone, edit the APIC_URLS dictionary at the top of the script.</p>
+</div></div></div>
 </div></div>
 
 </main></div>
@@ -1671,6 +2199,26 @@ function updateCredStatus(isSet){
   if(isSet){box.className='cred-status set';icon.textContent='✅';txt.textContent='Credentials stored (auto-fill active)';badge.className='cred-badge set';badge.textContent='SET'}
   else{box.className='cred-status unset';icon.textContent='⚠️';txt.textContent='No credentials stored';badge.className='cred-badge unset';badge.textContent='NOT SET'}
 }
+function saveToDisk(){
+  if(!credSet){alert('Set credentials first');return}
+  fetch('/api/credentials/save-to-disk',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.status==='saved') alert('Credentials saved to disk (.aci_credentials, base64 obfuscated)');
+    else alert('Failed to save: '+(d.message||'unknown error'));
+  });
+}
+function loadFromDisk(){
+  fetch('/api/credentials/load-from-disk',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.status==='loaded'){
+      updateCredStatus(true);
+      document.getElementById('credUsername').value=d.username||'';
+      document.getElementById('credApicD1').value=(d.apic_urls||{}).D1||'';
+      document.getElementById('credApicD2').value=(d.apic_urls||{}).D2||'';
+      document.getElementById('credApicD3').value=(d.apic_urls||{}).D3||'';
+      document.getElementById('credPassword').value='\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022';
+      alert('Credentials loaded from disk');
+    } else { alert('No saved credentials found on disk'); }
+  });
+}
 function checkCredentials(){fetch('/api/credentials').then(r=>r.json()).then(d=>{
   updateCredStatus(d.set);
   if(d.apic_urls){
@@ -1733,7 +2281,7 @@ function exportCsv(type){
 }
 
 // README
-function switchReadmeTab(tab){document.querySelectorAll('.readme-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.readme-tab-content').forEach(c=>c.classList.remove('active'));event.target.classList.add('active');const map={ui:'readmeTabUi',vpc:'readmeTabVpc',individual:'readmeTabIndividual',troubleshoot:'readmeTabTroubleshoot'};const el=document.getElementById(map[tab]);if(el)el.classList.add('active')}
+function switchReadmeTab(tab){document.querySelectorAll('.readme-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.readme-tab-content').forEach(c=>c.classList.remove('active'));event.target.classList.add('active');const map={ui:'readmeTabUi',vpc:'readmeTabVpc',individual:'readmeTabIndividual',epgadd:'readmeTabEpgadd',epgdelete:'readmeTabEpgdelete',management:'readmeTabManagement',troubleshoot:'readmeTabTroubleshoot'};const el=document.getElementById(map[tab]);if(el)el.classList.add('active')}
 function toggleCsvRef(type){const ref=document.getElementById(type+'CsvRef'),t=ref.querySelector('.csv-table'),e=ref.querySelector('.csv-example'),tog=ref.querySelector('.csv-reference-toggle');if(t.style.display==='none'){t.style.display='';e.style.display='';tog.textContent='Hide'}else{t.style.display='none';e.style.display='none';tog.textContent='Show'}}
 
 // TERMINAL
@@ -1742,7 +2290,17 @@ function highlightBracketNums(html){return html.replace(/\[\s*(\d+|[A-Za-z])\]/g
 function addLine(type,text,lineType='normal'){
   const output=document.getElementById(type+'Output'),line=document.createElement('div');
   if(lineType==='normal'){const tu=text.toUpperCase();
-    if(tu.includes('[FOUND]')||tu.includes('[SUCCESS]')||tu.includes('[OK]')||tu.includes('[CREATED]')||tu.includes('[DEPLOYED]'))lineType='success';
+    if(tu.includes('[AVAIL]'))lineType='port-available';
+    else if(tu.includes('[IN-USE]'))lineType='port-in-use';
+    else if(tu.includes('[AVAIL]'))lineType='port-available';
+    else if(tu.includes('[IN-USE]'))lineType='port-in-use';
+    else if(tu.includes('[AVAIL]'))lineType='port-available';
+    else if(tu.includes('[IN-USE]'))lineType='port-in-use';
+    else if(tu.includes('[AVAIL]'))lineType='port-available';
+    else if(tu.includes('[IN-USE]'))lineType='port-in-use';
+    else if(tu.includes('[AVAIL]'))lineType='port-available';
+    else if(tu.includes('[IN-USE]'))lineType='port-in-use';
+    else if(tu.includes('[FOUND]')||tu.includes('[SUCCESS]')||tu.includes('[OK]')||tu.includes('[CREATED]')||tu.includes('[DEPLOYED]'))lineType='success';
     else if(tu.includes('[ERROR]')||tu.includes('[FAILED]')||tu.includes('[FAILURE]')||tu.includes('[EXIT]'))lineType='error';
     else if(tu.includes('[WARNING]')||tu.includes('[WARN]')||tu.includes('[SKIP]')||tu.includes('[SKIPPED]'))lineType='warning';
     else if(tu.includes('[INFO]'))lineType='info';
@@ -1751,13 +2309,26 @@ function addLine(type,text,lineType='normal'){
   }
   line.className='terminal-line '+lineType;
   const esc=text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  if(['success','error','warning','info','credential'].includes(lineType)){
-    let h=esc.replace(/\[(FOUND|SUCCESS|OK|CREATED|DEPLOYED)\]/gi,'<span style="color:var(--accent-green);font-weight:600">[$1]</span>')
+  if(['success','error','warning','info','credential','port-available','port-in-use'].includes(lineType)){
+    let h=esc.replace(/\[(AVAIL)\]/gi,'<span class="port-avail">[$1]</span>')
+      .replace(/\[(IN-USE)\]/gi,'<span class="port-inuse">[$1]</span>')
+      .replace(/\[(AVAIL)\]/gi,'<span class="port-avail">[$1]</span>')
+      .replace(/\[(IN-USE)\]/gi,'<span class="port-inuse">[$1]</span>')
+      .replace(/\[(AVAIL)\]/gi,'<span class="port-avail">[$1]</span>')
+      .replace(/\[(IN-USE)\]/gi,'<span class="port-inuse">[$1]</span>')
+      .replace(/\[(AVAIL)\]/gi,'<span class="port-avail">[$1]</span>')
+      .replace(/\[(IN-USE)\]/gi,'<span class="port-inuse">[$1]</span>')
+      .replace(/\[(AVAIL)\]/gi,'<span class="port-avail">[$1]</span>')
+      .replace(/\[(IN-USE)\]/gi,'<span class="port-inuse">[$1]</span>')
+      .replace(/\[(FOUND|SUCCESS|OK|CREATED|DEPLOYED)\]/gi,'<span style="color:var(--accent-green);font-weight:600">[$1]</span>')
       .replace(/\[(ERROR|FAILED|FAILURE|EXIT)\]/gi,'<span style="color:var(--accent-red);font-weight:600">[$1]</span>')
       .replace(/\[(WARNING|WARN|SKIP|SKIPPED)\]/gi,'<span style="color:var(--accent-orange);font-weight:600">[$1]</span>')
       .replace(/\[(INFO)\]/gi,'<span style="color:var(--accent-blue);font-weight:600">[$1]</span>')
       .replace(/\[(CREDENTIALS)\]/gi,'<span style="color:#ffd200;font-weight:600">[$1]</span>')
-      .replace(/\[(AUTO)\]/gi,'<span style="color:#ffd200;font-weight:600">[$1]</span>');
+      .replace(/\[(AUTO)\]/gi,'<span style="color:#ffd200;font-weight:600">[$1]</span>')
+      .replace(/\[(FAIL)\]/gi,'<span style="color:var(--accent-red);font-weight:600">[$1]</span>')
+      .replace(/\[(OVERRIDE)\]/gi,'<span style="color:var(--accent-orange);font-weight:600">[$1]</span>')
+      .replace(/\[(CANCELLED)\]/gi,'<span style="color:var(--accent-orange);font-weight:600">[$1]</span>');
     line.innerHTML=highlightBracketNums(h);
   } else { line.innerHTML=highlightBracketNums(esc); }
   output.appendChild(line); output.scrollTop=output.scrollHeight;
@@ -1893,6 +2464,7 @@ function saveSettings(){
     epgadd_script:document.getElementById('settingsEpgaddScript').value,
     epgdelete_script:document.getElementById('settingsEpgdeleteScript').value,
     auto_select_port:document.getElementById('settingsAutoSelectPort').checked,
+    epg_overwrite_default:document.getElementById('settingsEpgOverwrite').checked,
     version:document.getElementById('settingsVersion').value
   };
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
@@ -2080,6 +2652,23 @@ def api_credentials():
     elif request.method == 'DELETE':
         stored_credentials = {"username": None, "password": None, "set": False, "apic_urls": {"D1": "", "D2": "", "D3": ""}}
         return jsonify({'status': 'cleared'})
+
+@app.route('/api/credentials/save-to-disk', methods=['POST'])
+def api_credentials_save_disk():
+    if not stored_credentials.get('set'):
+        return jsonify({'status': 'error', 'message': 'No credentials to save'})
+    ok = save_credentials_to_disk()
+    return jsonify({'status': 'saved' if ok else 'error'})
+
+@app.route('/api/credentials/load-from-disk', methods=['POST'])
+def api_credentials_load_disk():
+    ok = load_credentials_from_disk()
+    return jsonify({
+        'status': 'loaded' if ok else 'not_found',
+        'set': stored_credentials.get('set', False),
+        'username': stored_credentials.get('username', ''),
+        'apic_urls': stored_credentials.get('apic_urls', {"D1": "", "D2": "", "D3": ""})
+    })
 
 @app.route('/api/validate-csv', methods=['POST'])
 def api_validate_csv():
