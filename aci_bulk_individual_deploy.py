@@ -52,6 +52,19 @@ import urllib3
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Shared utilities (consolidated from duplicated helpers)
+from aci_port_utils import (
+    detect_environment, extract_node_id, parse_vlans, parse_interface,
+    prompt_input, sort_port_key,
+    get_all_ports_with_status, display_port_selection,
+    get_validated_available_ports,
+    cleanup_port_for_redeployment,
+    query_existing_access_policy_groups, display_policy_group_selection,
+    query_all_bindings_on_port,
+    ensure_token_fresh, reauth_apic
+)
+
+
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -61,15 +74,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # =============================================================================
 
 APIC_URLS = {
-    "D1": "",  # <-- UPDATE THIS (ACC switches)
-    "D2": "",  # <-- UPDATE THIS (SDC switches)
-    "D3": ""   # <-- UPDATE THIS (NSM switches)
+    "D1": "https://edcapic01.gwnsm.guidewell.net/",  # <-- UPDATE THIS (BLU Tenant - ACC switches)
+    "D2": "https://sdcapic01.gwnsm.guidewell.net/",  # <-- UPDATE THIS (BLU Tenant - SDC switches)
+    "D3": "https://edcnsmapic01.gwnsm.guidewell.net/"   # <-- UPDATE THIS (NSM_BLU Tenant - NSM switches)
 }
 
 # Multiple tenants per datacenter
 TENANTS = {
     "D1": ["BLU", "GWC", "GWS"],
-    "D2": ["BLU", "GWC", "GWS"],
+    "D2": ["BLU", "GWC", "GWS", "SDCFLB", "SDCGWS"],
     "D3": ["NSM_BLU", "NSM_BRN", "NSM_GLD", "NSM_GRN"]
 }
 
@@ -159,68 +172,15 @@ SPEED_MAPPING = {
 # HELPER FUNCTIONS
 # =============================================================================
 
-def prompt_input(prompt_text):
-    """Print prompt and get input - ensures prompt is visible in web UI."""
-    sys.stdout.write(prompt_text)
-    sys.stdout.flush()
-    return input()
+# prompt_input() — moved to aci_port_utils.py
 
+# detect_environment() — moved to aci_port_utils.py
 
-def detect_environment(switch_name):
-    """Detect data center from switch name. D3=NSM, D2=SDC, D1=everything else."""
-    switch_upper = switch_name.upper()
-    if "NSM" in switch_upper:
-        return "D3"
-    elif "SDC" in switch_upper:
-        return "D2"
-    else:
-        # Default to D1 for all other switches (including ACC and any without prefix)
-        return "D1"
+# extract_node_id() — moved to aci_port_utils.py
 
+# parse_vlans() — moved to aci_port_utils.py
 
-def extract_node_id(switch_name):
-    """Extract node ID from switch name (last digits)."""
-    match = re.search(r'(\d+)$', switch_name)
-    return match.group(1) if match else None
-
-
-def parse_vlans(vlan_string):
-    """Parse VLAN string into list of integers."""
-    vlans = []
-    vlan_string = str(vlan_string).replace(" ", "")
-    for part in vlan_string.split(","):
-        if "-" in part:
-            try:
-                start, end = part.split("-")
-                vlans.extend(range(int(start), int(end) + 1))
-            except ValueError:
-                pass
-        else:
-            try:
-                vlans.append(int(part))
-            except ValueError:
-                pass
-    return sorted(list(set(vlans)))
-
-
-def parse_interface(interface_string):
-    """Parse interface string to standard format."""
-    if not interface_string:
-        return None
-    cleaned = interface_string.strip().lower().replace("ethernet", "").replace("eth", "").replace("e", "").strip()
-    if "/" not in cleaned:
-        try:
-            return f"1/{int(cleaned)}"
-        except ValueError:
-            return None
-    parts = cleaned.split("/")
-    if len(parts) != 2:
-        return None
-    try:
-        return f"{int(parts[0])}/{int(parts[1])}"
-    except ValueError:
-        return None
-
+# parse_interface() — moved to aci_port_utils.py
 
 # =============================================================================
 # API FUNCTIONS - AUTHENTICATION
@@ -300,212 +260,7 @@ def check_interface_profile_exists(session, apic_url, profile_name):
 # API FUNCTIONS - PORT VALIDATION
 # =============================================================================
 
-def get_port_details(session, apic_url, node_id, interface):
-    """
-    Get detailed port information for validation.
-    Returns dict with: usage, description, policy_group, has_epg_bindings
-    """
-    port_info = {
-        "usage": None,
-        "description": None,
-        "policy_group": None,
-        "has_epg_bindings": False,
-        "valid": False,
-        "issues": []
-    }
-    
-    # Format interface for query
-    if "/" in interface:
-        eth_interface = f"eth{interface}"
-    else:
-        eth_interface = f"eth1/{interface}"
-    
-    # Query physical interface
-    url = f"{apic_url}/api/class/topology/pod-{POD_ID}/node-{node_id}/l1PhysIf.json?query-target-filter=wcard(l1PhysIf.dn,\"phys-[{eth_interface}]\")"
-    
-    try:
-        response = session.get(url, verify=False, timeout=30)
-        if response.status_code == 200:
-            data = response.json().get("imdata", [])
-            if data:
-                attrs = data[0].get("l1PhysIf", {}).get("attributes", {})
-                port_info["usage"] = attrs.get("usage", "").lower()
-                port_info["description"] = attrs.get("descr", "").strip()
-    except:
-        pass
-    
-    # Check for existing policy group assignment
-    # Query infraHPortS (port selectors) that reference this port
-    url = f"{apic_url}/api/class/infraPortBlk.json?query-target-filter=and(eq(infraPortBlk.fromPort,\"{interface.split('/')[-1]}\"),eq(infraPortBlk.toPort,\"{interface.split('/')[-1]}\"))"
-    
-    try:
-        response = session.get(url, verify=False, timeout=30)
-        if response.status_code == 200:
-            data = response.json().get("imdata", [])
-            # Check if any of these are on our node's interface profile
-            for item in data:
-                dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
-                if node_id in dn:
-                    port_info["policy_group"] = "exists"  # Found a port selector for this port
-                    break
-    except:
-        pass
-    
-    # Check for existing EPG bindings on this port
-    path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_interface}]"
-    url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\"{path_dn}\")"
-    
-    try:
-        response = session.get(url, verify=False, timeout=30)
-        if response.status_code == 200:
-            data = response.json().get("imdata", [])
-            if data:
-                port_info["has_epg_bindings"] = True
-    except:
-        pass
-    
-    # Validate
-    if port_info["usage"] != "discovery":
-        port_info["issues"].append(f"Usage is '{port_info['usage']}' (expected 'discovery')")
-    if port_info["description"]:
-        port_info["issues"].append(f"Has description: '{port_info['description']}'")
-    if port_info["policy_group"]:
-        port_info["issues"].append("Policy group already assigned")
-    if port_info["has_epg_bindings"]:
-        port_info["issues"].append("EPG already deployed to this port")
-    
-    port_info["valid"] = len(port_info["issues"]) == 0
-    
-    return port_info
-
-
-def validate_single_port(session, apic_url, node_id, port):
-    """
-    Validate a single port for policy group and EPG bindings.
-    Used by ThreadPoolExecutor for parallel validation.
-    """
-    port_num = port['interface'].split('/')[-1]
-    
-    # Check for policy group (port selector) on this port
-    try:
-        url = f"{apic_url}/api/class/infraPortBlk.json?query-target-filter=and(eq(infraPortBlk.fromPort,\"{port_num}\"),eq(infraPortBlk.toPort,\"{port_num}\"))"
-        response = session.get(url, verify=False, timeout=15)
-        if response.status_code == 200:
-            data = response.json().get("imdata", [])
-            for item in data:
-                dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
-                if node_id in dn:
-                    port["valid"] = False
-                    port["issues"].append("Policy group assigned")
-                    return port
-    except:
-        pass
-    
-    # Check for EPG bindings
-    try:
-        path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{port['port']}]"
-        url = f"{apic_url}/api/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.tDn,\"{path_dn}\")"
-        response = session.get(url, verify=False, timeout=15)
-        if response.status_code == 200:
-            data = response.json().get("imdata", [])
-            if data:
-                port["valid"] = False
-                port["issues"].append("EPG deployed")
-                return port
-    except:
-        pass
-    
-    return port
-
-
-def get_validated_available_ports(session, apic_url, node_id):
-    """
-    Get available ports with full validation using parallel queries.
-    Returns list of ports that pass all 4 checks:
-    1. Usage = 'discovery'
-    2. No description
-    3. No policy group assigned
-    4. No EPG deployed
-    
-    Uses ThreadPoolExecutor for faster validation (~5-10x speedup).
-    """
-    # First get all physical interfaces
-    url = f"{apic_url}/api/class/topology/pod-{POD_ID}/node-{node_id}/l1PhysIf.json"
-    
-    try:
-        response = session.get(url, verify=False, timeout=60)
-        if response.status_code != 200:
-            return []
-        
-        ports = []
-        for item in response.json().get("imdata", []):
-            attrs = item.get("l1PhysIf", {}).get("attributes", {})
-            
-            usage = attrs.get("usage", "").lower()
-            description = attrs.get("descr", "").strip()
-            admin_state = attrs.get("adminSt", "")
-            
-            # Extract port from DN
-            dn = attrs.get("dn", "")
-            port_match = re.search(r'phys-\[(.+?)\]', dn)
-            if not port_match:
-                continue
-            
-            port = port_match.group(1)
-            interface = parse_interface(port)
-            if not interface:
-                continue
-            
-            # Initial filter: discovery usage, no description, admin up
-            if usage == "discovery" and not description and admin_state == "up":
-                ports.append({
-                    "port": port,
-                    "interface": interface,
-                    "speed": attrs.get("speed", "inherit"),
-                    "usage": usage,
-                    "description": description,
-                    "valid": True,
-                    "issues": []
-                })
-        
-        # Sort ports
-        ports.sort(key=lambda x: (
-            int(re.search(r'eth(\d+)/', x['port']).group(1)) if re.search(r'eth(\d+)/', x['port']) else 0,
-            int(re.search(r'/(\d+)$', x['port']).group(1)) if re.search(r'/(\d+)$', x['port']) else 0
-        ))
-        
-        # Validate ports in parallel using ThreadPoolExecutor
-        # Max 10 workers to avoid overwhelming the APIC
-        validated_ports = []
-        
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            # Submit all validation tasks
-            future_to_port = {
-                executor.submit(validate_single_port, session, apic_url, node_id, port.copy()): port 
-                for port in ports
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_port):
-                try:
-                    result = future.result()
-                    if result["valid"]:
-                        validated_ports.append(result)
-                except Exception as e:
-                    pass
-        
-        # Re-sort after parallel processing
-        validated_ports.sort(key=lambda x: (
-            int(re.search(r'eth(\d+)/', x['port']).group(1)) if re.search(r'eth(\d+)/', x['port']) else 0,
-            int(re.search(r'/(\d+)$', x['port']).group(1)) if re.search(r'/(\d+)$', x['port']) else 0
-        ))
-        
-        return validated_ports
-    
-    except Exception as e:
-        print(f"    [ERROR] Failed to query ports: {e}")
-        return []
-
+# get_port_details() — moved to aci_port_utils.py
 
 # =============================================================================
 # API FUNCTIONS - LEAF ACCESS PORT POLICY GROUPS
@@ -1043,39 +798,7 @@ def run_preflight_checks(sessions, deployments):
 # DISPLAY FUNCTIONS
 # =============================================================================
 
-def display_validated_ports(ports, node_id):
-    """Display validated available ports."""
-    if not ports:
-        print(f"\n  [WARNING] No validated available ports on node {node_id}")
-        return None
-    
-    print(f"\n  Validated available ports on node {node_id}:")
-    print("  " + "-" * 60)
-    print(f"  {'#':>3}  {'Port':<15} {'Speed':<10} Status")
-    print("  " + "-" * 60)
-    
-    for i, port in enumerate(ports, 1):
-        status = "OK" if port['valid'] else f"INVALID: {', '.join(port['issues'])}"
-        print(f"  [{i:>2}] {port['port']:<15} {port['speed']:<10} {status}")
-    
-    print("  " + "-" * 60)
-    print("  [S] Skip this deployment")
-    print("  [Q] Quit script")
-    
-    while True:
-        choice = prompt_input("\n  Select port number: ").strip().upper()
-        if choice == 'S':
-            return "SKIP"
-        elif choice == 'Q':
-            return "QUIT"
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(ports):
-                return ports[idx]
-        except ValueError:
-            pass
-        print("  [ERROR] Invalid selection")
-
+# display_validated_ports() — moved to aci_port_utils.py
 
 def display_app_profile_choice(options, vlan_id):
     """Display Application Profile options and let user select. Options include tenant."""
@@ -1396,25 +1119,30 @@ def deploy_individual_port(session, apic_url, config, dry_run=False):
         print(f"        [WARNING] Could not set description: {response[:100]}")
         results["description"] = False
     
-    # Step 2: Create Leaf Access Port Policy Group
-    print(f"  [2/4] Creating Leaf Access Port Policy Group: {config['policy_group_name']}")
-    print(f"        AEP: {config['aep']}")
-    print(f"        CDP: {CDP_POLICY}")
-    print(f"        Link Level: {config['link_level']}")
-    print(f"        LLDP: {LLDP_POLICY}")
-    
-    success, response = create_leaf_access_port_policy_group(
-        session, apic_url, 
-        config['policy_group_name'], 
-        config['aep'], 
-        config['link_level']
-    )
-    if success:
-        print(f"        [SUCCESS]")
+    # Step 2: Create or reuse Leaf Access Port Policy Group
+    if config.get('reuse_policy_group'):
+        print(f"  [2/4] Using EXISTING Policy Group: {config['policy_group_name']}")
+        print(f"        [REUSE] Skipping creation")
         results["policy_group"] = True
     else:
-        print(f"        [FAILED] {response[:100]}")
-        return results
+        print(f"  [2/4] Creating Leaf Access Port Policy Group: {config['policy_group_name']}")
+        print(f"        AEP: {config['aep']}")
+        print(f"        CDP: {CDP_POLICY}")
+        print(f"        Link Level: {config['link_level']}")
+        print(f"        LLDP: {LLDP_POLICY}")
+        
+        success, response = create_leaf_access_port_policy_group(
+            session, apic_url, 
+            config['policy_group_name'], 
+            config['aep'], 
+            config['link_level']
+        )
+        if success:
+            print(f"        [SUCCESS]")
+            results["policy_group"] = True
+        else:
+            print(f"        [FAILED] {response[:100]}")
+            return results
     
     # Step 3: Create Port Selector
     selector_name = f"{config['hostname']}_e{config['interface'].split('/')[-1]}"
@@ -1492,6 +1220,60 @@ def main():
             break
     dry_run = (mode_choice == '2')
     
+    # Policy Group Mode
+    print("\n" + "-" * 70)
+    print(" POLICY GROUP MODE")
+    print("-" * 70)
+    print("\n  [1] Create NEW policy group per deployment (default)")
+    print("  [2] Reuse EXISTING policy group (query by link level)")
+    
+    while True:
+        pg_mode_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
+        if pg_mode_choice in ["", "1", "2"]:
+            break
+    reuse_pg_mode = (pg_mode_choice == '2')
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # Policy Group Mode
+    
+    # When PG already exists with same name
+    pg_exists_always_use = True
+    if not reuse_pg_mode:
+        print("\n" + "-" * 70)
+        print(" WHEN POLICY GROUP NAME ALREADY EXISTS")
+        print("-" * 70)
+        print("\n  [1] Always use existing policy group (default)")
+        print("  [2] Ask each time")
+        pg_exists_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
+        pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # EPG Binding Mode
+    print("\n" + "-" * 70)
+    print(" EPG BINDING MODE")
+    print("-" * 70)
+    print("\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+    print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
+    print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
+    epg_mode_choice = prompt_input("\nSelect (1/2/3) [default=1]: ").strip()
+    overwrite_mode = epg_mode_choice in ['2', '3']
+    overwrite_interactive = (epg_mode_choice == '2')
+    overwrite_auto = (epg_mode_choice == '3')
+    if overwrite_mode:
+        print("\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    
     # Get credentials
     print("\n" + "-" * 70)
     print(" AUTHENTICATION")
@@ -1526,6 +1308,13 @@ def main():
         print("\n[ERROR] No successful authentications.")
         sys.exit(1)
     
+    # Token state tracking for auto-refresh during batch deployments
+    import time as _token_time
+    token_states = {}
+    _credentials = {"username": username, "password": password}
+    for _env in sessions:
+        token_states[_env] = {"login_time": _token_time.time(), "lifetime": 300}
+    
     # Run pre-flight checks
     global_settings = run_preflight_checks(sessions, deployments)
     if not global_settings:
@@ -1559,6 +1348,12 @@ def main():
         
         session = sessions[env]
         apic_url = APIC_URLS[env]
+        
+        # Refresh APIC token if aging (prevents 403 on long batch runs)
+        if env in token_states:
+            if not ensure_token_fresh(session, apic_url, token_states[env]):
+                reauth_apic(session, apic_url, _credentials["username"],
+                           _credentials["password"], token_states[env])
         
         # Extract node ID
         node_id = extract_node_id(dep['switch'])
@@ -1595,22 +1390,21 @@ def main():
         
         # PORT VALIDATION - Get validated available ports
         print(f"\n  === PORT VALIDATION ===")
-        print(f"  Querying and validating ports (checking 4 criteria)...")
-        print(f"    1. Usage = 'discovery'")
-        print(f"    2. No description")
-        print(f"    3. No policy group assigned")
-        print(f"    4. No EPG deployed")
+        print(f"  Querying all ports and checking status...")
+        print(f"    Criteria: discovery usage, no description, no policy group, no EPG")
+        print(f"    [AVAIL] = passes all checks  |  [IN-USE] = has existing config")
         
-        ports = get_validated_available_ports(session, apic_url, node_id)
-        print(f"\n  Found {len(ports)} validated available ports")
+        all_ports = get_all_ports_with_status(session, apic_url, node_id, POD_ID)
+        avail_count = sum(1 for p in all_ports if p['valid'])
+        print(f"\n  Found {len(all_ports)} total ports ({avail_count} available)")
         
-        if not ports:
-            print(f"  [SKIP] No validated available ports")
+        if not all_ports:
+            print(f"  [SKIP] No ports found on node")
             skipped += 1
             continue
         
-        # Select port
-        selected_port = display_validated_ports(ports, node_id)
+        # Select port (shows all with color coding)
+        selected_port = display_port_selection(all_ports, f"node {node_id}", POD_ID)
         if selected_port == "SKIP":
             skipped += 1
             continue
@@ -1671,10 +1465,30 @@ def main():
         # Build policy group name: {Hostname}_e{InterfaceID}
         policy_group_name = f"{dep['hostname']}_e{interface.split('/')[-1]}"
         
-        # Check if policy group already exists
-        if check_policy_group_exists(session, apic_url, policy_group_name):
+        # Policy group: reuse existing or create new
+        reuse_this_pg = False
+        if reuse_pg_mode:
+            print(f"\n  [PG REUSE] Querying existing access policy groups...")
+            existing_pgs = query_existing_access_policy_groups(session, apic_url)
+            print(f"  [PG REUSE] Found {len(existing_pgs)} access policy group(s)")
+            selected_pg = display_policy_group_selection(
+                existing_pgs, pg_type="access",
+                link_level=link_level, aep=aep
+            )
+            if selected_pg:
+                policy_group_name = selected_pg
+                reuse_this_pg = True
+            else:
+                print(f"  [INFO] Will create new policy group: {policy_group_name}")
+        
+        # Check if policy group already exists (only when creating new)
+        if not reuse_this_pg and check_policy_group_exists(session, apic_url, policy_group_name):
             print(f"\n  [WARNING] Policy group '{policy_group_name}' already exists")
-            use_existing = prompt_input("  Use existing policy group? (yes/no): ").strip().lower()
+            if pg_exists_always_use:
+                print("  [AUTO] Using existing policy group (global setting)")
+                use_existing = 'yes'
+            else:
+                use_existing = prompt_input("  Use existing policy group? (yes/no): ").strip().lower()
             if use_existing not in ['yes', 'y']:
                 print(f"  [SKIP] Policy group already exists")
                 skipped += 1
@@ -1694,7 +1508,8 @@ def main():
             "link_level": link_level,
             "type": dep['type'],
             "mode": MODE_MAPPING.get(dep['type'], "regular"),
-            "epg_bindings": epg_bindings
+            "epg_bindings": epg_bindings,
+            "reuse_policy_group": reuse_this_pg
         }
         
         # Get all profiles and link level policies for edit functionality
@@ -1705,7 +1520,7 @@ def main():
         # Preview and confirm loop
         while True:
             # Preview
-            display_deployment_preview(config, all_profiles, all_link_levels, all_aeps, ports)
+            display_deployment_preview(config, all_profiles, all_link_levels, all_aeps, all_ports)
             
             # Confirm with edit option
             print("\n  [Y] Yes - Deploy")
@@ -1729,7 +1544,7 @@ def main():
             elif confirm == 'E':
                 # Edit mode
                 config, proceed = edit_interface_configuration(
-                    config, all_profiles, all_link_levels, all_aeps, ports, session, apic_url
+                    config, all_profiles, all_link_levels, all_aeps, all_ports, session, apic_url
                 )
                 if not proceed:
                     print("  [CANCELLED]")
@@ -1741,6 +1556,87 @@ def main():
             elif confirm in ['Y', 'YES']:
                 # Deploy
                 print("\n  Deploying..." if not dry_run else "\n  Dry-run...")
+                
+                # Full cleanup if overriding an in-use port
+                if not dry_run and not selected_port.get('valid', True):
+                    print("\n  [CLEANUP] Wiping existing port configuration...")
+                    cleanup_results = cleanup_port_for_redeployment(
+                        session, apic_url, config['node_id'], config['interface'],
+                        config['interface_profile'], POD_ID
+                    )
+                    print(f"  [CLEANUP] Done: {cleanup_results['bindings_deleted']} binding(s) removed, "
+                          f"selector: {'removed' if cleanup_results['selector_deleted'] else 'n/a'}, "
+                          f"description: {'cleared' if cleanup_results['description_cleared'] else 'n/a'}")
+                    print()
+                
+
+                
+                # Overwrite: delete ALL existing EPG bindings before Step 4
+                # Overwrite: delete existing EPG bindings before deploying
+                if overwrite_mode and not dry_run:
+                    import time as _time
+                    print(f"\n  [OVERWRITE] Querying existing EPG bindings...")
+                    
+                    # Use merged dual-strategy query from port_utils
+                    ow_existing = query_all_bindings_on_port(
+                        session, apic_url, node_id, dep['port'],
+                        POD_ID, tenants=TENANTS.get(env, [])
+                    )
+                    
+                    ow_deleted = 0
+                    if ow_existing:
+                        if overwrite_interactive:
+                            print(f"\n  Existing EPG bindings ({len(ow_existing)}):\n")
+                            for oi, ob in enumerate(ow_existing, 1):
+                                print(f"    [{oi}] VLAN {ob.get('vlan','?')} — {ob.get('epg','?')} ({ob.get('tenant','?')})")
+                            sel = prompt_input(f"\n  Delete which? (numbers, 'all', 'none') [default=all]: ").strip().lower()
+                            if sel in ['', 'all', 'a']:
+                                to_del = ow_existing[:]
+                            elif sel in ['none', 'n', '0']:
+                                to_del = []
+                            else:
+                                sel_idx = set()
+                                for part in sel.split(','):
+                                    part = part.strip()
+                                    if '-' in part:
+                                        rp = part.split('-')
+                                        for ri in range(int(rp[0]), int(rp[1]) + 1):
+                                            if 1 <= ri <= len(ow_existing): sel_idx.add(ri)
+                                    elif part.isdigit():
+                                        ri = int(part)
+                                        if 1 <= ri <= len(ow_existing): sel_idx.add(ri)
+                                to_del = [ow_existing[i-1] for i in sorted(sel_idx)]
+                            print(f"  -> Deleting {len(to_del)} of {len(ow_existing)} binding(s)")
+                        else:
+                            to_del = ow_existing[:]
+                            print(f"  [AUTO] Deleting all {len(to_del)} existing binding(s)")
+                        
+                        for ob in to_del:
+                            try:
+                                del_resp = session.delete(
+                                    f"{apic_url}/api/mo/{ob['dn']}.json",
+                                    verify=False, timeout=30)
+                                ok = del_resp.status_code == 200
+                            except Exception:
+                                ok = False
+                            status = '[DELETED]' if ok else '[FAIL]'
+                            print(f"    {status} VLAN {ob.get('vlan','?')} — {ob.get('epg','?')} ({ob.get('tenant','?')})")
+                            if ok:
+                                ow_deleted += 1
+                        
+                        _time.sleep(1)
+                        v_bindings = query_all_bindings_on_port(
+                            session, apic_url, node_id, dep['port'],
+                            POD_ID, tenants=TENANTS.get(env, []), verbose=False
+                        )
+                        if not v_bindings:
+                            print(f"  [VERIFIED] Port is clean — 0 bindings remain")
+                        else:
+                            print(f"  [WARNING] {len(v_bindings)} binding(s) still remain")
+                        print(f"  [OVERWRITE] Cleanup complete — {ow_deleted} removed")
+                    else:
+                        print(f"  [OVERWRITE] No existing bindings found")
+                
                 results = deploy_individual_port(session, apic_url, config, dry_run)
                 
                 ok_bindings = sum(1 for b in results['bindings'] if b['success'])
