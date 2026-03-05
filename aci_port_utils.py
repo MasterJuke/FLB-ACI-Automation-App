@@ -1914,6 +1914,79 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
     return protpath_dns
 
 
+def resolve_port_path_dn(session, apic_url, node_id, port, pod_id="1",
+                          verbose=True, token_state=None, credentials=None):
+    """
+    Determine the correct path DN for deploying EPG bindings to a port.
+
+    A physical port may be configured as:
+    - Individual: topology/pod-{pod}/paths-{node}/pathep-[eth{port}]
+    - VPC: topology/pod-{pod}/protpaths-{n1}-{n2}/pathep-[{pg_name}]
+
+    This function checks the port's policy group assignment to determine
+    which path type to use, ensuring bindings show up correctly under
+    Fabric > Inventory > Switch > Interface > Deployed EPGs.
+
+    Returns dict:
+        {
+            "path_dn": "topology/pod-1/...",
+            "path_type": "individual" | "vpc",
+            "pg_name": "EDCAVIO-ACC-R16_e8.VPC" | None,
+            "peer_node": "1601" | None,
+            "individual_path": "topology/pod-1/paths-{node}/pathep-[eth{port}]"
+        }
+
+    CCIE Automation Note:
+    This is critical for ACI static path bindings. The path DN in
+    fvRsPathAtt.tDn MUST match how the port is configured:
+    - accportgrp (individual) -> use paths-{node}/pathep-[eth{port}]
+    - accbundle with lagT=node (VPC) -> use protpaths-{n1}-{n2}/pathep-[{pg}]
+    Using the wrong path type causes bindings to not show in the GUI
+    and not forward traffic correctly.
+    """
+    eth_port = f"eth{port}" if not port.startswith("eth") else port
+    individual_path = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{eth_port}]"
+
+    result = {
+        "path_dn": individual_path,
+        "path_type": "individual",
+        "pg_name": None,
+        "peer_node": None,
+        "individual_path": individual_path
+    }
+
+    # Check if port has a VPC policy group
+    vpc_paths = _discover_vpc_paths_for_port(
+        session, apic_url, node_id, port, pod_id, verbose,
+        token_state, credentials
+    )
+
+    if vpc_paths:
+        # Use the first VPC protpath (a port typically has one VPC PG)
+        result["path_dn"] = vpc_paths[0]
+        result["path_type"] = "vpc"
+
+        # Extract pg_name and peer_node from the protpath DN
+        # Format: topology/pod-{pod}/protpaths-{n1}-{n2}/pathep-[{pg}]
+        import re as _re
+        pg_match = _re.search(r'pathep-\[(.+)\]', vpc_paths[0])
+        peer_match = _re.search(r'protpaths-(\d+)-(\d+)', vpc_paths[0])
+        if pg_match:
+            result["pg_name"] = pg_match.group(1)
+        if peer_match:
+            n1, n2 = peer_match.group(1), peer_match.group(2)
+            result["peer_node"] = n1 if n1 != str(node_id) else n2
+
+        if verbose:
+            print(f"  [PATH] Port uses VPC: {result['pg_name']} (peer node {result['peer_node']})")
+            print(f"         Deploy path: {result['path_dn']}")
+    else:
+        if verbose:
+            print(f"  [PATH] Port uses individual path: {individual_path}")
+
+    return result
+
+
 def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                                tenants=None, path_type="individual",
                                node2=None, pg_name=None, verbose=True,
