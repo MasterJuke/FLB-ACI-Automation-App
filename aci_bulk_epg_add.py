@@ -40,7 +40,7 @@ from aci_port_utils import (
     detect_environment, extract_node_id, parse_vlans, parse_port,
     parse_ports, prompt_input,
     query_all_bindings_on_port, delete_all_bindings_on_port,
-    ensure_token_fresh, reauth_apic
+    ensure_token_fresh, reauth_apic, resolve_port_path_dn
 )
 
 # Disable SSL warnings
@@ -138,22 +138,40 @@ def check_port_exists(session, apic_url, node_id, port):
     return False
 
 
-def check_epg_binding_exists(session, apic_url, tenant, app_profile, epg_name, path_dn):
+def check_epg_binding_exists(session, apic_url, tenant, app_profile, epg_name, path_dn, debug=False):
     """Check if an EPG binding already exists on a path."""
     try:
         url = f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{app_profile}/epg-{epg_name}.json?query-target=children&target-subtree-class=fvRsPathAtt"
+        if debug:
+            print(f"    [DEBUG] check_epg_binding_exists:")
+            print(f"      Checking: tn-{tenant}/ap-{app_profile}/epg-{epg_name}")
+            print(f"      Looking for tDn containing: {path_dn}")
         response = session.get(url, verify=False, timeout=15)
         if response.status_code == 200:
-            for item in response.json().get("imdata", []):
+            items = response.json().get("imdata", [])
+            if debug:
+                print(f"      Found {len(items)} fvRsPathAtt children")
+            for item in items:
                 attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
-                if path_dn in attrs.get("tDn", ""):
+                tdn = attrs.get("tDn", "")
+                if debug:
+                    match = "MATCH" if path_dn in tdn else "no match"
+                    print(f"        tDn: {tdn} [{match}]")
+                if path_dn in tdn:
+                    if debug:
+                        print(f"      -> ALREADY BOUND")
                     return True
-    except:
-        pass
+        elif debug:
+            print(f"      HTTP {response.status_code}: {response.text[:100]}")
+    except Exception as e:
+        if debug:
+            print(f"      ERROR: {e}")
+    if debug:
+        print(f"      -> NOT BOUND")
     return False
 
 
-def deploy_static_binding(session, apic_url, tenant, app_profile, epg_name, vlan_id, mode, path_dn):
+def deploy_static_binding(session, apic_url, tenant, app_profile, epg_name, vlan_id, mode, path_dn, debug=False):
     """Deploy a static binding to an EPG."""
     payload = {
         "fvRsPathAtt": {
@@ -165,13 +183,23 @@ def deploy_static_binding(session, apic_url, tenant, app_profile, epg_name, vlan
             }
         }
     }
+    post_url = f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{app_profile}/epg-{epg_name}.json"
+    if debug:
+        print(f"    [DEBUG] deploy_static_binding:")
+        print(f"      POST {post_url}")
+        print(f"      tDn:   {path_dn}")
+        print(f"      encap: vlan-{vlan_id}")
+        print(f"      mode:  {mode}")
     try:
-        response = session.post(
-            f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{app_profile}/epg-{epg_name}.json",
-            json=payload, verify=False, timeout=30
-        )
+        response = session.post(post_url, json=payload, verify=False, timeout=30)
+        if debug:
+            print(f"      HTTP {response.status_code}")
+            if response.status_code != 200:
+                print(f"      Response: {response.text[:200]}")
         return response.status_code == 200, response.text
     except Exception as e:
+        if debug:
+            print(f"      ERROR: {e}")
         return False, str(e)
 
 
@@ -272,6 +300,15 @@ def main():
         if mode_choice in ['1', '2']:
             break
     dry_run = (mode_choice == '2')
+    
+    # Debug mode
+    debug = os.environ.get('ACI_DEBUG', '') == '1'
+    if not debug:
+        sys.stdout.write("\nEnable debug output? (y/N): ")
+        sys.stdout.flush()
+        debug = input().strip().lower() in ['y', 'yes']
+    if debug:
+        print("  [DEBUG MODE ENABLED] — verbose API call logging")
     
     # =========================================================================
     # BINDING MODE
@@ -376,6 +413,7 @@ def main():
     all_bindings = []
     alerts = []
     ap_tenant_selections = {}  # Cache user selections: {env:vlan -> (app_profile, tenant)}
+    resolved_paths = {}  # Cache resolved path DNs: {"switch:port" -> path_dn}
     
     for idx, dep in enumerate(deployments, 1):
         print(f"\n[{idx}/{len(deployments)}] {dep['switch']} port {dep['port']}")
@@ -404,9 +442,24 @@ def main():
         if not check_port_exists(session, apic_url, node_id, dep['port']):
             print(f"  [WARNING] Port may not have policy group configured")
         
-        # Build path DN
-        eth_port = f"eth{dep['port']}" if not dep['port'].startswith("eth") else dep['port']
-        path_dn = f"topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_port}]"
+        # Resolve correct path DN — detects VPC vs individual automatically
+        path_info = resolve_port_path_dn(
+            session, apic_url, node_id, dep['port'], POD_ID,
+            verbose=True, token_state=token_states.get(env),
+            credentials=_credentials
+        )
+        path_dn = path_info["path_dn"]
+        
+        if debug:
+            print(f"  [DEBUG] resolve_port_path_dn result:")
+            print(f"    path_type:      {path_info['path_type']}")
+            print(f"    path_dn:        {path_dn}")
+            print(f"    pg_name:        {path_info.get('pg_name')}")
+            print(f"    peer_node:      {path_info.get('peer_node')}")
+            print(f"    individual_path:{path_info.get('individual_path')}")
+        
+        # Cache resolved path per switch+port for multi-AP resolution later
+        resolved_paths[f"{dep['switch']}:{dep['port']}"] = path_dn
         
         # Process each VLAN
         vlans = parse_vlans(dep['vlans'])
@@ -451,8 +504,12 @@ def main():
                 
                 # Check if binding already exists
                 already_bound = check_epg_binding_exists(
-                    session, apic_url, epg_tenant, epg['app_profile'], epg['epg_name'], path_dn
+                    session, apic_url, epg_tenant, epg['app_profile'], epg['epg_name'], path_dn, debug
                 )
+                
+                if debug:
+                    print(f"    VLAN {vlan}: path_dn={path_dn}")
+                    print(f"    VLAN {vlan}: already_bound={already_bound}")
                 
                 all_bindings.append({
                     "switch": dep['switch'],
@@ -522,7 +579,12 @@ def main():
                                 continue
                             
                             dep_eth = f"eth{dep['port']}" if not dep['port'].startswith("eth") else dep['port']
-                            dep_path = f"topology/pod-{POD_ID}/paths-{dep_node_id}/pathep-[{dep_eth}]"
+                            # Use cached resolved path (VPC or individual)
+                            dep_cache_key = f"{dep['switch']}:{dep['port']}"
+                            if dep_cache_key in resolved_paths:
+                                dep_path = resolved_paths[dep_cache_key]
+                            else:
+                                dep_path = f"topology/pod-{POD_ID}/paths-{dep_node_id}/pathep-[{dep_eth}]"
                             
                             already_bound = check_epg_binding_exists(
                                 dep_session, dep_apic_url, selected_tenant,
@@ -562,6 +624,15 @@ def main():
     # Show summary
     new_bindings = [b for b in all_bindings if not b['already_bound']]
     existing_bindings = [b for b in all_bindings if b['already_bound']]
+    
+    if debug and existing_bindings:
+        print(f"\n  [DEBUG] Bindings marked 'already_bound' (will be skipped in Add mode):")
+        for b in existing_bindings[:10]:
+            print(f"    VLAN {b['vlan']} on {b['switch']} port {b['port']}")
+            print(f"      path_dn: {b['path_dn']}")
+            print(f"      EPG: {b['tenant']}/{b['app_profile']}/{b['epg_name']}")
+        if len(existing_bindings) > 10:
+            print(f"    ... and {len(existing_bindings) - 10} more")
     
     print(f"\n  Total bindings: {len(all_bindings)}")
     print(f"  New bindings:   {len(new_bindings)}")
@@ -803,6 +874,16 @@ def main():
     # In overwrite mode, deploy ALL bindings (not just "new" — we wiped ports)
     deploy_list = all_bindings if overwrite_mode else new_bindings
     
+    if debug:
+        print(f"\n  [DEBUG] deploy_list has {len(deploy_list)} binding(s)")
+        print(f"  [DEBUG] all_bindings: {len(all_bindings)}, new_bindings: {len(new_bindings)}")
+        print(f"  [DEBUG] overwrite_mode={overwrite_mode}, using {'all_bindings' if overwrite_mode else 'new_bindings'}")
+        for i, b in enumerate(deploy_list[:5]):
+            print(f"  [DEBUG]   [{i}] VLAN {b['vlan']} path_dn={b['path_dn']}")
+            print(f"  [DEBUG]       already_bound={b['already_bound']} tenant={b['tenant']} epg={b['epg_name']}")
+        if len(deploy_list) > 5:
+            print(f"  [DEBUG]   ... and {len(deploy_list) - 5} more")
+    
     # Track port changes for separator output
     _last_deploy_port = None
     for b in deploy_list:
@@ -825,7 +906,7 @@ def main():
         
         success, response = deploy_static_binding(
             session, apic_url, b['tenant'], b['app_profile'],
-            b['epg_name'], b['vlan'], b['mode'], b['path_dn']
+            b['epg_name'], b['vlan'], b['mode'], b['path_dn'], debug
         )
         
         if success:
