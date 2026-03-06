@@ -148,7 +148,7 @@ current_run = {"type": None, "start_time": None, "csv_path": None, "output_lines
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 for key, value in DEFAULT_CONFIG.items():
                     if key not in config:
@@ -159,7 +159,7 @@ def load_config():
     return DEFAULT_CONFIG.copy()
 
 def save_config(config):
-    with open(CONFIG_FILE, 'w') as f:
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
 
 # =============================================================================
@@ -169,14 +169,14 @@ def save_config(config):
 def load_log():
     if os.path.exists(LOG_FILE):
         try:
-            with open(LOG_FILE, 'r') as f:
+            with open(LOG_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except:
             pass
     return {"entries": [], "total_time_saved_minutes": 0, "total_deployments": 0}
 
 def save_log(log_data):
-    with open(LOG_FILE, 'w') as f:
+    with open(LOG_FILE, 'w', encoding='utf-8') as f:
         json.dump(log_data, f, indent=2)
 
 def add_log_entry(deploy_type, csv_path, status, deployment_count, duration_seconds, output_lines):
@@ -262,7 +262,7 @@ def auto_save_log(deploy_type, entry_id, timestamp, output_lines):
         filename = f"{ts}_{deploy_type}_run{entry_id}.txt"
         filepath = os.path.join(SAVED_LOGS_FOLDER, filename)
 
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             f.write(f"ACI Deployment Log\n")
             f.write(f"{'=' * 60}\n")
             f.write(f"Type:      {deploy_type.upper()}\n")
@@ -503,7 +503,7 @@ def generate_rollback_script(deploy_type, entry_id, timestamp, output_lines):
         if prior_states:
             script = inject_restore_phase(script, prior_states, deploy_type)
 
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             f.write(script)
 
         return filename
