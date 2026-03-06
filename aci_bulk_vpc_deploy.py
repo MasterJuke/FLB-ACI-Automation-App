@@ -275,7 +275,7 @@ def set_port_description(session, apic_url, node_id, interface, description):
     }
     try:
         response = session.post(
-            f"{apic_url}/api/node/mo/topology/pod-{POD_ID}/node-{node_id}/sys/phys-[{interface}].json",
+            f"{apic_url}/api/mo/topology/pod-{POD_ID}/node-{node_id}/sys/phys-[{interface}].json",
             json=payload, verify=False, timeout=30
         )
         return response.status_code == 200, response.text
