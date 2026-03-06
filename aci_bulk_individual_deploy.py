@@ -465,6 +465,9 @@ def set_port_description(session, apic_url, node_id, interface, description):
     """
     Set the description on a physical interface.
     Description format: {Hostname} {WorkOrder}
+    
+    Uses /api/mo/ (APIC policy engine) rather than /api/node/mo/ (node DME proxy)
+    because l1PhysIf write access requires APIC-level routing on some fabric versions.
     """
     if "/" in interface:
         eth_interface = f"eth{interface}"
@@ -483,7 +486,7 @@ def set_port_description(session, apic_url, node_id, interface, description):
     }
     
     try:
-        response = session.post(f"{apic_url}/api/node/mo/{dn}.json", 
+        response = session.post(f"{apic_url}/api/mo/{dn}.json", 
                                json=payload, verify=False, timeout=30)
         return response.status_code == 200, response.text
     except Exception as e:
