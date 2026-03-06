@@ -1110,7 +1110,7 @@ def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
         phys_dn = f"topology/pod-{pod_id}/node-{node_id}/sys/phys-[{eth_iface}]"
         payload = {"l1PhysIf": {"attributes": {"descr": ""}}}
         resp = session.post(
-            f"{apic_url}/api/node/mo/{phys_dn}.json",
+            f"{apic_url}/api/mo/{phys_dn}.json",
             json=payload, verify=False, timeout=30
         )
         if resp.status_code == 200:
@@ -1257,7 +1257,7 @@ def cleanup_vpc_port_for_redeployment(session, apic_url, node1, node2, interface
             phys_dn = f"topology/pod-{pod_id}/node-{node}/sys/phys-[{eth_iface}]"
             payload = {"l1PhysIf": {"attributes": {"descr": ""}}}
             resp = session.post(
-                f"{apic_url}/api/node/mo/{phys_dn}.json",
+                f"{apic_url}/api/mo/{phys_dn}.json",
                 json=payload, verify=False, timeout=30
             )
             if resp.status_code == 200:
