@@ -414,6 +414,7 @@ def main():
     alerts = []
     ap_tenant_selections = {}  # Cache user selections: {env:vlan -> (app_profile, tenant)}
     resolved_paths = {}  # Cache resolved path DNs: {"switch:port" -> path_dn}
+    resolved_path_info = {}  # Cache full path info: {"switch:port" -> path_info dict}
     
     for idx, dep in enumerate(deployments, 1):
         print(f"\n[{idx}/{len(deployments)}] {dep['switch']} port {dep['port']}")
@@ -450,16 +451,27 @@ def main():
         )
         path_dn = path_info["path_dn"]
         
+        # Always show resolved path prominently
+        if path_info["path_type"] == "vpc":
+            print(f"  *** DEPLOY PATH: VPC protpath ***")
+            print(f"      Policy Group: {path_info.get('pg_name', '?')}")
+            print(f"      VPC Pair:     {node_id}-{path_info.get('peer_node', '?')}")
+            print(f"      tDn:          {path_dn}")
+        else:
+            print(f"  *** DEPLOY PATH: Individual ***")
+            print(f"      tDn:          {path_dn}")
+        
         if debug:
-            print(f"  [DEBUG] resolve_port_path_dn result:")
-            print(f"    path_type:      {path_info['path_type']}")
-            print(f"    path_dn:        {path_dn}")
-            print(f"    pg_name:        {path_info.get('pg_name')}")
-            print(f"    peer_node:      {path_info.get('peer_node')}")
-            print(f"    individual_path:{path_info.get('individual_path')}")
+            print(f"  [DEBUG] resolve_port_path_dn full result:")
+            print(f"    path_type:       {path_info['path_type']}")
+            print(f"    pg_name:         {path_info.get('pg_name')}")
+            print(f"    peer_node:       {path_info.get('peer_node')}")
+            print(f"    individual_path: {path_info.get('individual_path')}")
         
         # Cache resolved path per switch+port for multi-AP resolution later
         resolved_paths[f"{dep['switch']}:{dep['port']}"] = path_dn
+        # Also cache full path_info for overwrite section
+        resolved_path_info[f"{dep['switch']}:{dep['port']}"] = path_info
         
         # Process each VLAN
         vlans = parse_vlans(dep['vlans'])
@@ -656,6 +668,27 @@ def main():
     # Show binding details
     mode_display = "Trunk (Tagged)" if binding_mode == "regular" else "Access (Untagged)"
     print(f"\n  Binding Mode: {mode_display}")
+    
+    # Show resolved paths per port
+    _preview_ports = {}
+    for b in all_bindings:
+        pk = f"{b['switch']}:{b['port']}"
+        if pk not in _preview_ports:
+            ptype = "VPC" if "protpaths" in b['path_dn'] else "Individual"
+            pg = b['path_dn'].split('pathep-[')[-1].rstrip(']') if 'protpaths' in b['path_dn'] else ""
+            _preview_ports[pk] = {"type": ptype, "pg": pg, "path_dn": b['path_dn']}
+    
+    if _preview_ports:
+        print(f"\n  === PORT DEPLOY PATHS ===")
+        print("  " + "-" * 66)
+        for pk, pdata in _preview_ports.items():
+            sw, pt = pk.split(":", 1)
+            if pdata["type"] == "VPC":
+                print(f"  {sw} port {pt}: *** VPC — {pdata['pg']} ***")
+            else:
+                print(f"  {sw} port {pt}: Individual")
+        print("  " + "-" * 66)
+    
     print("\n  === NEW BINDINGS TO DEPLOY ===")
     print("  " + "-" * 66)
     print(f"  {'Switch':<20} {'Port':<8} {'VLAN':<6} {'EPG':<30}")
@@ -740,6 +773,17 @@ def main():
             print(f"  Port {port_num}/{port_total}: {switch} port {port}")
             print(f"  {'=' * 60}")
             
+            # Show the resolved deploy path for this port
+            _cache_key = f"{switch}:{port}"
+            _pinfo = resolved_path_info.get(_cache_key, {})
+            if _pinfo.get("path_type") == "vpc":
+                print(f"  *** PATH: VPC — {_pinfo.get('pg_name', '?')} (pair {node_id}-{_pinfo.get('peer_node', '?')}) ***")
+                print(f"      Query tDn: {_pinfo.get('path_dn', '?')}")
+            else:
+                eth_p = f"eth{port}" if not port.startswith("eth") else port
+                print(f"  *** PATH: Individual — {eth_p} ***")
+                print(f"      Query tDn: topology/pod-{POD_ID}/paths-{node_id}/pathep-[{eth_p}]")
+            
             if env not in sessions:
                 print(f"  [SKIP] No session for {env}")
                 continue
@@ -770,12 +814,19 @@ def main():
             
             if overwrite_interactive:
                 print(f"\n  Existing EPG bindings on this port:")
-                print(f"  {'-' * 70}")
-                print(f"  {'#':<5} {'VLAN':<7} {'EPG':<35} {'Tenant':<12} {'App Profile'}")
-                print(f"  {'-' * 70}")
+                print(f"  {'-' * 80}")
+                print(f"  {'#':<5} {'VLAN':<7} {'EPG':<30} {'Tenant':<12} {'Path Type'}")
+                print(f"  {'-' * 80}")
                 for idx, b_ex in enumerate(existing, 1):
-                    print(f"  [{idx:<3}] {b_ex.get('vlan', '?'):<7} {b_ex.get('epg', '?'):<35} {b_ex.get('tenant', '?'):<12} {b_ex.get('app_profile', '?')}")
-                print(f"  {'-' * 70}")
+                    tdn = b_ex.get('tDn', b_ex.get('dn', ''))
+                    if 'protpaths' in tdn:
+                        ptype = "VPC"
+                    else:
+                        ptype = "Individual"
+                    print(f"  [{idx:<3}] {b_ex.get('vlan', '?'):<7} {b_ex.get('epg', '?'):<30} {b_ex.get('tenant', '?'):<12} {ptype}")
+                    if debug:
+                        print(f"         tDn: {tdn}")
+                print(f"  {'-' * 80}")
                 
                 print(f"\n  [A] Select ALL bindings")
                 print(f"  [N] Select NONE (skip this port)")
@@ -836,12 +887,14 @@ def main():
                     except Exception:
                         ok = False
                     
+                    tdn = b_del.get('tDn', b_del.get('dn', ''))
+                    ptype = "VPC" if 'protpaths' in tdn else "Indiv"
                     status = "[DELETED]" if ok else "[FAIL]"
-                    print(f"    {status} VLAN {b_del.get('vlan', '?')} — {b_del.get('epg', '?')} ({b_del.get('tenant', '?')})")
+                    print(f"    {status} VLAN {b_del.get('vlan', '?')} — {b_del.get('epg', '?')} ({b_del.get('tenant', '?')}) [{ptype}]")
+                    if not ok:
+                        print(f"           DN: {b_del.get('dn', '?')[:80]}")
                     if ok:
                         overwrite_deleted += 1
-                    else:
-                        print(f"           DN: {b_del.get('dn', '?')[:80]}")
                 
                 # Verify port is clean after deletion
                 time.sleep(1)
@@ -893,6 +946,11 @@ def main():
             _dp_count = sum(1 for x in deploy_list if (x['switch'], x['port']) == _dp_key)
             print(f"\n  {'-' * 60}")
             print(f"  {b['switch']} port {b['port']} — {_dp_count} binding(s)")
+            # Show deploy path
+            if 'protpaths' in b['path_dn']:
+                print(f"  *** VPC: {b['path_dn'].split('pathep-[')[-1].rstrip(']')} ***")
+            else:
+                print(f"  *** Individual: {b['path_dn'].split('pathep-[')[-1].rstrip(']')} ***")
             print(f"  {'-' * 60}")
         
         session = sessions[b['env']]
