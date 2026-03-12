@@ -1582,7 +1582,7 @@ def main():
                     
                     # Use merged dual-strategy query from port_utils
                     ow_existing = query_all_bindings_on_port(
-                        session, apic_url, node_id, dep['port'],
+                        session, apic_url, config['node_id'], config['interface'],
                         POD_ID, tenants=TENANTS.get(env, [])
                     )
                     
@@ -1629,7 +1629,7 @@ def main():
                         
                         _time.sleep(1)
                         v_bindings = query_all_bindings_on_port(
-                            session, apic_url, node_id, dep['port'],
+                            session, apic_url, config['node_id'], config['interface'],
                             POD_ID, tenants=TENANTS.get(env, []), verbose=False
                         )
                         if not v_bindings:
