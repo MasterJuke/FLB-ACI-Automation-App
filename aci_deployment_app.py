@@ -1427,6 +1427,9 @@ def run_script_thread(script_path, csv_path):
                                 except:
                                     pass
 
+                        # Build recent output context for auto-inject detection
+                        recent_5 = [r.lower() for r in current_run["output_lines"][-5:]]
+
                         # AUTO-POLICY GROUP MODE SELECTION
                         # Detects "POLICY GROUP MODE" prompt and auto-injects from settings
                         is_pg_mode = any('policy group mode' in r for r in recent_5)
@@ -1466,7 +1469,6 @@ def run_script_thread(script_path, csv_path):
                         # AUTO-EPG MODE SELECTION
                         # Detects "EPG BINDING MODE" or "EPG MODE" in recent output and
                         # auto-injects "3" (overwrite all) or "1" (add) based on settings.
-                        recent_5 = [r.lower() for r in current_run["output_lines"][-5:]]
                         is_epg_mode = any('epg binding mode' in r or 'epg mode' in r for r in recent_5)
                         if is_epg_mode and ('(1/2' in tl or 'select mode' in tl) and tl.endswith(':'):
                             cfg = load_config()
