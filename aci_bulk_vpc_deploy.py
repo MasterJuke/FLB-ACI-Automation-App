@@ -275,7 +275,7 @@ def set_port_description(session, apic_url, node_id, interface, description):
     }
     try:
         response = session.post(
-            f"{apic_url}/api/mo/topology/pod-{POD_ID}/node-{node_id}/sys/phys-[{interface}].json",
+            f"{apic_url}/api/node/mo/topology/pod-{POD_ID}/node-{node_id}/sys/phys-[{interface}].json",
             json=payload, verify=False, timeout=30
         )
         return response.status_code == 200, response.text
@@ -432,69 +432,73 @@ def run_preflight_checks(sessions, deployments):
         global_settings["int_profiles"][env] = {}
         all_profiles = get_interface_profiles(session, apic_url)
         
-        print(f"\n    Checking Interface Profiles for {len(data['node_pairs'])} node pair(s)...")
-        
-        for node1, node2 in sorted(data['node_pairs']):
-            pair_key = f"{node1}-{node2}"
-            print(f"\n      Looking for profile matching '{pair_key}'...")
+        if data["node_pairs"]:
+            print(f"\n    Finding Interface Profiles for {len(data['node_pairs'])} node pair(s)...")
             
-            found_profile = find_interface_profile_for_nodes(all_profiles, node1, node2)
+            # Auto-resolve all node pairs first
+            for node1, node2 in sorted(data['node_pairs']):
+                pair_key = f"{node1}-{node2}"
+                found_profile = find_interface_profile_for_nodes(all_profiles, node1, node2)
+                global_settings["int_profiles"][env][pair_key] = found_profile
             
-            if found_profile:
-                print(f"        [FOUND] {found_profile}")
+            # Show all resolved profiles in one table
+            print(f"\n    Resolved Interface Profiles:")
+            print("    " + "-" * 55)
+            resolved = global_settings["int_profiles"][env]
+            for i, (pk, prof) in enumerate(sorted(resolved.items()), 1):
+                status = prof if prof else "[NOT FOUND]"
+                print(f"    [{i}] Nodes {pk}: {status}")
+            print("    " + "-" * 55)
+            
+            # Single confirmation prompt
+            while True:
+                choice = prompt_input("\n    Accept all? (Y to confirm, or enter number to change): ").strip()
                 
-                # Confirm or allow change
-                confirm = prompt_input(f"        Use this profile for all {pair_key} VPCs? (yes/no): ").strip().lower()
+                if choice.upper() in ['Y', 'YES', '']:
+                    missing = [pk for pk, prof in resolved.items() if not prof]
+                    if missing:
+                        print(f"    [WARNING] {len(missing)} node pair(s) have no profile — their VPCs will be skipped")
+                    break
                 
-                if confirm in ['yes', 'y']:
-                    global_settings["int_profiles"][env][pair_key] = found_profile
-                else:
-                    # Show all profiles to select
-                    print(f"\n    Available Interface Profiles:")
-                    print("    " + "-" * 50)
-                    for i, p in enumerate(all_profiles, 1):
-                        marker = " <-- suggested" if p == found_profile else ""
-                        print(f"    [{i:>3}] {p}{marker}")
-                    print("    " + "-" * 50)
-                    
-                    while True:
-                        choice = prompt_input(f"\n    Select profile for {pair_key} (or 'S' to skip): ").strip().upper()
-                        if choice == 'S':
-                            global_settings["int_profiles"][env][pair_key] = None
-                            print(f"        [SKIP] VPCs with nodes {pair_key} will be skipped")
-                            break
-                        try:
-                            idx = int(choice) - 1
-                            if 0 <= idx < len(all_profiles):
-                                global_settings["int_profiles"][env][pair_key] = all_profiles[idx]
-                                print(f"        [SELECTED] {all_profiles[idx]}")
+                try:
+                    idx = int(choice) - 1
+                    sorted_pairs = sorted(resolved.keys())
+                    if 0 <= idx < len(sorted_pairs):
+                        edit_pair = sorted_pairs[idx]
+                        print(f"\n    Available Interface Profiles:")
+                        print("    " + "-" * 50)
+                        for pi, p in enumerate(all_profiles, 1):
+                            current = " <-- current" if p == resolved.get(edit_pair) else ""
+                            print(f"    [{pi:>3}] {p}{current}")
+                        print("    " + "-" * 50)
+                        
+                        while True:
+                            pc = prompt_input(f"\n    Select profile for {edit_pair} (or 'S' to skip): ").strip().upper()
+                            if pc == 'S':
+                                resolved[edit_pair] = None
+                                print(f"    [SKIP] VPCs with nodes {edit_pair} will be skipped")
                                 break
-                        except ValueError:
-                            pass
-                        print("    [ERROR] Invalid selection")
-            else:
-                print(f"        [NOT FOUND] No profile matching '{pair_key}'")
-                print(f"\n    Available Interface Profiles:")
-                print("    " + "-" * 50)
-                for i, p in enumerate(all_profiles, 1):
-                    print(f"    [{i:>3}] {p}")
-                print("    " + "-" * 50)
-                
-                while True:
-                    choice = prompt_input(f"\n    Select profile for {pair_key} (or 'S' to skip): ").strip().upper()
-                    if choice == 'S':
-                        global_settings["int_profiles"][env][pair_key] = None
-                        print(f"        [SKIP] VPCs with nodes {pair_key} will be skipped")
-                        break
-                    try:
-                        idx = int(choice) - 1
-                        if 0 <= idx < len(all_profiles):
-                            global_settings["int_profiles"][env][pair_key] = all_profiles[idx]
-                            print(f"        [SELECTED] {all_profiles[idx]}")
-                            break
-                    except ValueError:
-                        pass
-                    print("    [ERROR] Invalid selection")
+                            try:
+                                pi2 = int(pc) - 1
+                                if 0 <= pi2 < len(all_profiles):
+                                    resolved[edit_pair] = all_profiles[pi2]
+                                    print(f"    [UPDATED] Nodes {edit_pair}: {all_profiles[pi2]}")
+                                    break
+                            except ValueError:
+                                pass
+                            print("    [ERROR] Invalid selection")
+                        
+                        # Re-show the table
+                        print(f"\n    Resolved Interface Profiles:")
+                        print("    " + "-" * 55)
+                        for ri, (pk, prof) in enumerate(sorted(resolved.items()), 1):
+                            status = prof if prof else "[NOT FOUND]"
+                            print(f"    [{ri}] Nodes {pk}: {status}")
+                        print("    " + "-" * 55)
+                    else:
+                        print("    [ERROR] Invalid number")
+                except ValueError:
+                    print("    [ERROR] Enter Y to accept or a number to edit")
         
         # 3. Select Link Level Policies by Speed
         global_settings["link_level"][env] = {}
@@ -888,7 +892,8 @@ def load_vpc_csv(filename):
                     "switch2": normalized.get("SWITCH2", ""),
                     "speed": normalized.get("SPEED", "").upper(),
                     "vlans": normalized.get("VLANS", ""),
-                    "work_order": normalized.get("WORKORDER", "")
+                    "work_order": normalized.get("WORKORDER", ""),
+                    "port": parse_interface(normalized.get("PORTS", normalized.get("PORT", "")))
                 })
             return deployments
     except FileNotFoundError:
@@ -1079,7 +1084,18 @@ def main():
             break
     dry_run = (mode_choice == '2')
     
-    # Select Flow Control
+    # Load settings from webapp config (auto-select modes)
+    _web_settings = {}
+    try:
+        import json as _json
+        _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'aci_config.json')
+        if os.path.exists(_cfg_path):
+            with open(_cfg_path, 'r', encoding='utf-8') as _cf:
+                _web_settings = _json.load(_cf)
+    except:
+        pass
+    
+    # Select Flow Control (always prompted — no common default)
     print("\n" + "-" * 70)
     print(" FLOW CONTROL")
     print("-" * 70)
@@ -1097,61 +1113,68 @@ def main():
             flow_control = "FLOW-CONTROL-ON"
             break
     
-    # Policy Group Mode
-    print("\n" + "-" * 70)
-    print(" POLICY GROUP MODE")
-    print("-" * 70)
-    print("\n  [1] Create NEW policy group per deployment (default)")
-    print("  [2] Reuse EXISTING policy group (query by link level)")
-    
-    while True:
-        pg_mode_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
-        if pg_mode_choice in ["", "1", "2"]:
-            break
-    reuse_pg_mode = (pg_mode_choice == '2')
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # Policy Group Mode
-    
-    # When PG already exists with same name
-    pg_exists_always_use = True
-    if not reuse_pg_mode:
+    # Policy Group Mode — from settings or prompt
+    _pg_mode_setting = _web_settings.get('pg_mode', '')
+    if _pg_mode_setting == 'reuse':
+        reuse_pg_mode = True
+        print(f"\n  [SETTINGS] Policy Group Mode: Reuse Existing")
+    elif _pg_mode_setting == 'create':
+        reuse_pg_mode = False
+        print(f"\n  [SETTINGS] Policy Group Mode: Create New")
+    else:
         print("\n" + "-" * 70)
-        print(" WHEN POLICY GROUP NAME ALREADY EXISTS")
+        print(" POLICY GROUP MODE")
         print("-" * 70)
-        print("\n  [1] Always use existing policy group (default)")
-        print("  [2] Ask each time")
-        pg_exists_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
-        pg_exists_always_use = (pg_exists_choice != '2')
+        print("\n  [1] Create NEW policy group per deployment (default)")
+        print("  [2] Reuse EXISTING policy group (query by link level)")
+        
+        while True:
+            pg_mode_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
+            if pg_mode_choice in ["", "1", "2"]:
+                break
+        reuse_pg_mode = (pg_mode_choice == '2')
     
-    # EPG Binding Mode
-    print("\n" + "-" * 70)
-    print(" EPG BINDING MODE")
-    print("-" * 70)
-    print("\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
-    print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
-    print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
-    epg_mode_choice = prompt_input("\nSelect (1/2/3) [default=1]: ").strip()
-    overwrite_mode = epg_mode_choice in ['2', '3']
-    overwrite_interactive = (epg_mode_choice == '2')
-    overwrite_auto = (epg_mode_choice == '3')
-    if overwrite_mode:
-        print("\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
+    # When PG already exists — from settings or prompt
+    _pg_exists_setting = _web_settings.get('pg_exists_action', '')
+    if _pg_exists_setting == 'always_use':
+        pg_exists_always_use = True
+        if not reuse_pg_mode:
+            print(f"  [SETTINGS] PG Name Exists: Always Use Existing")
+    elif _pg_exists_setting == 'ask':
+        pg_exists_always_use = False
+        if not reuse_pg_mode:
+            print(f"  [SETTINGS] PG Name Exists: Ask Each Time")
+    else:
+        pg_exists_always_use = True
+        if not reuse_pg_mode:
+            print("\n" + "-" * 70)
+            print(" WHEN POLICY GROUP NAME ALREADY EXISTS")
+            print("-" * 70)
+            print("\n  [1] Always use existing policy group (default)")
+            print("  [2] Ask each time")
+            pg_exists_choice = prompt_input("\nSelect (1/2) [default=1]: ").strip()
+            pg_exists_always_use = (pg_exists_choice != '2')
+    
+    # EPG Binding Mode — from settings or prompt
+    _epg_ow_setting = _web_settings.get('epg_overwrite_default', False)
+    if os.environ.get('ACI_WEB_UI') == '1' and _epg_ow_setting:
+        overwrite_mode = True
+        overwrite_interactive = False
+        overwrite_auto = True
+        print(f"  [SETTINGS] EPG Binding Mode: Overwrite ALL")
+    else:
+        print("\n" + "-" * 70)
+        print(" EPG BINDING MODE")
+        print("-" * 70)
+        print("\n  [1] Add - Deploy new EPG bindings (keep existing on each port)")
+        print("  [2] Overwrite - Show existing EPGs, choose which to delete first")
+        print("  [3] Overwrite ALL - Automatically remove ALL existing EPG bindings first")
+        epg_mode_choice = prompt_input("\nSelect (1/2/3) [default=1]: ").strip()
+        overwrite_mode = epg_mode_choice in ['2', '3']
+        overwrite_interactive = (epg_mode_choice == '2')
+        overwrite_auto = (epg_mode_choice == '3')
+        if overwrite_mode:
+            print("\n  [OVERWRITE] Existing EPG bindings will be wiped before deploying on every port")
     
     # Get credentials
     print("\n" + "-" * 70)
@@ -1285,33 +1308,60 @@ def main():
         avail_common = sum(1 for p in common_ports if p['valid'])
         print(f"    Common: {len(common_ports)} total ({avail_common} available on both)")
         
-        # Port selection mode
-        print(f"\n  Port Selection Mode:")
-        print(f"    [1] Same port on both switches (common ports)")
-        print(f"    [2] Different port on each switch (independent)")
-        port_mode = prompt_input("\n  Select (1/2) [default=1]: ").strip()
+        # Check if CSV has a port specified
+        csv_port = dep.get('port', '').strip()
         
-        asymmetric_vpc = False
-        selected_port2 = None
+        if csv_port:
+            # CSV has port — auto-select from common ports
+            matched_port = None
+            for p in common_ports:
+                if p['interface'] == csv_port:
+                    matched_port = p
+                    break
+            
+            if matched_port:
+                selected_port = matched_port
+                selected_port2 = None
+                asymmetric_vpc = False
+                print(f"\n  [CSV] Auto-selected port {csv_port} from CSV")
+                if not matched_port['valid']:
+                    print(f"  [WARNING] Port {csv_port} is IN-USE — will override existing config")
+                    for issue in matched_port.get('issues', []):
+                        print(f"    - {issue}")
+            else:
+                print(f"\n  [WARNING] Port {csv_port} from CSV not found in common ports")
+                print(f"  Falling back to manual selection...")
+                csv_port = ""  # Fall through to manual selection
         
-        if port_mode == '2':
-            # Independent selection — different port per switch
-            selected_port, selected_port2 = display_vpc_independent_port_selection(
-                ports1, ports2, node1, node2
-            )
-            if selected_port is None or selected_port2 is None:
-                print(f"  [SKIPPED by user]")
-                skipped += 1
-                continue
-            asymmetric_vpc = (selected_port['interface'] != selected_port2['interface'])
-        else:
-            # Same port mode — use common ports
-            if not common_ports:
-                print(f"  [SKIP] No common ports found on both switches")
-                print(f"  [TIP] Try mode 2 for independent port selection")
-                skipped += 1
-                continue
-            selected_port = display_vpc_port_selection(common_ports, node1, node2)
+        if not csv_port:
+            # No port in CSV or CSV port not found — interactive selection
+            # Port selection mode
+            print(f"\n  Port Selection Mode:")
+            print(f"    [1] Same port on both switches (common ports)")
+            print(f"    [2] Different port on each switch (independent)")
+            port_mode = prompt_input("\n  Select (1/2) [default=1]: ").strip()
+            
+            asymmetric_vpc = False
+            selected_port2 = None
+            
+            if port_mode == '2':
+                # Independent selection — different port per switch
+                selected_port, selected_port2 = display_vpc_independent_port_selection(
+                    ports1, ports2, node1, node2
+                )
+                if selected_port is None or selected_port2 is None:
+                    print(f"  [SKIPPED by user]")
+                    skipped += 1
+                    continue
+                asymmetric_vpc = (selected_port['interface'] != selected_port2['interface'])
+            else:
+                # Same port mode — use common ports
+                if not common_ports:
+                    print(f"  [SKIP] No common ports found on both switches")
+                    print(f"  [TIP] Try mode 2 for independent port selection")
+                    skipped += 1
+                    continue
+                selected_port = display_vpc_port_selection(common_ports, node1, node2)
         if selected_port == "SKIP":
             skipped += 1
             continue
