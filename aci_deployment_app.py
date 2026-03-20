@@ -65,7 +65,9 @@ DEFAULT_CONFIG = {
     "default_epgdelete_csv": "epg_delete.csv",
     "auto_select_port": True,
     "epg_overwrite_default": False,
-    "version": "1.3.0"
+    "pg_mode": "",
+    "pg_exists_action": "",
+    "version": "1.4.0"
 }
 
 TIME_ESTIMATES = {
@@ -1425,6 +1427,42 @@ def run_script_thread(script_path, csv_path):
                                 except:
                                     pass
 
+                        # AUTO-POLICY GROUP MODE SELECTION
+                        # Detects "POLICY GROUP MODE" prompt and auto-injects from settings
+                        is_pg_mode = any('policy group mode' in r for r in recent_5)
+                        if is_pg_mode and ('(1/2' in tl or 'select' in tl) and tl.endswith(':'):
+                            cfg = load_config()
+                            pg_setting = cfg.get('pg_mode', '')
+                            if pg_setting:
+                                pg_val = '2' if pg_setting == 'reuse' else '1'
+                                pg_label = 'Reuse Existing' if pg_setting == 'reuse' else 'Create New'
+                                time.sleep(0.1)
+                                try:
+                                    running_process.stdin.write((pg_val + '\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    output_queue.put(('output', f'[AUTO] Policy Group Mode: {pg_label} (from settings)'))
+                                    current_run["output_lines"].append(f'[AUTO] PG Mode: {pg_label}')
+                                except:
+                                    pass
+
+                        # AUTO-PG EXISTS ACTION
+                        # Detects "WHEN POLICY GROUP NAME ALREADY EXISTS" prompt
+                        is_pg_exists = any('already exists' in r or 'policy group name already' in r for r in recent_5)
+                        if is_pg_exists and ('(1/2' in tl or 'select' in tl) and tl.endswith(':'):
+                            cfg = load_config()
+                            pg_exists_setting = cfg.get('pg_exists_action', '')
+                            if pg_exists_setting:
+                                pe_val = '2' if pg_exists_setting == 'ask' else '1'
+                                pe_label = 'Ask Each Time' if pg_exists_setting == 'ask' else 'Always Use Existing'
+                                time.sleep(0.1)
+                                try:
+                                    running_process.stdin.write((pe_val + '\n').encode('utf-8'))
+                                    running_process.stdin.flush()
+                                    output_queue.put(('output', f'[AUTO] PG Exists Action: {pe_label} (from settings)'))
+                                    current_run["output_lines"].append(f'[AUTO] PG Exists: {pe_label}')
+                                except:
+                                    pass
+
                         # AUTO-EPG MODE SELECTION
                         # Detects "EPG BINDING MODE" or "EPG MODE" in recent output and
                         # auto-injects "3" (overwrite all) or "1" (add) based on settings.
@@ -1940,6 +1978,24 @@ body{font-family:'IBM Plex Sans',-apple-system,sans-serif;background:var(--bg-da
   </div>
   <span class="toggle-badge {% if config.epg_overwrite_default %}on{% else %}off{% endif %}" id="epgOverwriteBadge">{% if config.epg_overwrite_default %}ON{% else %}OFF{% endif %}</span>
 </label>
+</div>
+<div class="settings-row">
+  <label class="settings-label">Policy Group Mode</label>
+  <select id="settingsPgMode" class="settings-input" style="max-width:280px">
+    <option value="" {% if not config.pg_mode %}selected{% endif %}>Prompt each time</option>
+    <option value="create" {% if config.pg_mode == 'create' %}selected{% endif %}>Create New (default)</option>
+    <option value="reuse" {% if config.pg_mode == 'reuse' %}selected{% endif %}>Reuse Existing</option>
+  </select>
+  <div style="font-size:10px;color:var(--text-dim);margin-top:2px">Skip the Policy Group Mode prompt — auto-selects Create New or Reuse Existing. VPC + Static Port scripts.</div>
+</div>
+<div class="settings-row">
+  <label class="settings-label">PG Name Already Exists</label>
+  <select id="settingsPgExists" class="settings-input" style="max-width:280px">
+    <option value="" {% if not config.pg_exists_action %}selected{% endif %}>Prompt each time</option>
+    <option value="always_use" {% if config.pg_exists_action == 'always_use' %}selected{% endif %}>Always Use Existing (default)</option>
+    <option value="ask" {% if config.pg_exists_action == 'ask' %}selected{% endif %}>Ask Each Time</option>
+  </select>
+  <div style="font-size:10px;color:var(--text-dim);margin-top:2px">When creating a new PG but the name already exists. VPC + Static Port scripts.</div>
 </div>
 </div>
 <div class="settings-section"><div class="settings-section-title">ℹ️ Application Info</div><div class="settings-row"><label class="settings-label">Version</label><input type="text" class="settings-input" id="settingsVersion" value="{{ config.version }}"></div></div>
@@ -2465,6 +2521,8 @@ function saveSettings(){
     epgdelete_script:document.getElementById('settingsEpgdeleteScript').value,
     auto_select_port:document.getElementById('settingsAutoSelectPort').checked,
     epg_overwrite_default:document.getElementById('settingsEpgOverwrite').checked,
+    pg_mode:document.getElementById('settingsPgMode').value,
+    pg_exists_action:document.getElementById('settingsPgExists').value,
     version:document.getElementById('settingsVersion').value
   };
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
