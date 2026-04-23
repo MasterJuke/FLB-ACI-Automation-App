@@ -17,6 +17,7 @@ Features:
 - Asymmetric VPC port selection (different port per switch)
 - Existing policy group query & reuse (query by link level + AEP)
 - Port binding query & overwrite (query/delete all fvRsPathAtt on a port)
+- Datacenter selection at startup (select_datacenters)
 
 CCIE Automation Exam Relevance:
 - ACI REST API queries (l1PhysIf, infraPortBlk, fvRsPathAtt)
@@ -36,11 +37,12 @@ Usage:
         cleanup_port_for_redeployment, cleanup_vpc_port_for_redeployment,
         query_existing_access_policy_groups, query_existing_vpc_policy_groups,
         display_policy_group_selection,
-        query_all_bindings_on_port, delete_all_bindings_on_port
+        query_all_bindings_on_port, delete_all_bindings_on_port,
+        select_datacenters
     )
 
 Author: Network Automation
-Version: 1.6.0 — Aggressive token refresh (120s threshold), safe_get/safe_delete with retry, mid-query checkpoints
+Version: 1.7.0 — Added select_datacenters() for runtime DC scoping
 """
 
 import os
@@ -805,43 +807,23 @@ def display_vpc_independent_port_selection(ports1, ports2, node1, node2):
     return port1, port2
 
 
-
-# When a user selects a red [IN-USE] port, these functions wipe all existing
-# configuration so the fresh deployment proceeds with zero conflicts.
-#
-# CCIE Automation Note:
-# This is the reverse of the deployment stack. Deployment creates objects
-# bottom-up (PG → selector → bindings), cleanup deletes top-down
-# (bindings → selector → PG). Understanding this ordering is critical
-# for the ACI programmability exam — deleting a selector before its
-# bindings would leave orphaned fvRsPathAtt objects in the fabric.
-#
-# The multi-tier rollback extends this: before deleting the old state,
-# we capture it as structured [ROLLBACK:STATE] markers in stdout. The
-# web UI parses these markers to build a rollback script that can both
-# DELETE new objects AND RESTORE the previous configuration. This is
-# analogous to ACI's config snapshot/rollback (configSnapshot +
-# configImportP) but at the individual port level.
+# =============================================================================
+# PORT CLEANUP FOR REDEPLOYMENT
+# =============================================================================
 
 import json as _json
 
 def emit_rollback_state(state_dict):
     """
     Print a structured state marker that the rollback generator can parse.
-    
+
     Format: [ROLLBACK:STATE] {"type":"binding","vlan":"32",...}
-    
-    The web UI collects these markers from terminal output and uses them
-    to generate restore actions in the rollback script.
     """
     print(f"[ROLLBACK:STATE] {_json.dumps(state_dict, separators=(',', ':'))}")
 
 
 def capture_port_description(session, apic_url, node_id, port, pod_id="1"):
-    """
-    Query the current port description from l1PhysIf.
-    Returns the description string, or empty string if none/error.
-    """
+    """Query the current port description from l1PhysIf."""
     eth = f"eth{port}" if not port.startswith("eth") else port
     url = (f"{apic_url}/api/mo/topology/pod-{pod_id}/node-{node_id}"
            f"/sys/phys-[{eth}].json")
@@ -857,10 +839,7 @@ def capture_port_description(session, apic_url, node_id, port, pod_id="1"):
 
 
 def capture_selector_policy_group(session, apic_url, interface_profile, selector_name):
-    """
-    Query the policy group DN that a port selector points to.
-    Returns (pg_name, pg_type) where pg_type is 'vpc' or 'access', or (None, None).
-    """
+    """Query the policy group DN that a port selector points to."""
     url = (f"{apic_url}/api/mo/uni/infra/accportprof-{interface_profile}"
            f"/hports-{selector_name}-typ-range.json"
            f"?query-target=children&target-subtree-class=infraRsAccBaseGrp")
@@ -882,22 +861,13 @@ def capture_selector_policy_group(session, apic_url, interface_profile, selector
 
 def capture_and_emit_port_state(session, apic_url, node_id, interface,
                                  interface_profile, pod_id="1", node2=None):
-    """
-    Capture the full state of a port BEFORE cleanup/overwrite and emit
-    [ROLLBACK:STATE] markers for each component.
-    
-    Captures: description, EPG bindings, selector name, policy group name.
-    For VPC (node2 provided): captures both node descriptions and VPC bindings.
-    
-    Returns the captured state dict for optional local use.
-    """
+    """Capture the full state of a port BEFORE cleanup and emit [ROLLBACK:STATE] markers."""
     state = {"bindings": [], "description": "", "description2": "",
              "selector": None, "policy_group": None, "pg_type": None}
-    
+
     eth_iface = f"eth{interface}" if not interface.startswith("eth") else interface
     port_num = interface.split('/')[-1]
-    
-    # --- Capture description(s) ---
+
     desc = capture_port_description(session, apic_url, node_id, interface, pod_id)
     state["description"] = desc
     if desc:
@@ -905,7 +875,7 @@ def capture_and_emit_port_state(session, apic_url, node_id, interface,
             "type": "description", "node": str(node_id),
             "port": interface, "value": desc
         })
-    
+
     if node2:
         desc2 = capture_port_description(session, apic_url, node2, interface, pod_id)
         state["description2"] = desc2
@@ -914,8 +884,7 @@ def capture_and_emit_port_state(session, apic_url, node_id, interface,
                 "type": "description", "node": str(node2),
                 "port": interface, "value": desc2
             })
-    
-    # --- Capture EPG bindings (individual path) ---
+
     bindings = query_all_bindings_on_port(session, apic_url, node_id, interface, pod_id)
     for b in bindings:
         state["bindings"].append(b)
@@ -926,11 +895,9 @@ def capture_and_emit_port_state(session, apic_url, node_id, interface,
             "mode": b.get("mode", "regular"),
             "path_type": "individual"
         })
-    
-    # --- Capture VPC bindings (protpaths) if VPC ---
+
     if node2:
         n1, n2 = (str(node_id), str(node2)) if int(node_id) < int(node2) else (str(node2), str(node_id))
-        # Find old VPC PG first to query protpath bindings
         try:
             url = (f"{apic_url}/api/class/infraPortBlk.json"
                    f"?query-target-filter=and("
@@ -955,7 +922,6 @@ def capture_and_emit_port_state(session, apic_url, node_id, interface,
                                     "profile": interface_profile, "port": interface,
                                     "policy_group": pg_name, "pg_type": pg_type or "vpc"
                                 })
-                                # Query VPC protpath bindings
                                 vpc_path = f"topology/pod-{pod_id}/protpaths-{n1}-{n2}/pathep-[{pg_name}]"
                                 vpc_url = (f"{apic_url}/api/class/fvRsPathAtt.json"
                                            f"?query-target-filter=eq(fvRsPathAtt.tDn,\"{vpc_path}\")")
@@ -986,7 +952,6 @@ def capture_and_emit_port_state(session, apic_url, node_id, interface,
         except Exception:
             pass
     else:
-        # Individual port — find selector and PG
         try:
             url = (f"{apic_url}/api/class/infraPortBlk.json"
                    f"?query-target-filter=and("
@@ -1013,14 +978,15 @@ def capture_and_emit_port_state(session, apic_url, node_id, interface,
                             })
         except Exception:
             pass
-    
+
     binding_count = len(state["bindings"])
     if state.get("selector") or binding_count > 0 or state.get("description"):
         print(f"    [STATE] Captured before-state: {binding_count} binding(s), "
               f"selector={state.get('selector', 'none')}, "
               f"desc={'yes' if state.get('description') else 'none'}")
-    
+
     return state
+
 
 def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
                                    interface_profile, pod_id="1"):
@@ -1032,10 +998,6 @@ def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
       2. Port selector (infraHPortS) on the interface profile for this port
       3. Clears the port description (l1PhysIf.descr)
 
-    The policy group (infraAccPortGrp) is left in place — ACI's POST is
-    idempotent for policy groups so step 2 of deployment will simply
-    update the existing PG if the name matches, or create a new one.
-
     Returns dict: {bindings_deleted, selector_deleted, description_cleared, old_selector}
     """
     results = {
@@ -1045,7 +1007,6 @@ def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
         "old_selector": None
     }
 
-    # --- Capture before-state for multi-tier rollback ---
     print(f"    [CAPTURE] Saving port state before cleanup...")
     capture_and_emit_port_state(session, apic_url, node_id, interface,
                                  interface_profile, pod_id)
@@ -1069,7 +1030,6 @@ def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
                     )
                     if del_resp.status_code == 200:
                         results["bindings_deleted"] += 1
-                        # Extract EPG name for logging
                         epg_match = re.search(r'/epg-([^/]+)/', dn)
                         vlan_match = re.search(r'vlan-(\d+)', item.get("fvRsPathAtt", {}).get("attributes", {}).get("encap", ""))
                         epg_name = epg_match.group(1) if epg_match else "?"
@@ -1088,7 +1048,6 @@ def cleanup_port_for_redeployment(session, apic_url, node_id, interface,
         if resp.status_code == 200:
             for item in resp.json().get("imdata", []):
                 dn = item.get("infraPortBlk", {}).get("attributes", {}).get("dn", "")
-                # Match only the port block on OUR interface profile
                 if interface_profile in dn:
                     sel_match = re.search(r'hports-(.+?)-typ-range', dn)
                     if sel_match:
@@ -1129,13 +1088,6 @@ def cleanup_vpc_port_for_redeployment(session, apic_url, node1, node2, interface
 
     Handles both individual-path and protpaths (VPC) bindings.
 
-    Deletes in order:
-      1a. ALL fvRsPathAtt on individual paths for BOTH nodes
-      1b. ALL fvRsPathAtt on protpaths (VPC) — discovers old VPC PG name
-          from the existing port selector's infraRsAccBaseGrp
-      2.  Port selector on the VPC interface profile
-      3.  Clears port description on both nodes
-
     Returns dict with cleanup counts.
     """
     results = {
@@ -1146,7 +1098,6 @@ def cleanup_vpc_port_for_redeployment(session, apic_url, node1, node2, interface
         "old_vpc_pg": None
     }
 
-    # --- Capture before-state for multi-tier rollback ---
     print(f"    [CAPTURE] Saving VPC port state before cleanup...")
     capture_and_emit_port_state(session, apic_url, node1, interface,
                                  interface_profile, pod_id, node2=node2)
@@ -1192,7 +1143,6 @@ def cleanup_vpc_port_for_redeployment(session, apic_url, node1, node2, interface
                     if sel_match:
                         selector_name = sel_match.group(1)
                         results["old_selector"] = selector_name
-                        # Query the port selector to find its policy group (accbundle)
                         sel_url = (f"{apic_url}/api/mo/uni/infra/accportprof-"
                                    f"{interface_profile}/hports-{selector_name}-typ-range.json"
                                    f"?query-target=children&target-subtree-class=infraRsAccBaseGrp")
@@ -1207,9 +1157,7 @@ def cleanup_vpc_port_for_redeployment(session, apic_url, node1, node2, interface
     except Exception as e:
         print(f"    [WARNING] Error discovering old VPC PG: {e}")
 
-    # Delete VPC protpaths bindings using discovered PG name
     if old_vpc_pg:
-        # Ensure consistent node ordering for protpaths
         n1, n2 = (node1, node2) if int(node1) < int(node2) else (node2, node1)
         vpc_path = f"topology/pod-{pod_id}/protpaths-{n1}-{n2}/pathep-[{old_vpc_pg}]"
         try:
@@ -1274,27 +1222,10 @@ def cleanup_vpc_port_for_redeployment(session, apic_url, node1, node2, interface
 # =============================================================================
 # EXISTING POLICY GROUP QUERY & SELECTION
 # =============================================================================
-# Instead of always creating a new policy group, these functions let the user
-# discover and reuse an existing PG that already has the right link level,
-# AEP, and other policies configured.
-#
-# CCIE Automation Note:
-# This queries the ACI MIT using rsp-subtree=children to retrieve a policy
-# group AND all its child relationship objects (infraRsHIfPol, infraRsAttEntP,
-# infraRsCdpIfPol, etc.) in a single API call. This is the "subtree" query
-# pattern — essential for the APIC REST API section of the exam. Without
-# rsp-subtree, you'd need N+1 queries (one for the PG list, then one per PG
-# to get its children). The subtree approach is O(1) API calls regardless of
-# how many PGs exist.
 
 def query_existing_access_policy_groups(session, apic_url):
     """
-    Query ALL Leaf Access Port Policy Groups (infraAccPortGrp) with their
-    child policy relationships in a single API call.
-
-    Returns list of dicts:
-        [{"name": "PG_NAME", "aep": "AEP_NAME", "link_level": "25G-POLICY",
-          "cdp": "cdp-disabled", "lldp": "lldp-enabled", "dn": "..."}, ...]
+    Query ALL Leaf Access Port Policy Groups with child policies in one API call.
     """
     try:
         url = (f"{apic_url}/api/class/infraAccPortGrp.json"
@@ -1341,13 +1272,7 @@ def query_existing_access_policy_groups(session, apic_url):
 
 def query_existing_vpc_policy_groups(session, apic_url):
     """
-    Query ALL VPC Interface Policy Groups (infraAccBndlGrp with lagT=node)
-    with their child policy relationships in a single API call.
-
-    Returns list of dicts:
-        [{"name": "VPC_PG", "aep": "AEP", "link_level": "25G-POLICY",
-          "cdp": "...", "lldp": "...", "lacp": "...", "mcp": "...",
-          "storm_control": "...", "flow_control": "...", "dn": "..."}, ...]
+    Query ALL VPC Interface Policy Groups with child policies in one API call.
     """
     try:
         url = (f"{apic_url}/api/class/infraAccBndlGrp.json"
@@ -1399,18 +1324,7 @@ def query_existing_vpc_policy_groups(session, apic_url):
 
 
 def filter_policy_groups_by_criteria(policy_groups, link_level=None, aep=None):
-    """
-    Filter policy groups by link level and/or AEP.
-
-    Matching logic:
-      - Exact match on link_level name if provided
-      - Exact match on AEP name if provided
-      - If neither provided, returns all
-
-    Returns (exact_matches, partial_matches):
-      - exact_matches: PGs matching ALL provided criteria
-      - partial_matches: PGs matching link_level only (if AEP also specified)
-    """
+    """Filter policy groups by link level and/or AEP."""
     if not link_level and not aep:
         return policy_groups, []
 
@@ -1430,18 +1344,7 @@ def filter_policy_groups_by_criteria(policy_groups, link_level=None, aep=None):
 
 
 def display_policy_group_selection(policy_groups, pg_type="access", link_level=None, aep=None):
-    """
-    Display matching policy groups and let user select one or create new.
-
-    Args:
-        policy_groups: List of PG dicts from query functions
-        pg_type: "access" or "vpc" (affects display columns)
-        link_level: Current link level for highlighting matches
-        aep: Current AEP for highlighting matches
-
-    Returns:
-        Selected PG name (str), or None if user wants to create new
-    """
+    """Display matching policy groups and let user select one or create new."""
     exact, partial = filter_policy_groups_by_criteria(policy_groups, link_level, aep)
 
     if not exact and not partial:
@@ -1533,33 +1436,14 @@ def display_policy_group_selection(policy_groups, pg_type="access", link_level=N
 # =============================================================================
 # APIC TOKEN REFRESH
 # =============================================================================
-# APIC tokens expire after refreshTimeoutSeconds (default 300s / 5 minutes).
-# In batch deployments with interactive port selection, the token can easily
-# expire between deployments. These helpers keep the session alive.
-#
-# CCIE Automation Note:
-# The APIC uses cookie-based auth (APIC-cookie). On login (aaaLogin), you get
-# a token with a refreshTimeoutSeconds. Before it expires, call aaaRefresh to
-# get a new token. If it already expired, you must re-authenticate via aaaLogin.
-# The exam tests this lifecycle — particularly in scripts that run >5 minutes.
-# Strategy: proactive refresh (check age before each operation) + reactive
-# retry (catch 403 and re-auth). This is the same pattern used in production
-# SDKs like cobra/acitoolkit.
 
 import time as _time
 
-# Default refresh threshold — refresh when this many seconds remain.
-# Set high enough that multi-step operations (Strategy 3 VPC discovery
-# can make 5-10 API calls per port) don't run out mid-query.
 TOKEN_REFRESH_THRESHOLD = 120  # seconds
 
 
 def refresh_apic_token(session, apic_url):
-    """
-    Refresh APIC token via /api/aaaRefresh.json.
-    
-    Returns new token lifetime (seconds) on success, None on failure.
-    """
+    """Refresh APIC token via /api/aaaRefresh.json."""
     try:
         resp = session.get(f"{apic_url}/api/aaaRefresh.json", verify=False, timeout=30)
         if resp.status_code == 200:
@@ -1574,23 +1458,13 @@ def refresh_apic_token(session, apic_url):
 
 
 def ensure_token_fresh(session, apic_url, token_state):
-    """
-    Check token age and refresh proactively if needed.
-    
-    token_state is a mutable dict: {"login_time": float, "lifetime": int}
-    Call this before each deployment iteration to prevent 403 errors.
-    
-    Uses TOKEN_REFRESH_THRESHOLD (120s) — aggressive enough to survive
-    Strategy 3 VPC discovery which makes 5-10 API calls per port.
-    
-    Returns True if token is fresh, False if refresh failed (caller should re-auth).
-    """
+    """Check token age and refresh proactively if needed."""
     if not token_state:
-        return True  # No state tracked, skip
-    
+        return True
+
     elapsed = _time.time() - token_state.get('login_time', _time.time())
     remaining = token_state.get('lifetime', 300) - elapsed
-    
+
     if remaining < TOKEN_REFRESH_THRESHOLD:
         new_lifetime = refresh_apic_token(session, apic_url)
         if new_lifetime:
@@ -1601,17 +1475,12 @@ def ensure_token_fresh(session, apic_url, token_state):
         else:
             print(f"  [TOKEN] Refresh failed — token may have expired")
             return False
-    
+
     return True
 
 
 def reauth_apic(session, apic_url, username, password, token_state=None):
-    """
-    Full re-authentication to APIC (when refresh fails / token already expired).
-    
-    Updates token_state in-place if provided.
-    Returns True on success, False on failure.
-    """
+    """Full re-authentication to APIC."""
     payload = {"aaaUser": {"attributes": {"name": username, "pwd": password}}}
     try:
         resp = session.post(f"{apic_url}/api/aaaLogin.json", json=payload, verify=False, timeout=30)
@@ -1639,43 +1508,25 @@ def _is_token_invalid(response):
         text = response.text.lower()
         if 'token was invalid' in text or 'not authenticated' in text:
             return True
-    except:
+    except Exception:
         pass
     return False
 
 
 def safe_get(session, apic_url, url, token_state=None, credentials=None,
              timeout=30, verify=False):
-    """
-    Token-aware GET request with automatic refresh and retry.
-    
-    Before each request: checks token age, refreshes proactively if needed.
-    After each request: if 401/403, re-authenticates and retries once.
-    
-    Args:
-        session: requests.Session with APIC auth
-        apic_url: APIC base URL (for refresh/re-auth calls)
-        url: Full URL to GET
-        token_state: Mutable dict {"login_time": float, "lifetime": int}
-        credentials: Dict {"username": str, "password": str} for re-auth
-        timeout: Request timeout in seconds
-        verify: SSL verification
-    
-    Returns: requests.Response (or None on complete failure)
-    """
-    # Proactive refresh before the call
+    """Token-aware GET request with automatic refresh and retry."""
     if token_state:
         if not ensure_token_fresh(session, apic_url, token_state):
             if credentials:
                 reauth_apic(session, apic_url, credentials["username"],
                            credentials["password"], token_state)
-    
+
     try:
         resp = session.get(url, verify=verify, timeout=timeout)
     except Exception:
         return None
-    
-    # Reactive retry: if token was invalid, re-auth and try once more
+
     if _is_token_invalid(resp) and credentials and token_state:
         print(f"  [TOKEN] 401/403 detected mid-query — re-authenticating...")
         if reauth_apic(session, apic_url, credentials["username"],
@@ -1684,27 +1535,24 @@ def safe_get(session, apic_url, url, token_state=None, credentials=None,
                 resp = session.get(url, verify=verify, timeout=timeout)
             except Exception:
                 return None
-    
+
     return resp
 
 
 def safe_delete(session, apic_url, url, token_state=None, credentials=None,
                 timeout=30, verify=False):
-    """
-    Token-aware DELETE request with automatic refresh and retry.
-    Same pattern as safe_get but for DELETE operations.
-    """
+    """Token-aware DELETE request with automatic refresh and retry."""
     if token_state:
         if not ensure_token_fresh(session, apic_url, token_state):
             if credentials:
                 reauth_apic(session, apic_url, credentials["username"],
                            credentials["password"], token_state)
-    
+
     try:
         resp = session.delete(url, verify=verify, timeout=timeout)
     except Exception:
         return None
-    
+
     if _is_token_invalid(resp) and credentials and token_state:
         print(f"  [TOKEN] 401/403 detected mid-delete — re-authenticating...")
         if reauth_apic(session, apic_url, credentials["username"],
@@ -1713,31 +1561,16 @@ def safe_delete(session, apic_url, url, token_state=None, credentials=None,
                 resp = session.delete(url, verify=verify, timeout=timeout)
             except Exception:
                 return None
-    
+
     return resp
 
 
 # =============================================================================
 # EPG BINDING QUERY & OVERWRITE FUNCTIONS
 # =============================================================================
-# Used by EPG Add (overwrite mode) to wipe all existing bindings on a port
-# before deploying new ones. Also reusable by any script that needs to
-# discover what's currently bound to a physical port.
-#
-# CCIE Automation Note:
-# fvRsPathAtt is queried at the CLASS level with a tDn filter — this is
-# a "reverse lookup" pattern. Instead of querying each EPG individually to
-# check if it has a binding to our port (O(N) calls where N = number of EPGs),
-# we query the fvRsPathAtt class globally filtered by the port's path DN.
-# This returns ALL bindings on that port in a SINGLE API call regardless of
-# which tenant/AP/EPG they belong to. The exam tests this pattern heavily.
 
 def _parse_binding_attrs(attrs, seen_dns):
-    """
-    Parse fvRsPathAtt attributes into a binding dict.
-    Returns (binding_dict, is_new) or (None, False) if already seen.
-    Internal helper for query_all_bindings_on_port().
-    """
+    """Parse fvRsPathAtt attributes into a binding dict."""
     dn = attrs.get("dn", "")
     if not dn or dn in seen_dns:
         return None, False
@@ -1761,30 +1594,10 @@ def _parse_binding_attrs(attrs, seen_dns):
 
 def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
                                   verbose=True, token_state=None, credentials=None):
-    """
-    Discover VPC protpaths DN(s) for a physical port.
-
-    A physical port may have bindings deployed via VPC policy groups
-    (protpaths) rather than individual paths. This function:
-      1. Finds the port selector → policy group name for this port
-      2. Checks if it's a VPC bundle (accbundle with lagT="node")
-      3. Finds the VPC peer node via fabricExplicitGEp
-      4. Returns the protpaths DN string(s) to query
-
-    Returns list of protpath DN strings (may be empty if port is individual).
-
-    CCIE Automation Note:
-    In ACI, VPC static path bindings use protpaths-{node1}-{node2} in the
-    tDn, not paths-{node}. The policy group name (e.g. EDCAVIO-ACC-R16_e8.VPC)
-    appears in pathep-[...] rather than the physical eth interface.
-    """
+    """Discover VPC protpaths DN(s) for a physical port."""
     port_num = port.split('/')[-1] if '/' in port else port
     protpath_dns = []
 
-    # ------------------------------------------------------------------
-    # Step 1: Find port selector(s) referencing this port on this node
-    # Query infraPortBlk for matching fromPort/toPort, filter by node_id
-    # ------------------------------------------------------------------
     pg_names = []
     try:
         url = (f"{apic_url}/api/class/infraPortBlk.json"
@@ -1797,9 +1610,6 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
                 if node_id not in blk_dn:
                     continue
 
-                # Walk up from infraPortBlk to parent infraHPortS to find
-                # the associated policy group via infraRsAccBaseGrp
-                # DN format: uni/infra/accportprof-{profile}/hports-{selector}-typ-range/portblk-{block}
                 selector_match = re.search(r'(uni/infra/accportprof-[^/]+/hports-[^/]+-typ-range)', blk_dn)
                 if not selector_match:
                     continue
@@ -1811,8 +1621,6 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
                 if pg_resp.status_code == 200:
                     for pg_item in pg_resp.json().get("imdata", []):
                         tdn = pg_item.get("infraRsAccBaseGrp", {}).get("attributes", {}).get("tDn", "")
-                        # tDn = uni/infra/funcprof/accbundle-{name} for VPC/PC
-                        # tDn = uni/infra/funcprof/accportgrp-{name} for individual
                         bundle_match = re.search(r'accbundle-(.+)$', tdn)
                         if bundle_match:
                             pg_names.append(bundle_match.group(1))
@@ -1826,15 +1634,12 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
     if verbose:
         print(f"  [QUERY] Strategy 3: found {len(pg_names)} VPC/PC policy group(s) on port: {', '.join(pg_names)}")
 
-    # ------------------------------------------------------------------
-    # Step 2: Verify each is a VPC bundle (lagT="node")
-    # TOKEN CHECKPOINT — discovery involves multiple API calls
-    # ------------------------------------------------------------------
     if token_state:
         if not ensure_token_fresh(session, apic_url, token_state):
             if credentials:
                 reauth_apic(session, apic_url, credentials["username"],
                            credentials["password"], token_state)
+
     vpc_pg_names = []
     for pg in pg_names:
         try:
@@ -1857,15 +1662,12 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
     if not vpc_pg_names:
         return []
 
-    # ------------------------------------------------------------------
-    # Step 3: Find VPC peer node via fabricExplicitGEp
-    # TOKEN CHECKPOINT
-    # ------------------------------------------------------------------
     if token_state:
         if not ensure_token_fresh(session, apic_url, token_state):
             if credentials:
                 reauth_apic(session, apic_url, credentials["username"],
                            credentials["password"], token_state)
+
     peer_node = None
     try:
         vpc_url = f"{apic_url}/api/class/fabricExplicitGEp.json?rsp-subtree=children"
@@ -1880,7 +1682,6 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
                         node_ids.append(nid)
 
                 if str(node_id) in node_ids:
-                    # Found our node's VPC pair
                     for nid in node_ids:
                         if nid != str(node_id):
                             peer_node = nid
@@ -1899,10 +1700,6 @@ def _discover_vpc_paths_for_port(session, apic_url, node_id, port, pod_id="1",
     if verbose:
         print(f"  [QUERY] Strategy 3: VPC pair = {node_id}-{peer_node}")
 
-    # ------------------------------------------------------------------
-    # Step 4: Build protpaths DN(s)
-    # Ensure consistent ordering (lower node first)
-    # ------------------------------------------------------------------
     n1, n2 = sorted([str(node_id), str(peer_node)], key=int)
 
     for pg in vpc_pg_names:
@@ -1918,31 +1715,7 @@ def resolve_port_path_dn(session, apic_url, node_id, port, pod_id="1",
                           verbose=True, token_state=None, credentials=None):
     """
     Determine the correct path DN for deploying EPG bindings to a port.
-
-    A physical port may be configured as:
-    - Individual: topology/pod-{pod}/paths-{node}/pathep-[eth{port}]
-    - VPC: topology/pod-{pod}/protpaths-{n1}-{n2}/pathep-[{pg_name}]
-
-    This function checks the port's policy group assignment to determine
-    which path type to use, ensuring bindings show up correctly under
-    Fabric > Inventory > Switch > Interface > Deployed EPGs.
-
-    Returns dict:
-        {
-            "path_dn": "topology/pod-1/...",
-            "path_type": "individual" | "vpc",
-            "pg_name": "EDCAVIO-ACC-R16_e8.VPC" | None,
-            "peer_node": "1601" | None,
-            "individual_path": "topology/pod-1/paths-{node}/pathep-[eth{port}]"
-        }
-
-    CCIE Automation Note:
-    This is critical for ACI static path bindings. The path DN in
-    fvRsPathAtt.tDn MUST match how the port is configured:
-    - accportgrp (individual) -> use paths-{node}/pathep-[eth{port}]
-    - accbundle with lagT=node (VPC) -> use protpaths-{n1}-{n2}/pathep-[{pg}]
-    Using the wrong path type causes bindings to not show in the GUI
-    and not forward traffic correctly.
+    Returns dict with path_dn, path_type, pg_name, peer_node, individual_path.
     """
     eth_port = f"eth{port}" if not port.startswith("eth") else port
     individual_path = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{eth_port}]"
@@ -1955,22 +1728,17 @@ def resolve_port_path_dn(session, apic_url, node_id, port, pod_id="1",
         "individual_path": individual_path
     }
 
-    # Check if port has a VPC policy group
     vpc_paths = _discover_vpc_paths_for_port(
         session, apic_url, node_id, port, pod_id, verbose,
         token_state, credentials
     )
 
     if vpc_paths:
-        # Use the first VPC protpath (a port typically has one VPC PG)
         result["path_dn"] = vpc_paths[0]
         result["path_type"] = "vpc"
 
-        # Extract pg_name and peer_node from the protpath DN
-        # Format: topology/pod-{pod}/protpaths-{n1}-{n2}/pathep-[{pg}]
-        import re as _re
-        pg_match = _re.search(r'pathep-\[(.+)\]', vpc_paths[0])
-        peer_match = _re.search(r'protpaths-(\d+)-(\d+)', vpc_paths[0])
+        pg_match = re.search(r'pathep-\[(.+)\]', vpc_paths[0])
+        peer_match = re.search(r'protpaths-(\d+)-(\d+)', vpc_paths[0])
         if pg_match:
             result["pg_name"] = pg_match.group(1)
         if peer_match:
@@ -1994,33 +1762,10 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
     """
     Query ALL fvRsPathAtt bindings on a port using THREE merged strategies.
 
-    ALWAYS runs all applicable strategies and merges results with deduplication.
-
     Strategy 1: Class-level eq() filter on individual path DN (fast)
     Strategy 2: Per-tenant EPG subtree walk with Python substring match
-    Strategy 3: VPC protpaths discovery — finds VPC policy groups assigned
-                to the port, discovers the VPC peer node, and queries bindings
-                on the protpaths DN. Catches bindings deployed via VPC that
-                use a completely different tDn format.
-
-    Args:
-        session: requests.Session with APIC auth
-        apic_url: APIC base URL
-        node_id: Leaf node ID (e.g., '1602')
-        port: Port string (e.g., '1/48')
-        pod_id: Pod ID (default '1')
-        tenants: List of tenant names for Strategy 2. If None, auto-discovers.
-        path_type: "individual" for single ports, "vpc" for protpaths
-        node2: Second node ID (required when path_type="vpc")
-        pg_name: Policy group name (required when path_type="vpc")
-        verbose: Print query progress (default True)
-
-    Returns:
-        List of dicts: [{"dn": "...", "tDn": "...", "encap": "vlan-32",
-                         "mode": "regular", "tenant": "...",
-                         "app_profile": "...", "epg": "...", "vlan": 32}, ...]
+    Strategy 3: VPC protpaths discovery
     """
-    # Build the path DN based on port type
     if path_type == "vpc" and node2 and pg_name:
         path_dn = f"topology/pod-{pod_id}/protpaths-{node_id}-{node2}/pathep-[{pg_name}]"
     else:
@@ -2030,9 +1775,7 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
     bindings = []
     seen_dns = set()
 
-    # ------------------------------------------------------------------
-    # Strategy 1: Class-level query with eq() filter (fast, single call)
-    # ------------------------------------------------------------------
+    # Strategy 1
     s1_count = 0
     try:
         url = (f"{apic_url}/api/class/fvRsPathAtt.json"
@@ -2052,20 +1795,13 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
     if verbose:
         print(f"  [QUERY] Strategy 1 (class-level individual): {s1_count} binding(s)")
 
-    # ------------------------------------------------------------------
-    # TOKEN CHECKPOINT — refresh before Strategy 2 if token is aging
-    # ------------------------------------------------------------------
     if token_state:
         if not ensure_token_fresh(session, apic_url, token_state):
             if credentials:
                 reauth_apic(session, apic_url, credentials["username"],
                            credentials["password"], token_state)
 
-    # ------------------------------------------------------------------
-    # Strategy 2: Per-tenant EPG subtree walk (ALWAYS runs, merges new)
-    # Uses Python substring match — immune to URL encoding issues.
-    # ------------------------------------------------------------------
-    # Auto-discover tenants if not provided
+    # Strategy 2
     if tenants is None:
         tenants = []
         try:
@@ -2078,7 +1814,7 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                     t_name = t_item.get("fvTenant", {}).get("attributes", {}).get("name", "")
                     if t_name and t_name not in ("common", "infra", "mgmt"):
                         tenants.append(t_name)
-        except:
+        except Exception:
             pass
         if verbose and tenants:
             print(f"  [QUERY] Auto-discovered {len(tenants)} tenant(s) for Strategy 2")
@@ -2089,7 +1825,6 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
 
     for tenant in tenants:
         try:
-            # Get all app profiles in this tenant
             ap_url = f"{apic_url}/api/mo/uni/tn-{tenant}.json?query-target=children&target-subtree-class=fvAp"
             ap_resp = session.get(ap_url, verify=False, timeout=15)
             if ap_resp.status_code != 200:
@@ -2100,7 +1835,6 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                 if not ap_name:
                     continue
 
-                # Get all fvRsPathAtt under this app profile
                 epg_url = (f"{apic_url}/api/mo/uni/tn-{tenant}/ap-{ap_name}.json"
                            f"?query-target=subtree&target-subtree-class=fvRsPathAtt")
                 epg_resp = session.get(epg_url, verify=False, timeout=20)
@@ -2111,7 +1845,6 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                     attrs = item.get("fvRsPathAtt", {}).get("attributes", {})
                     tdn = attrs.get("tDn", "")
 
-                    # Python substring match — catches what eq() misses
                     if path_dn in tdn:
                         binding, is_new = _parse_binding_attrs(attrs, seen_dns)
                         if is_new:
@@ -2127,24 +1860,13 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
         else:
             print(f"  [QUERY] Strategy 2: confirmed (0 additional)")
 
-    # ------------------------------------------------------------------
-    # TOKEN CHECKPOINT — refresh before Strategy 3 if token is aging
-    # ------------------------------------------------------------------
     if token_state:
         if not ensure_token_fresh(session, apic_url, token_state):
             if credentials:
                 reauth_apic(session, apic_url, credentials["username"],
                            credentials["password"], token_state)
 
-    # ------------------------------------------------------------------
-    # Strategy 3: VPC protpaths discovery
-    # The port may have bindings deployed via VPC policy groups that use
-    # protpaths-{node1}-{node2}/pathep-[{pg_name}] — a completely different
-    # tDn than the individual paths-{node}/pathep-[eth{port}] we searched.
-    #
-    # Only runs for individual path queries (if caller already specified
-    # path_type="vpc", they've already built the correct protpath DN).
-    # ------------------------------------------------------------------
+    # Strategy 3
     s3_count = 0
     if path_type != "vpc":
         if verbose:
@@ -2156,7 +1878,6 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
         )
 
         for vpc_path in vpc_protpaths:
-            # Class-level query on the VPC protpath DN
             try:
                 vpc_url = (f"{apic_url}/api/class/fvRsPathAtt.json"
                            f"?query-target-filter=eq(fvRsPathAtt.tDn,\"{vpc_path}\")")
@@ -2189,23 +1910,13 @@ def query_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
 
 def delete_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
                                 tenants=None):
-    """
-    Delete ALL fvRsPathAtt bindings on a specific port.
-
-    Queries all bindings first (merged dual-strategy), emits
-    [ROLLBACK:STATE] for each one, then deletes each one.
-    Returns (deleted_count, failed_count, binding_details).
-
-    binding_details is a list of {"vlan", "epg", "success"} for logging.
-    """
+    """Delete ALL fvRsPathAtt bindings on a specific port."""
     bindings = query_all_bindings_on_port(session, apic_url, node_id, port,
                                           pod_id, tenants=tenants)
 
     if not bindings:
         return 0, 0, []
 
-    # Emit state markers BEFORE deleting — rollback generator uses these
-    # to restore old bindings if needed
     for b in bindings:
         emit_rollback_state({
             "type": "binding", "node": str(node_id), "port": port,
@@ -2246,26 +1957,98 @@ def delete_all_bindings_on_port(session, apic_url, node_id, port, pod_id="1",
 # =============================================================================
 # BACKWARD-COMPATIBLE WRAPPERS
 # =============================================================================
-# These allow the existing scripts to switch to this module with minimal changes.
 
 def get_validated_available_ports(session, apic_url, node_id, pod_id="1"):
-    """
-    Backward-compatible wrapper — returns ONLY valid (available) ports.
-
-    Use get_all_ports_with_status() for the new full-inventory behavior.
-    """
+    """Backward-compatible wrapper — returns ONLY valid (available) ports."""
     all_ports = get_all_ports_with_status(session, apic_url, node_id, pod_id)
     return [p for p in all_ports if p['valid']]
 
 
 def find_common_validated_ports(ports1, ports2):
-    """
-    Backward-compatible wrapper — returns ONLY valid common ports.
-
-    Use find_common_ports_with_status() for the new full-inventory behavior.
-    """
+    """Backward-compatible wrapper — returns ONLY valid common ports."""
     all_common = find_common_ports_with_status(ports1, ports2)
     return [p for p in all_common if p['valid']]
+
+
+# =============================================================================
+# DATACENTER SELECTION
+# =============================================================================
+# Call select_datacenters(APIC_URLS) at the top of main() in any deploy script.
+# Returns a filtered copy of APIC_URLS containing only the operator-selected DCs.
+#
+# CCIE Automation Note:
+# Runtime scoping of targets is analogous to Ansible's --limit flag and
+# Nornir's filter_func. The URL values are NOT modified, so the existing
+# missing_urls check in each script continues to validate configuration
+# for any DC that IS selected — no downstream logic changes.
+
+def select_datacenters(current_urls):
+    """
+    Prompt the operator to choose which datacenters are in scope for this run.
+
+    Args:
+        current_urls: The APIC_URLS dict from the calling script.
+                      e.g. {"D1": "https://...", "D2": "https://...", "D3": "https://..."}
+
+    Returns:
+        A filtered copy of current_urls with only the active DCs.
+        URL strings are unchanged — this controls scope only.
+
+    Usage in main():
+        APIC_URLS = select_datacenters(APIC_URLS)
+        # The existing "# Check configuration" / missing_urls block runs next,
+        # unchanged — it will catch any selected DC whose URL is still blank.
+    """
+    dc_keys = sorted(current_urls.keys())
+
+    DC_DESC = {
+        "D1": "ACC switches  (default — non-NSM, non-SDC)",
+        "D2": "SDC switches  (switch names contain 'SDC')",
+        "D3": "NSM switches  (switch names contain 'NSM')",
+    }
+
+    print("\n" + "=" * 70)
+    print(" DATACENTER SELECTION")
+    print("=" * 70)
+    print()
+    print("  Datacenters in scope (all active by default):")
+    print()
+
+    for dc in dc_keys:
+        url_hint = f"  [{current_urls[dc].rstrip('/')}]" if current_urls[dc] else "  [URL not set]"
+        print(f"    {dc}:  {DC_DESC.get(dc, '')}  {url_hint}")
+
+    print()
+    print("  Enter DC keys to SKIP, e.g. 'D2' or 'D1 D3'.")
+    print("  Press Enter to run against ALL datacenters.")
+    print()
+
+    raw = prompt_input("  Skip DCs (or Enter for all): ").strip().upper()
+
+    active = {dc: True for dc in dc_keys}
+    if raw:
+        for token in re.findall(r'D\d+', raw):
+            if token in active:
+                active[token] = False
+
+    selected = {dc: url for dc, url in current_urls.items() if active.get(dc, False)}
+
+    if not selected:
+        print("\n  [ERROR] At least one datacenter must be active.")
+        sys.exit(1)
+
+    print()
+    print("  ── Scope for this run ──────────────────────────────────────────")
+    for dc in dc_keys:
+        if active.get(dc):
+            url_val = current_urls[dc] or "(URL not set)"
+            print(f"    ✓  {dc}: {url_val}")
+        else:
+            print(f"    ✗  {dc}: (skipped)")
+    print("  ────────────────────────────────────────────────────────────────")
+    print()
+
+    return selected
 
 
 # =============================================================================
@@ -2273,7 +2056,7 @@ def find_common_validated_ports(ports1, ports2):
 # =============================================================================
 
 if __name__ == "__main__":
-    print("ACI Port Utilities v1.0.0")
+    print("ACI Port Utilities v1.7.0")
     print("=" * 50)
     print()
     print("Shared module — import into deployment scripts:")
@@ -2281,7 +2064,8 @@ if __name__ == "__main__":
     print("  from aci_port_utils import (")
     print("      detect_environment, extract_node_id, parse_vlans,")
     print("      get_all_ports_with_status, display_port_selection,")
-    print("      find_common_ports_with_status, display_vpc_port_selection")
+    print("      find_common_ports_with_status, display_vpc_port_selection,")
+    print("      select_datacenters")
     print("  )")
     print()
     print("Helper Functions:")
@@ -2293,7 +2077,6 @@ if __name__ == "__main__":
     print(f"  parse_port('1/68')                    -> '{parse_port('1/68')}'")
     print()
     print("Color Demo:")
-    # Simulate a few ports for display demo
     demo_ports = [
         {"port": "eth1/1", "interface": "1/1", "speed": "25G", "valid": True,
          "issues": [], "config_details": {}, "usage": "discovery", "admin_state": "up"},
