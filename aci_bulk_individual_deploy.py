@@ -61,7 +61,7 @@ from aci_port_utils import (
     cleanup_port_for_redeployment,
     query_existing_access_policy_groups, display_policy_group_selection,
     query_all_bindings_on_port,
-    ensure_token_fresh, reauth_apic
+    ensure_token_fresh, reauth_apic, select_datacenters
 )
 
 
